@@ -1,0 +1,37 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 256 256" role="img" aria-labelledby="title">
+  <title id="title">Draconium — Dn with three dragon claw marks</title>
+  <defs>
+    <linearGradient id="tile" x2=".8" y2="1">
+      <stop stop-color="#2c1927"/><stop offset=".55" stop-color="#1d1421"/><stop offset="1" stop-color="#311a2a"/>
+    </linearGradient>
+    <linearGradient id="rim" x2="1" y2=".8">
+      <stop stop-color="#793954"/><stop offset=".55" stop-color="#51233c"/><stop offset="1" stop-color="#773450"/>
+    </linearGradient>
+    <linearGradient id="rose" x2=".7" y2="1">
+      <stop stop-color="#efdae5"/><stop offset=".36" stop-color="#d6a5bc"/><stop offset=".68" stop-color="#be839f"/><stop offset="1" stop-color="#d8abbd"/>
+    </linearGradient>
+    <linearGradient id="gouge" x2=".4" y2="1">
+      <stop stop-color="#45182f"/><stop offset=".48" stop-color="#7e3257"/><stop offset=".75" stop-color="#42172e"/><stop offset="1" stop-color="#21131f"/>
+    </linearGradient>
+    <linearGradient id="lip"><stop stop-color="#97506e"/><stop offset=".58" stop-color="#ecd8e2"/><stop offset="1" stop-color="#b37d98"/></linearGradient>
+    <clipPath id="edge"><rect width="256" height="256" rx="39"/></clipPath>
+  </defs>
+  <g clip-path="url(#edge)">
+    <rect width="256" height="256" fill="url(#rim)"/>
+    <rect x="4" y="4" width="248" height="248" rx="35" fill="url(#tile)"/>
+    <g id="monogram" fill="url(#rose)">
+      <path fill-rule="evenodd" d="M43 64H90C125 64 146 87 146 121S124 178 90 178H43ZM67 85V157H89C109 157 122 144 122 121S110 85 89 85Z"/>
+      <path d="M150 96H172V108C178 99 187 94 199 94C217 94 230 107 230 128V178H207V133C207 120 202 114 192 114C181 114 174 123 174 136V178H150Z"/>
+    </g>
+    <g id="claw-marks" fill="url(#gouge)">
+      <path d="M142 244Q187 193 259 180Q199 200 142 244Z"/>
+      <path d="M165 252Q204 212 259 199Q212 218 165 252Z"/>
+      <path d="M196 248Q222 222 255 216Q228 226 196 248Z"/>
+    </g>
+    <g fill="url(#lip)">
+      <path d="M142 244Q187 192 259 180Q195 195 142 244Z"/>
+      <path d="M165 252Q204 210 259 199Q209 213 165 252Z"/>
+      <path d="M196 248Q222 221 255 216Q227 222 196 248Z"/>
+    </g>
+  </g>
+</svg>

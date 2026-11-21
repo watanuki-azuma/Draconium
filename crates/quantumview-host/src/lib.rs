@@ -1,0 +1,89 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
+
+//! # `quantumview-host`
+//!
+//! Lightweight, self-contained Rust desktop WebView host powered by **Servo 0.8.0**
+//! (Stylo, WebRender, SpiderMonkey) — no Chromium or OS WebView runtime required.
+//!
+//! ## Quick Start
+//!
+//! ```no_run
+//! use quantumview_host::{
+//!     Capabilities, EmbeddedAsset, HostConfig, HostHandler, WindowConfig, resolve_app_url_from,
+//!     run,
+//! };
+//! use std::path::Path;
+//!
+//! const ASSETS: &[EmbeddedAsset] = &[EmbeddedAsset {
+//!     path: "index.html",
+//!     bytes: b"<!doctype html><html><body><h1>Hello QuantumView</h1></body></html>",
+//! }];
+//!
+//! struct MyApp;
+//!
+//! impl HostHandler for MyApp {
+//!     fn handle_request(&mut self, command: &str, payload: &str) -> Result<String, String> {
+//!         match command {
+//!             "ping" => Ok(format!("pong: {payload}")),
+//!             other => Err(format!("Unsupported command: {other}")),
+//!         }
+//!     }
+//! }
+//!
+//! fn main() -> Result<(), Box<dyn std::error::Error>> {
+//!     let (url, asset_root) = resolve_app_url_from(
+//!         Path::new(env!("CARGO_MANIFEST_DIR")),
+//!         true,
+//!         None,
+//!         "index.html",
+//!         "ui/index.html",
+//!         "ui/index.html",
+//!     );
+//!     let config = HostConfig::new("My App", url)
+//!         .with_window(WindowConfig::standard(960, 640))
+//!         .with_asset_root(asset_root)
+//!         .with_embedded_assets(ASSETS)
+//!         .with_capabilities(Capabilities::restricted().with_app_commands(["ping"]));
+//!     run(config, MyApp, None)
+//! }
+//! ```
+
+mod bridge;
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+mod embedder_ui;
+mod host;
+mod input;
+mod policy;
+mod protocol;
+mod qv_protocol;
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+mod tray;
+mod unix_platform;
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+mod win_platform;
+mod window_state;
+
+pub use url::Url;
+
+pub use crate::bridge::DevOrigin;
+pub use crate::host::{
+    HostConfig, HostHandler, WindowConfig, resolve_app_url, resolve_app_url_from, resolve_ui_path,
+    resolve_ui_path_from, run,
+};
+pub use crate::policy::{AllowedAppCommands, Capabilities, Capability};
+pub use crate::protocol::{APP_AUTHORITY, DEFAULT_CSP, EmbeddedAsset, SCHEME, asset_url};
+pub use crate::window_state::{
+    CHIPS_SIZE, DEFAULT_WINDOW_SIZE, FLYOUT_SIZE, LogicalPosition, LogicalSize, Presentation,
+    SavedWindowState,
+};
+
+/// Platform validation, capability introspection, and parsing utilities for CLI
+/// flags and host setup.
+pub mod platform {
+    pub use crate::unix_platform::{PlatformCapabilities, platform_capabilities};
+    pub use crate::win_platform::{
+        opacity_to_alpha, parse_hotkey, validate_custom_uri_scheme, validate_devtools_addr,
+    };
+}

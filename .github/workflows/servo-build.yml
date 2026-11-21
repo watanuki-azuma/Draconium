@@ -1,0 +1,142 @@
+name: Servo Release Build
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_os:
+        description: Operating system(s) to build
+        type: choice
+        options:
+          - all
+          - windows
+          - macos
+          - linux
+        default: all
+        required: true
+      build_example:
+        description: Also build the quantumview-host hello example
+        type: boolean
+        default: true
+        required: true
+      media_gstreamer:
+        description: Enable optional Servo media-gstreamer feature
+        type: boolean
+        default: false
+        required: true
+
+jobs:
+  build:
+    name: Servo release (${{ matrix.target_os }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    env:
+      CARGO_TARGET_DIR: probes/servo/target
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(inputs.target_os == 'windows' && '[{"runner":"windows-latest","target_os":"windows"}]' || inputs.target_os == 'macos' && '[{"runner":"macos-latest","target_os":"macos"}]' || inputs.target_os == 'linux' && '[{"runner":"ubuntu-latest","target_os":"linux"}]' || '[{"runner":"windows-latest","target_os":"windows"},{"runner":"macos-latest","target_os":"macos"},{"runner":"ubuntu-latest","target_os":"linux"}]') }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Initialize MSVC environment
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Check Windows GStreamer SDK
+        if: ${{ inputs.media_gstreamer && runner.os == 'Windows' }}
+        shell: pwsh
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:GSTREAMER_1_0_ROOT_MSVC_X86_64)) {
+            throw 'The optional Windows media-gstreamer build requires the official GStreamer 1.20+ MSVC x86_64 SDK. Set GSTREAMER_1_0_ROOT_MSVC_X86_64 and install pkg-config before building.'
+          }
+          if (-not (Test-Path -LiteralPath $env:GSTREAMER_1_0_ROOT_MSVC_X86_64 -PathType Container)) {
+            throw "GSTREAMER_1_0_ROOT_MSVC_X86_64 does not point to an SDK directory: $env:GSTREAMER_1_0_ROOT_MSVC_X86_64"
+          }
+          if (-not (Get-Command pkg-config -ErrorAction SilentlyContinue)) {
+            throw 'The optional Windows media-gstreamer build requires pkg-config in PATH alongside the official GStreamer MSVC SDK.'
+          }
+          $pkgConfigDir = Join-Path $env:GSTREAMER_1_0_ROOT_MSVC_X86_64 'lib\pkgconfig'
+          $pkgConfigPath = (@($pkgConfigDir, $env:PKG_CONFIG_PATH) | Where-Object { $_ }) -join [IO.Path]::PathSeparator
+          "PKG_CONFIG_PATH=$pkgConfigPath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Install Ubuntu build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            clang libclang-dev cmake ninja-build pkg-config gperf m4 python3 \
+            libssl-dev libx11-dev libx11-xcb-dev libxrandr-dev libxi-dev \
+            libxcursor-dev libxcb1-dev libxcb-shape0-dev libxcb-shm0-dev \
+            libxcb-icccm4-dev libxcb-image0-dev libxcb-keysyms1-dev \
+            libxcb-randr0-dev libxcb-render-util0-dev libxcb-xfixes0-dev \
+            libxcb-xinerama0-dev libxcb-xkb-dev libxkbcommon-dev \
+            libxkbcommon-x11-dev libwayland-dev libgl1-mesa-dev \
+            libegl1-mesa-dev libgles2-mesa-dev libfontconfig1-dev \
+            libfreetype6-dev libharfbuzz-dev libglib2.0-dev libgtk-3-dev \
+            libgdk-pixbuf2.0-dev libdbus-1-dev
+
+      - name: Install Linux GStreamer dependencies
+        if: ${{ inputs.media_gstreamer && runner.os == 'Linux' }}
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
+            libgstreamer-plugins-bad1.0-dev gstreamer1.0-plugins-base \
+            gstreamer1.0-plugins-good gstreamer1.0-plugins-bad \
+            gstreamer1.0-libav
+
+      - name: Install macOS build dependencies
+        if: runner.os == 'macOS'
+        run: brew install cmake ninja pkg-config llvm
+
+      - name: Install macOS GStreamer dependencies
+        if: ${{ inputs.media_gstreamer && runner.os == 'macOS' }}
+        run: |
+          brew install gstreamer
+          echo "PKG_CONFIG_PATH=$(brew --prefix gstreamer)/lib/pkgconfig:${PKG_CONFIG_PATH}" >> "$GITHUB_ENV"
+
+      - name: Configure macOS libclang
+        if: runner.os == 'macOS'
+        run: |
+          echo "$(brew --prefix llvm)/bin" >> "$GITHUB_PATH"
+          echo "LIBCLANG_PATH=$(brew --prefix llvm)/lib" >> "$GITHUB_ENV"
+
+      - name: Install LLVM for Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          choco install llvm --yes --no-progress
+          $llvmBin = 'C:\Program Files\LLVM\bin'
+          $llvmBin | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          "LIBCLANG_PATH=$llvmBin" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "CC=clang-cl" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "CXX=clang-cl" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Check GStreamer version
+        if: ${{ inputs.media_gstreamer }}
+        shell: bash
+        run: |
+          # pkgconf can stop at the first match for --atleast-version.
+          if ! pkg-config --atleast-version=1.20 gstreamer-1.0 gstreamer-play-1.0 ||
+             ! pkg-config --exists 'gstreamer-1.0 >= 1.20' 'gstreamer-play-1.0 >= 1.20'; then
+            echo 'GStreamer 1.20+ development files for both gstreamer-1.0 and gstreamer-play-1.0 are required.' >&2
+            exit 1
+          fi
+
+      - name: Cache Cargo dependencies and Servo build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            probes/servo/target
+          key: ${{ runner.os }}-cargo-servo${{ inputs.media_gstreamer && '-gst' || '' }}-${{ hashFiles('probes/servo/Cargo.lock', 'probes/servo/Cargo.toml', 'crates/quantumview-host/Cargo.toml') }}
+
+      - name: Build Servo release
+        run: cargo build --release --locked ${{ inputs.media_gstreamer && '--features media-gstreamer' || '' }} --manifest-path probes/servo/Cargo.toml
+
+      - name: Build host hello example
+        if: ${{ inputs.build_example }}
+        run: cargo build --release --locked ${{ inputs.media_gstreamer && '--features media-gstreamer' || '' }} -p quantumview-host --example hello --manifest-path probes/servo/Cargo.toml

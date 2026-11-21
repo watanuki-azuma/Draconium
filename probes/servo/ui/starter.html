@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="en" data-theme="light">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>QuantumView Starter</title>
+  <link rel="stylesheet" href="starter.css">
+</head>
+<body>
+  <main class="starter-shell">
+    <header class="starter-header">
+      <h1 class="starter-title">QuantumView Starter</h1>
+      <p class="starter-lead">
+        Minimal host template wired to Rust through <code>window.QuantumView</code> over <code>qv://app/</code>.
+      </p>
+    </header>
+
+    <section class="starter-panel">
+      <label class="field-label" for="starter-input">Message to Rust host</label>
+      <div class="input-row">
+        <input id="starter-input" class="text-input" type="text" value="Hello from Servo 0.8.0" spellcheck="false">
+        <button id="btn-echo-sync" class="btn btn-primary" type="button">Send sync</button>
+        <button id="btn-echo-async" class="btn btn-quiet" type="button">Send async</button>
+      </div>
+
+      <div class="reply-box">
+        <span class="reply-label">Host response</span>
+        <pre id="starter-reply" class="reply-output">Waiting for request</pre>
+      </div>
+    </section>
+
+    <footer class="starter-footer">
+      <span id="host-meta">Host info pending</span>
+      <span id="theme-meta">Theme: light</span>
+    </footer>
+  </main>
+  <script src="starter.js"></script>
+</body>
+</html>

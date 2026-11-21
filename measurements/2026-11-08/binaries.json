@@ -1,0 +1,17 @@
+[
+  {
+    "Name": "quantumview-servo.exe",
+    "Bytes": 114664960,
+    "Note": "Servo 0.7.0 baseline"
+  },
+  {
+    "Name": "quantumview-blitz.exe",
+    "Bytes": 21239808,
+    "Note": "Blitz / Dioxus Native 0.7.10 baseline (archived)"
+  },
+  {
+    "Name": "quantumview-webview2.exe",
+    "Bytes": 1044480,
+    "Note": "WebView2 / wry 0.57.1 baseline"
+  }
+]

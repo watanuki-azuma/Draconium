@@ -1,0 +1,18 @@
+[package]
+name = "quantumview-host"
+version = "0.1.0"
+edition = "2024"
+license = "MPL-2.0"
+description = "Lightweight, self-contained Rust desktop WebView host powered by Servo 0.8.0"
+publish = false
+
+[features]
+default = []
+media-gstreamer = ["servo/media-gstreamer"]
+
+[dependencies]
+servo = { version = "=0.8.0", default-features = false, features = ["bundled", "clipboard", "devtools", "js_jit"] }
+euclid = "0.22"
+rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std", "tls12"] }
+url = "2.5"
+winit = "=0.30.13"

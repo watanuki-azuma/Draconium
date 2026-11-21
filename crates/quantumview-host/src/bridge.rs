@@ -1,0 +1,1603 @@
+//! The JS ↔ Rust bridge contract for the QuantumView host.
+//!
+//! The host's synchronous channel from page JS to Rust is Servo's
+//! `SimpleDialog::Prompt` embedder control: page code calls
+//! `window.QuantumView.*`, which delegates to a closure-captured native
+//! `window.prompt` prefixed with a per-launch session token for privileged
+//! host commands (`qv-tok:<nonce>:qv-window:<cmd>`) and correlated non-blocking
+//! async commands (`qv-tok:<nonce>:qv-app-async:<id>:<cmd>` and
+//! `qv-tok:<nonce>:qv-window-async:<id>:<cmd>`).
+//!
+//! Beyond the IPC bridge, [`PRELOAD_SCRIPT`] also injects lightweight shims
+//! for web/Electron capabilities missing in Servo 0.7.0:
+//! - HTML Popover API (`[popover]`, `showPopover`/`hidePopover`/`togglePopover`,
+//!   `popovertarget`, light-dismiss), paired with [`POPOVER_POLYFILL_CSS`]
+//!   injected at `Origin::User` via `UserStyleSheet` so strict `style-src 'self'`
+//!   Content-Security-Policy is preserved
+//! - Declarative `-webkit-app-region: drag` / `[data-qv-drag]` window drag
+//! - `<a download>` interception for `data:` / `blob:` URLs → native Save dialog
+//! - `window.print()` fallback → raster PDF export dialog
+//! - Synthetic `qv:file-drop` DOM events paired with capability-scoped file tokens
+//!
+//! All items in this module are dependency-free pure Rust so they can be
+//! unit-tested on any OS with `rustc --edition 2024 --test`.
+
+use std::collections::hash_map::RandomState;
+use std::hash::{BuildHasher, Hasher};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+/// Prefix marking a bridge command as a host window command rather than an
+/// application command.
+pub const WINDOW_COMMAND_PREFIX: &str = "qv-window:";
+/// Prefix marking a correlated async host window command.
+pub const WINDOW_ASYNC_PREFIX: &str = "qv-window-async:";
+/// Prefix marking a correlated async application command.
+pub const APP_ASYNC_PREFIX: &str = "qv-app-async:";
+/// Prefix wrapping privileged host commands with the per-launch session token.
+pub const TOKEN_COMMAND_PREFIX: &str = "qv-tok:";
+/// Placeholder inside [`PRELOAD_SCRIPT`] replaced by [`render_preload_script`].
+const TOKEN_PLACEHOLDER: &str = "__QV_SESSION_TOKEN__";
+
+/// User-origin stylesheet registered via `UserContentManager::add_stylesheet`
+/// to support the HTML Popover API polyfill without requiring `'unsafe-inline'`
+/// in author `style-src` Content-Security-Policy.
+pub const POPOVER_POLYFILL_CSS: &str = "[popover]:not(.qv-popover-open){display:none !important;}[popover].qv-popover-open{position:fixed;z-index:2147483647;}";
+
+/// Validated loopback development server origin (`--dev-url http://127.0.0.1:5173`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DevOrigin {
+    pub host: String,
+    pub port: u16,
+    pub initial_url: String,
+}
+
+impl DevOrigin {
+    /// Parse and validate a loopback HTTP development server URL.
+    ///
+    /// Only `http://127.0.0.1:<port>[/...]`, `http://localhost:<port>[/...]`,
+    /// and `http://[::1]:<port>[/...]` with an explicit non-zero port are
+    /// accepted. Remote hosts, `0.0.0.0`, userinfo (`@`), backslashes, and
+    /// non-HTTP schemes are rejected.
+    pub fn parse(raw: &str) -> Result<Self, String> {
+        let trimmed = raw.trim();
+        if trimmed.is_empty()
+            || trimmed != raw
+            || trimmed
+                .chars()
+                .any(|ch| ch.is_control() || ch.is_whitespace() || ch == '\\' || ch == '@')
+        {
+            return Err("不正な --dev-url 指定です".to_owned());
+        }
+        let Some((scheme, rest)) = trimmed.split_once("://") else {
+            return Err("--dev-url は http://<host>:<port> 形式で指定してください".to_owned());
+        };
+        if !scheme.eq_ignore_ascii_case("http") {
+            return Err("--dev-url は http:// スキームのみ対応しています".to_owned());
+        }
+        let (authority, path_part) = match rest.find('/') {
+            Some(idx) => (&rest[..idx], &rest[idx..]),
+            None => (rest, "/"),
+        };
+        if authority.is_empty() || authority.contains(['?', '#']) {
+            return Err("--dev-url のホストまたはポートが不正です".to_owned());
+        }
+        let (host_raw, port_raw) = if let Some(after_bracket) = authority.strip_prefix("[::1]") {
+            let Some(port_str) = after_bracket.strip_prefix(':') else {
+                return Err("--dev-url には明示的なポート番号が必要です".to_owned());
+            };
+            ("[::1]", port_str)
+        } else {
+            let Some((h, p)) = authority.rsplit_once(':') else {
+                return Err("--dev-url には明示的なポート番号が必要です".to_owned());
+            };
+            (h, p)
+        };
+        let host = if host_raw == "127.0.0.1" {
+            "127.0.0.1".to_owned()
+        } else if host_raw.eq_ignore_ascii_case("localhost") {
+            "localhost".to_owned()
+        } else if host_raw == "[::1]" {
+            "[::1]".to_owned()
+        } else {
+            return Err(format!(
+                "--dev-url はループバック (127.0.0.1 / localhost / [::1]) のみ許可されています: {host_raw}"
+            ));
+        };
+        let port: u16 = port_raw
+            .parse()
+            .map_err(|_| format!("--dev-url のポート番号が不正です: {port_raw}"))?;
+        if port == 0 {
+            return Err("--dev-url のポート番号に 0 は指定できません".to_owned());
+        }
+        let initial_url = format!("http://{host}:{port}{path_part}");
+        Ok(Self {
+            host,
+            port,
+            initial_url,
+        })
+    }
+
+    /// Return `true` if `url` is an `http://` URL targeting this exact
+    /// loopback `(host, port)` origin.
+    pub fn matches_url(&self, url: &str) -> bool {
+        let trimmed = url.trim();
+        if trimmed.is_empty()
+            || trimmed != url
+            || trimmed
+                .chars()
+                .any(|ch| ch.is_control() || ch.is_whitespace() || ch == '\\' || ch == '@')
+        {
+            return false;
+        }
+        let Some((scheme, rest)) = trimmed.split_once("://") else {
+            return false;
+        };
+        if !scheme.eq_ignore_ascii_case("http") {
+            return false;
+        }
+        let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+        let (host_raw, port_raw) = if let Some(after_bracket) = authority.strip_prefix("[::1]") {
+            let Some(port_str) = after_bracket.strip_prefix(':') else {
+                return false;
+            };
+            ("[::1]", port_str)
+        } else {
+            let Some((h, p)) = authority.rsplit_once(':') else {
+                return false;
+            };
+            (h, p)
+        };
+        let Ok(port) = port_raw.parse::<u16>() else {
+            return false;
+        };
+        port == self.port && host_raw.eq_ignore_ascii_case(&self.host)
+    }
+}
+
+/// Window / platform operations the host performs on behalf of any page.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WindowCommand {
+    /// Start an OS window drag (`Window::drag_window`).
+    Drag,
+    /// Start an OS edge/corner window resize (`Window::drag_resize_window`).
+    DragResize,
+    /// Minimize the window (`Window::set_minimized(true)`).
+    Minimize,
+    /// Toggle maximized state (`Window::set_maximized(!is_maximized)`).
+    ToggleMaximize,
+    /// Query whether the window is currently maximized (`"true"` / `"false"`).
+    IsMaximized,
+    /// Set the native window title.
+    SetTitle,
+    /// Set or clear borderless fullscreen mode.
+    SetFullscreen,
+    /// Query whether the window is in fullscreen mode.
+    IsFullscreen,
+    /// Set whether the window stays above other windows.
+    SetAlwaysOnTop,
+    /// Focus the native window.
+    Focus,
+    /// Request or clear native user attention.
+    RequestUserAttention,
+    /// Read logical window bounds and state as JSON.
+    GetBounds,
+    /// Request a logical inner size.
+    SetSize,
+    /// Navigate backward in the WebView history.
+    GoBack,
+    /// Navigate forward in the WebView history.
+    GoForward,
+    /// Query whether backward history navigation is available.
+    CanGoBack,
+    /// Query whether forward history navigation is available.
+    CanGoForward,
+    /// Resize the window to the compact chips presentation.
+    ShowChips,
+    /// Resize the window to the expanded flyout presentation.
+    ShowFlyout,
+    /// Hide the window (`set_visible(false)`). Only allowed when a recovery
+    /// mechanism such as the system tray is active.
+    Hide,
+    /// Show the window again (`set_visible(true)`).
+    Show,
+    /// Ask the host to run its normal close flow (including the page's
+    /// `__quantumviewBeforeClose` hook).
+    Close,
+    /// Reload the page (`WebView::reload`).
+    Reload,
+    /// Clear the network cache and reload the page (`NetworkManager::clear_cache` + reload).
+    HardReload,
+    /// Zoom the page in by one step (`WebView::set_page_zoom`).
+    ZoomIn,
+    /// Zoom the page out by one step (`WebView::set_page_zoom`).
+    ZoomOut,
+    /// Reset page zoom to 100% (`WebView::set_page_zoom(1.0)`).
+    ZoomReset,
+    /// Open an allowlisted external URL (`https:` / `mailto:`) in the OS
+    /// default handler.
+    OpenExternal,
+    /// Set layered window opacity (`0.1..=1.0`, Windows `SetLayeredWindowAttributes`).
+    SetOpacity,
+    /// Toggle mouse click-through (`WS_EX_TRANSPARENT`, Windows).
+    SetClickThrough,
+    /// Prompt for a PNG path (`GetSaveFileNameW`) and save `WebView::take_screenshot`.
+    CapturePng,
+    /// Prompt for an HTML path (`GetSaveFileNameW`) and save a serialized HTML snapshot.
+    ExportHtml,
+    /// Prompt for a PDF path (`GetSaveFileNameW`) and save a single-page raster PDF snapshot.
+    ExportPdf,
+    /// Save a `<a download>` base64 payload via native `GetSaveFileNameW`.
+    SaveDownload,
+    /// Open native file picker and return capability-scoped file tokens.
+    DialogOpenFile,
+    /// Open native folder picker and return the selected directory path.
+    DialogSelectFolder,
+    /// Open native save dialog and write text or base64 content.
+    DialogSaveFile,
+    /// Read UTF-8 text from a capability-scoped file token (dropped or picked).
+    FileReadText,
+    /// Read base64 bytes from a capability-scoped file token (dropped or picked).
+    FileReadBase64,
+    /// Encrypt UTF-8 text with Windows DPAPI (`safeStorage.encrypt`).
+    SafeStorageEncrypt,
+    /// Decrypt base64 ciphertext with Windows DPAPI (`safeStorage.decrypt`).
+    SafeStorageDecrypt,
+    /// Display a desktop notification via the tray icon (`NIF_INFO`) or ephemeral balloon.
+    Notify,
+    /// Query current OS theme (`"dark"` or `"light"`).
+    GetTheme,
+    /// Query runtime OS identifier and native host capability matrix (JSON object).
+    GetPlatform,
+    /// Read plain UTF-8 text from the OS clipboard.
+    ClipboardReadText,
+    /// Write plain UTF-8 text to the OS clipboard.
+    ClipboardWriteText,
+    /// Read HTML fragment (`CF_HTML`) from the OS clipboard.
+    ClipboardReadHtml,
+    /// Write HTML fragment (`CF_HTML`) to the OS clipboard.
+    ClipboardWriteHtml,
+    /// Read image (`CF_DIB`) from the OS clipboard as a base64 PNG data URL / object.
+    ClipboardReadImage,
+    /// Write RGBA / BMP image data to the OS clipboard as `CF_DIB`.
+    ClipboardWriteImage,
+    /// Clear the OS clipboard.
+    ClipboardClear,
+    /// Query whether the app is registered in `HKCU\...\Run` autostart.
+    AutostartGet,
+    /// Enable or disable `HKCU\...\Run` autostart for the app.
+    AutostartSet,
+    /// Register a custom URI scheme (`HKCU\Software\Classes\<scheme>`) for deep links.
+    ProtocolClientSet,
+    /// Unregister a custom URI scheme from `HKCU\Software\Classes\<scheme>`.
+    ProtocolClientRemove,
+    /// List site data entries (`SiteDataManager::site_data`).
+    SessionListSiteData,
+    /// Clear site data (`SiteDataManager::clear_site_data`).
+    SessionClearSiteData,
+    /// Clear all or session-only cookies (`SiteDataManager::clear_cookies`).
+    SessionClearCookies,
+    /// Clear Servo's network cache (`NetworkManager::clear_cache`).
+    SessionClearCache,
+    /// Open a secondary child window (`WebViewBuilder::new`) with attenuated capabilities.
+    OpenChildWindow,
+}
+
+impl WindowCommand {
+    /// Canonical wire suffix name (without `qv-window:`), used for capability checks.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Drag => "drag",
+            Self::DragResize => "drag-resize",
+            Self::Minimize => "minimize",
+            Self::ToggleMaximize => "toggle-maximize",
+            Self::IsMaximized => "is-maximized",
+            Self::SetTitle => "set-title",
+            Self::SetFullscreen => "set-fullscreen",
+            Self::IsFullscreen => "is-fullscreen",
+            Self::SetAlwaysOnTop => "set-always-on-top",
+            Self::Focus => "focus",
+            Self::RequestUserAttention => "request-user-attention",
+            Self::GetBounds => "get-bounds",
+            Self::SetSize => "set-size",
+            Self::GoBack => "go-back",
+            Self::GoForward => "go-forward",
+            Self::CanGoBack => "can-go-back",
+            Self::CanGoForward => "can-go-forward",
+            Self::ShowChips => "chips",
+            Self::ShowFlyout => "flyout",
+            Self::Hide => "hide",
+            Self::Show => "show",
+            Self::Close => "close",
+            Self::Reload => "reload",
+            Self::HardReload => "hard-reload",
+            Self::ZoomIn => "zoom-in",
+            Self::ZoomOut => "zoom-out",
+            Self::ZoomReset => "zoom-reset",
+            Self::OpenExternal => "open-external",
+            Self::SetOpacity => "set-opacity",
+            Self::SetClickThrough => "set-click-through",
+            Self::CapturePng => "capture-png",
+            Self::ExportHtml => "export-html",
+            Self::ExportPdf => "export-pdf",
+            Self::SaveDownload => "save-download",
+            Self::DialogOpenFile => "dialog-open-file",
+            Self::DialogSelectFolder => "dialog-select-folder",
+            Self::DialogSaveFile => "dialog-save-file",
+            Self::FileReadText => "file-read-text",
+            Self::FileReadBase64 => "file-read-base64",
+            Self::SafeStorageEncrypt => "safe-storage-encrypt",
+            Self::SafeStorageDecrypt => "safe-storage-decrypt",
+            Self::Notify => "notify",
+            Self::GetTheme => "get-theme",
+            Self::GetPlatform => "get-platform",
+            Self::ClipboardReadText => "clipboard-read-text",
+            Self::ClipboardWriteText => "clipboard-write-text",
+            Self::ClipboardReadHtml => "clipboard-read-html",
+            Self::ClipboardWriteHtml => "clipboard-write-html",
+            Self::ClipboardReadImage => "clipboard-read-image",
+            Self::ClipboardWriteImage => "clipboard-write-image",
+            Self::ClipboardClear => "clipboard-clear",
+            Self::AutostartGet => "autostart-get",
+            Self::AutostartSet => "autostart-set",
+            Self::ProtocolClientSet => "protocol-client-set",
+            Self::ProtocolClientRemove => "protocol-client-remove",
+            Self::SessionListSiteData => "session-list-site-data",
+            Self::SessionClearSiteData => "session-clear-site-data",
+            Self::SessionClearCookies => "session-clear-cookies",
+            Self::SessionClearCache => "session-clear-cache",
+            Self::OpenChildWindow => "open-child-window",
+        }
+    }
+}
+
+/// Remove control characters and surrounding whitespace from a native window
+/// title, keeping it to at most 256 Unicode scalar values. An empty result uses
+/// the supplied fallback title.
+pub fn sanitize_window_title(raw: &str, fallback: &str) -> String {
+    fn clean(value: &str) -> String {
+        let filtered: String = value.chars().filter(|ch| !ch.is_control()).collect();
+        filtered
+            .trim()
+            .chars()
+            .take(256)
+            .collect::<String>()
+            .trim()
+            .to_owned()
+    }
+
+    let title = clean(raw);
+    if title.is_empty() {
+        clean(fallback)
+    } else {
+        title
+    }
+}
+
+/// Classification of an incoming `SimpleDialog::Prompt` command.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum BridgeCommand<'a> {
+    /// Authenticated synchronous host window/platform command.
+    Window(WindowCommand),
+    /// Authenticated non-blocking async host window/platform command.
+    WindowAsync {
+        call_id: u64,
+        command: WindowCommand,
+    },
+    /// Authenticated non-blocking async application command.
+    AppAsync { call_id: u64, command: &'a str },
+    /// Unauthenticated or unknown privileged command — must be rejected and
+    /// never forwarded to the application handler.
+    Rejected(String),
+    /// Normal synchronous application command (e.g. `"load"`, `"save"`, `"load_state"`).
+    App(&'a str),
+}
+
+/// Generate a per-launch 128-bit hex session token for same-realm preload
+/// hardening (defense-in-depth against raw `window.prompt("qv-window:...")`
+/// spoofing; not a substitute for an isolated JS compartment).
+pub fn generate_session_token() -> String {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let pid = std::process::id();
+    let mut h1 = RandomState::new().build_hasher();
+    h1.write_u128(nanos);
+    h1.write_u32(pid);
+    let mut h2 = RandomState::new().build_hasher();
+    h2.write_u64(h1.finish());
+    h2.write_u128(nanos.rotate_left(37));
+    format!("{:016x}{:016x}", h1.finish(), h2.finish())
+}
+
+/// Constant-time equality check for ASCII session tokens.
+fn constant_time_eq(a: &str, b: &str) -> bool {
+    let ab = a.as_bytes();
+    let bb = b.as_bytes();
+    if ab.len() != bb.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (&x, &y) in ab.iter().zip(bb.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
+fn parse_window_command_name(name: &str) -> Option<WindowCommand> {
+    match name {
+        "drag" => Some(WindowCommand::Drag),
+        "drag-resize" => Some(WindowCommand::DragResize),
+        "minimize" => Some(WindowCommand::Minimize),
+        "toggle-maximize" => Some(WindowCommand::ToggleMaximize),
+        "is-maximized" => Some(WindowCommand::IsMaximized),
+        "set-title" => Some(WindowCommand::SetTitle),
+        "set-fullscreen" => Some(WindowCommand::SetFullscreen),
+        "is-fullscreen" => Some(WindowCommand::IsFullscreen),
+        "set-always-on-top" => Some(WindowCommand::SetAlwaysOnTop),
+        "focus" => Some(WindowCommand::Focus),
+        "request-user-attention" => Some(WindowCommand::RequestUserAttention),
+        "get-bounds" => Some(WindowCommand::GetBounds),
+        "set-size" => Some(WindowCommand::SetSize),
+        "go-back" => Some(WindowCommand::GoBack),
+        "go-forward" => Some(WindowCommand::GoForward),
+        "can-go-back" => Some(WindowCommand::CanGoBack),
+        "can-go-forward" => Some(WindowCommand::CanGoForward),
+        "chips" => Some(WindowCommand::ShowChips),
+        "flyout" => Some(WindowCommand::ShowFlyout),
+        "hide" => Some(WindowCommand::Hide),
+        "show" => Some(WindowCommand::Show),
+        "close" => Some(WindowCommand::Close),
+        "reload" => Some(WindowCommand::Reload),
+        "hard-reload" => Some(WindowCommand::HardReload),
+        "zoom-in" => Some(WindowCommand::ZoomIn),
+        "zoom-out" => Some(WindowCommand::ZoomOut),
+        "zoom-reset" => Some(WindowCommand::ZoomReset),
+        "open-external" => Some(WindowCommand::OpenExternal),
+        "set-opacity" => Some(WindowCommand::SetOpacity),
+        "set-click-through" => Some(WindowCommand::SetClickThrough),
+        "capture-png" => Some(WindowCommand::CapturePng),
+        "export-html" => Some(WindowCommand::ExportHtml),
+        "export-pdf" => Some(WindowCommand::ExportPdf),
+        "save-download" => Some(WindowCommand::SaveDownload),
+        "dialog-open-file" => Some(WindowCommand::DialogOpenFile),
+        "dialog-select-folder" => Some(WindowCommand::DialogSelectFolder),
+        "dialog-save-file" => Some(WindowCommand::DialogSaveFile),
+        "file-read-text" => Some(WindowCommand::FileReadText),
+        "file-read-base64" => Some(WindowCommand::FileReadBase64),
+        "safe-storage-encrypt" => Some(WindowCommand::SafeStorageEncrypt),
+        "safe-storage-decrypt" => Some(WindowCommand::SafeStorageDecrypt),
+        "notify" => Some(WindowCommand::Notify),
+        "get-theme" => Some(WindowCommand::GetTheme),
+        "get-platform" => Some(WindowCommand::GetPlatform),
+        "clipboard-read-text" => Some(WindowCommand::ClipboardReadText),
+        "clipboard-write-text" => Some(WindowCommand::ClipboardWriteText),
+        "clipboard-read-html" => Some(WindowCommand::ClipboardReadHtml),
+        "clipboard-write-html" => Some(WindowCommand::ClipboardWriteHtml),
+        "clipboard-read-image" => Some(WindowCommand::ClipboardReadImage),
+        "clipboard-write-image" => Some(WindowCommand::ClipboardWriteImage),
+        "clipboard-clear" => Some(WindowCommand::ClipboardClear),
+        "autostart-get" => Some(WindowCommand::AutostartGet),
+        "autostart-set" => Some(WindowCommand::AutostartSet),
+        "protocol-client-set" => Some(WindowCommand::ProtocolClientSet),
+        "protocol-client-remove" => Some(WindowCommand::ProtocolClientRemove),
+        "session-list-site-data" => Some(WindowCommand::SessionListSiteData),
+        "session-clear-site-data" => Some(WindowCommand::SessionClearSiteData),
+        "session-clear-cookies" => Some(WindowCommand::SessionClearCookies),
+        "session-clear-cache" => Some(WindowCommand::SessionClearCache),
+        "open-child-window" => Some(WindowCommand::OpenChildWindow),
+        _ => None,
+    }
+}
+
+/// Parse a bridge command string into a window command, if it is one.
+pub fn parse_window_command(command: &str) -> Option<WindowCommand> {
+    let name = command.strip_prefix(WINDOW_COMMAND_PREFIX)?;
+    parse_window_command_name(name)
+}
+
+/// Classify an incoming prompt message using the per-launch session token.
+///
+/// Privileged commands (`qv-window:*`) and async correlated commands
+/// (`qv-window-async:<id>:<cmd>`, `qv-app-async:<id>:<cmd>`) MUST arrive
+/// wrapped with `qv-tok:<session_token>:` via the frozen preload bridge;
+/// raw unauthenticated calls or wrong tokens are rejected.
+pub fn classify_command<'a>(raw_message: &'a str, session_token: &str) -> BridgeCommand<'a> {
+    if let Some(rest) = raw_message.strip_prefix(TOKEN_COMMAND_PREFIX) {
+        let Some((token, inner)) = rest.split_once(':') else {
+            return BridgeCommand::Rejected("不正なブリッジ認証形式です".to_owned());
+        };
+        if !constant_time_eq(token, session_token) {
+            return BridgeCommand::Rejected("ブリッジ認証トークンが一致しません".to_owned());
+        }
+        if let Some(win_async) = inner.strip_prefix(WINDOW_ASYNC_PREFIX) {
+            let Some((id_str, cmd_name)) = win_async.split_once(':') else {
+                return BridgeCommand::Rejected(
+                    "不正な非同期ウィンドウコマンド形式です".to_owned(),
+                );
+            };
+            let Ok(call_id) = id_str.parse::<u64>() else {
+                return BridgeCommand::Rejected("非同期 call_id が不正です".to_owned());
+            };
+            if call_id == 0 {
+                return BridgeCommand::Rejected("非同期 call_id に 0 は指定できません".to_owned());
+            }
+            return match parse_window_command_name(cmd_name) {
+                Some(command) => BridgeCommand::WindowAsync { call_id, command },
+                None => {
+                    BridgeCommand::Rejected(format!("未対応の非同期ウィンドウコマンド: {cmd_name}"))
+                }
+            };
+        }
+        if let Some(app_async) = inner.strip_prefix(APP_ASYNC_PREFIX) {
+            let Some((id_str, app_cmd)) = app_async.split_once(':') else {
+                return BridgeCommand::Rejected("不正な非同期アプリコマンド形式です".to_owned());
+            };
+            let Ok(call_id) = id_str.parse::<u64>() else {
+                return BridgeCommand::Rejected("非同期 call_id が不正です".to_owned());
+            };
+            if call_id == 0 || app_cmd.is_empty() || app_cmd.starts_with("qv-") {
+                return BridgeCommand::Rejected("不正な非同期アプリコマンド指定です".to_owned());
+            }
+            return BridgeCommand::AppAsync {
+                call_id,
+                command: app_cmd,
+            };
+        }
+        return match parse_window_command(inner) {
+            Some(cmd) => BridgeCommand::Window(cmd),
+            None => BridgeCommand::Rejected(format!("未対応のウィンドウコマンド: {inner}")),
+        };
+    }
+    if raw_message.starts_with(WINDOW_COMMAND_PREFIX)
+        || raw_message.starts_with(WINDOW_ASYNC_PREFIX)
+        || raw_message.starts_with(APP_ASYNC_PREFIX)
+    {
+        return BridgeCommand::Rejected(
+            "未認証の特権コマンドは拒否されました（window.QuantumView API を使用してください）"
+                .to_owned(),
+        );
+    }
+    BridgeCommand::App(raw_message)
+}
+
+/// Strict allowlist for `qv-window:open-external` (see `docs/electron-mapping.md`
+/// §1 `shell`). Only `https://` URLs with a non-empty host and `mailto:`
+/// addresses without control/whitespace characters are permitted; `file:`,
+/// `http:`, `javascript:`, executables, and UNC paths are always rejected.
+pub fn allows_external_url(url: &str) -> bool {
+    let trimmed = url.trim();
+    if trimmed.is_empty()
+        || trimmed != url
+        || trimmed
+            .chars()
+            .any(|ch| ch.is_control() || ch.is_whitespace())
+    {
+        return false;
+    }
+    let Some((scheme, rest)) = trimmed.split_once(':') else {
+        return false;
+    };
+    match scheme.to_ascii_lowercase().as_str() {
+        "https" => {
+            let Some(after_slashes) = rest.strip_prefix("//") else {
+                return false;
+            };
+            if after_slashes.contains('\\') || after_slashes.contains('"') {
+                return false;
+            }
+            let authority = after_slashes.split(['/', '?', '#']).next().unwrap_or("");
+            !authority.is_empty() && !authority.starts_with('@')
+        }
+        "mailto" => !rest.is_empty() && !rest.starts_with("//") && rest.contains('@'),
+        _ => false,
+    }
+}
+
+/// Navigation policy for local QuantumView apps (Milestone B: external URL
+/// blocking).
+pub fn allows_navigation(url: &str) -> bool {
+    let Some((scheme, rest)) = url.split_once(':') else {
+        return false;
+    };
+    if scheme.is_empty()
+        || !scheme
+            .chars()
+            .next()
+            .is_some_and(|ch| ch.is_ascii_alphabetic())
+        || !scheme
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '+' | '-' | '.'))
+    {
+        return false;
+    }
+    match scheme.to_ascii_lowercase().as_str() {
+        "file" => {
+            let Some(after_slashes) = rest.strip_prefix("//") else {
+                return false;
+            };
+            let authority = after_slashes.split('/').next().unwrap_or("");
+            authority.is_empty() || authority.eq_ignore_ascii_case("localhost")
+        }
+        "qv" => {
+            let Some(after_slashes) = rest.strip_prefix("//") else {
+                return false;
+            };
+            let authority = after_slashes.split(['/', '?', '#']).next().unwrap_or("");
+            authority.eq_ignore_ascii_case("app")
+        }
+        "about" => rest.eq_ignore_ascii_case("blank"),
+        _ => false,
+    }
+}
+
+/// Navigation policy that additionally permits the active loopback `--dev-url`
+/// origin when explicitly configured for frontend HMR development.
+pub fn allows_navigation_with_dev(url: &str, dev_origin: Option<&DevOrigin>) -> bool {
+    if allows_navigation(url) {
+        return true;
+    }
+    dev_origin.is_some_and(|dev| dev.matches_url(url))
+}
+
+/// Render [`PRELOAD_SCRIPT`] with the per-launch session token injected into
+/// its private closure.
+pub fn render_preload_script(session_token: &str) -> String {
+    PRELOAD_SCRIPT.replace(TOKEN_PLACEHOLDER, &js_string_literal(session_token))
+}
+
+/// Preload script template injected into every page via `UserContentManager`.
+///
+/// Use [`render_preload_script`] to substitute the per-launch session token
+/// before passing the script to `UserScript::new`.
+pub const PRELOAD_SCRIPT: &str = r#"
+(() => {
+  if (window.QuantumView && window.QuantumView.__installed) return;
+  const SESSION_TOKEN = __QV_SESSION_TOKEN__;
+  const nativePrompt = window.prompt.bind(window);
+  const listeners = new Map();
+  const pendingAsync = new Map();
+  let nextAsyncId = 1;
+
+  function parseReply(raw) {
+    if (typeof raw !== "string") return { ok: false, error: "cancelled" };
+    if (raw.startsWith("ok:")) return { ok: true, data: raw.slice(3) };
+    if (raw.startsWith("err:")) return { ok: false, error: raw.slice(4) };
+    return { ok: false, error: "ホスト応答なし" };
+  }
+
+  function parseJsonReply(reply) {
+    if (!reply.ok) return reply;
+    try {
+      return { ok: true, data: JSON.parse(reply.data) };
+    } catch (error) {
+      return { ok: false, error: "JSON 応答の解析に失敗しました" };
+    }
+  }
+
+  function callApp(command, payload) {
+    const cmd = String(command);
+    if (cmd.startsWith("qv-")) {
+      return { ok: false, error: "特権コマンドは window.QuantumView API 経由で呼んでください" };
+    }
+    return parseReply(nativePrompt(cmd, payload == null ? "" : String(payload)));
+  }
+
+  function callHostWindow(name, payload) {
+    const tagged = "qv-tok:" + SESSION_TOKEN + ":qv-window:" + name;
+    return parseReply(nativePrompt(tagged, payload == null ? "" : String(payload)));
+  }
+
+  function callAppAsync(command, payload) {
+    const cmd = String(command);
+    if (cmd.startsWith("qv-")) {
+      return Promise.resolve({ ok: false, error: "特権コマンドは window.QuantumView API 経由で呼んでください" });
+    }
+    const callId = nextAsyncId++;
+    return new Promise((resolve) => {
+      pendingAsync.set(callId, { resolve, parseJson: false });
+      const tagged = "qv-tok:" + SESSION_TOKEN + ":qv-app-async:" + callId + ":" + cmd;
+      const syncAck = parseReply(nativePrompt(tagged, payload == null ? "" : String(payload)));
+      if (!syncAck.ok) {
+        pendingAsync.delete(callId);
+        resolve(syncAck);
+      }
+    });
+  }
+
+  function callHostWindowAsync(name, payload, parseJson) {
+    const callId = nextAsyncId++;
+    return new Promise((resolve) => {
+      pendingAsync.set(callId, { resolve, parseJson: Boolean(parseJson) });
+      const tagged = "qv-tok:" + SESSION_TOKEN + ":qv-window-async:" + callId + ":" + name;
+      const syncAck = parseReply(nativePrompt(tagged, payload == null ? "" : String(payload)));
+      if (!syncAck.ok) {
+        pendingAsync.delete(callId);
+        resolve(syncAck);
+      }
+    });
+  }
+
+  const resolveAsyncFn = (callId, ok, payload, isJson) => {
+    const entry = pendingAsync.get(callId);
+    if (!entry) return;
+    pendingAsync.delete(callId);
+    if (!ok) {
+      entry.resolve({ ok: false, error: String(payload) });
+      return;
+    }
+    if (isJson || entry.parseJson) {
+      try {
+        entry.resolve({ ok: true, data: JSON.parse(payload) });
+      } catch (_) {
+        entry.resolve({ ok: false, error: "JSON 応答の解析に失敗しました" });
+      }
+    } else {
+      entry.resolve({ ok: true, data: payload });
+    }
+  };
+  Object.defineProperty(window, "__quantumviewResolveAsync", {
+    value: resolveAsyncFn,
+    writable: false,
+    configurable: false,
+    enumerable: false,
+  });
+
+  function bytesToBase64(bytes) {
+    let binary = "";
+    const chunkSize = 0x8000;
+    for (let i = 0; i < bytes.length; i += chunkSize) {
+      binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunkSize));
+    }
+    return btoa(binary);
+  }
+
+  function dispatchSyntheticDropEvent(event, data) {
+    if (typeof document === "undefined" || typeof CustomEvent !== "function") return;
+    if (event === "file-drop-hover") {
+      if (document.documentElement) document.documentElement.classList.add("qv-file-drop-hover");
+      document.dispatchEvent(new CustomEvent("qv:file-drop-hover", { detail: data }));
+    } else if (event === "file-drop-cancel") {
+      if (document.documentElement) document.documentElement.classList.remove("qv-file-drop-hover");
+      document.dispatchEvent(new CustomEvent("qv:file-drop-cancel", { detail: data }));
+    } else if (event === "file-drop") {
+      if (document.documentElement) document.documentElement.classList.remove("qv-file-drop-hover");
+      let target = document.body || document.documentElement || document;
+      if (data && typeof data.x === "number" && typeof data.y === "number" && typeof document.elementFromPoint === "function") {
+        target = document.elementFromPoint(data.x, data.y) || target;
+      }
+      target.dispatchEvent(new CustomEvent("qv:file-drop", { detail: data, bubbles: true, cancelable: true }));
+    }
+  }
+
+  const dispatchFn = (event, data) => {
+    dispatchSyntheticDropEvent(event, data);
+    const set = listeners.get(event);
+    if (!set) return;
+    for (const fn of [...set]) {
+      try { fn(data); } catch (error) { console.error(error); }
+    }
+  };
+  Object.defineProperty(window, "__quantumviewDispatch", {
+    value: dispatchFn,
+    writable: false,
+    configurable: false,
+    enumerable: false,
+  });
+
+  const windowApi = Object.freeze({
+    drag() { return callHostWindow("drag", ""); },
+    dragResize(direction) { return callHostWindow("drag-resize", direction == null ? "" : String(direction)); },
+    minimize() { return callHostWindow("minimize", ""); },
+    toggleMaximize() { return callHostWindow("toggle-maximize", ""); },
+    isMaximized() { return callHostWindow("is-maximized", ""); },
+    setTitle(title) { return callHostWindow("set-title", title == null ? "" : String(title)); },
+    setFullscreen(enabled) { return callHostWindow("set-fullscreen", enabled ? "true" : "false"); },
+    isFullscreen() { return callHostWindow("is-fullscreen", ""); },
+    setAlwaysOnTop(enabled) { return callHostWindow("set-always-on-top", enabled ? "true" : "false"); },
+    focus() { return callHostWindow("focus", ""); },
+    requestUserAttention(level) {
+      const v = level === true ? "critical" : (level === false || level == null ? "" : String(level));
+      return callHostWindow("request-user-attention", v);
+    },
+    getBounds() { return parseJsonReply(callHostWindow("get-bounds", "")); },
+    setSize(width, height) {
+      if (!Number.isInteger(width) || !Number.isInteger(height) || width <= 0 || height <= 0) {
+        return { ok: false, error: "Width and height must be positive integers" };
+      }
+      return callHostWindow("set-size", JSON.stringify({ width, height }));
+    },
+    goBack() { return callHostWindow("go-back", ""); },
+    goForward() { return callHostWindow("go-forward", ""); },
+    canGoBack() { return callHostWindow("can-go-back", ""); },
+    canGoForward() { return callHostWindow("can-go-forward", ""); },
+    showChips() { return callHostWindow("chips", ""); },
+    showFlyout() { return callHostWindow("flyout", ""); },
+    hide() { return callHostWindow("hide", ""); },
+    show() { return callHostWindow("show", ""); },
+    close() { return callHostWindow("close", ""); },
+    reload() { return callHostWindow("reload", ""); },
+    hardReload() { return callHostWindow("hard-reload", ""); },
+    zoomIn() { return callHostWindow("zoom-in", ""); },
+    zoomOut() { return callHostWindow("zoom-out", ""); },
+    zoomReset() { return callHostWindow("zoom-reset", ""); },
+    openExternal(url) { return callHostWindow("open-external", url == null ? "" : String(url)); },
+    setOpacity(opacity) { return callHostWindow("set-opacity", String(Number(opacity))); },
+    setClickThrough(enabled) { return callHostWindow("set-click-through", enabled ? "true" : "false"); },
+    capturePng(name) {
+      return callHostWindow("capture-png", JSON.stringify({ name: name ? String(name) : "capture.png" }));
+    },
+    capturePngAsync(name) {
+      return callHostWindowAsync("capture-png", JSON.stringify({ name: name ? String(name) : "capture.png" }), false);
+    },
+    exportHtml(name) {
+      const html = (typeof document !== "undefined" && document.documentElement)
+        ? "<!DOCTYPE html>\n" + document.documentElement.outerHTML
+        : "";
+      return callHostWindow("export-html", JSON.stringify({
+        name: name ? String(name) : "export.html",
+        text: html,
+      }));
+    },
+    exportHtmlAsync(name) {
+      const html = (typeof document !== "undefined" && document.documentElement)
+        ? "<!DOCTYPE html>\n" + document.documentElement.outerHTML
+        : "";
+      return callHostWindowAsync("export-html", JSON.stringify({
+        name: name ? String(name) : "export.html",
+        text: html,
+      }), false);
+    },
+    exportPdf(name) {
+      return callHostWindow("export-pdf", JSON.stringify({ name: name ? String(name) : "capture.pdf" }));
+    },
+    exportPdfAsync(name) {
+      return callHostWindowAsync("export-pdf", JSON.stringify({ name: name ? String(name) : "capture.pdf" }), false);
+    },
+    openChild(options) {
+      const opts = typeof options === "string" ? { url: options } : (options || {});
+      return callHostWindow("open-child-window", JSON.stringify({
+        url: opts.url ? String(opts.url) : "about:blank",
+        title: opts.title ? String(opts.title) : "",
+        width: typeof opts.width === "number" ? opts.width : 800,
+        height: typeof opts.height === "number" ? opts.height : 600,
+      }));
+    },
+    getTheme() { return callHostWindow("get-theme", ""); },
+    getPlatform() { return parseJsonReply(callHostWindow("get-platform", "")); },
+  });
+
+  const dialogApi = Object.freeze({
+    openFile(options) {
+      const opts = options && typeof options === "object" ? options : {};
+      const payload = JSON.stringify({
+        extensions: Array.isArray(opts.extensions) ? opts.extensions.map(String) : [],
+        multiple: Boolean(opts.multiple),
+      });
+      return parseJsonReply(callHostWindow("dialog-open-file", payload));
+    },
+    openFileAsync(options) {
+      const opts = options && typeof options === "object" ? options : {};
+      const payload = JSON.stringify({
+        extensions: Array.isArray(opts.extensions) ? opts.extensions.map(String) : [],
+        multiple: Boolean(opts.multiple),
+      });
+      return callHostWindowAsync("dialog-open-file", payload, true);
+    },
+    selectFolder(options) {
+      const opts = options && typeof options === "object" ? options : {};
+      const title = opts.title ? String(opts.title) : "";
+      return callHostWindow("dialog-select-folder", title);
+    },
+    selectFolderAsync(options) {
+      const opts = options && typeof options === "object" ? options : {};
+      const title = opts.title ? String(opts.title) : "";
+      return callHostWindowAsync("dialog-select-folder", title, false);
+    },
+    saveTextFile(options) {
+      const opts = options && typeof options === "object" ? options : {};
+      const payload = JSON.stringify({
+        name: opts.name ? String(opts.name) : "export.txt",
+        extensions: Array.isArray(opts.extensions) ? opts.extensions.map(String) : [],
+        text: opts.text == null ? "" : String(opts.text),
+      });
+      return callHostWindow("dialog-save-file", payload);
+    },
+    saveTextFileAsync(options) {
+      const opts = options && typeof options === "object" ? options : {};
+      const payload = JSON.stringify({
+        name: opts.name ? String(opts.name) : "export.txt",
+        extensions: Array.isArray(opts.extensions) ? opts.extensions.map(String) : [],
+        text: opts.text == null ? "" : String(opts.text),
+      });
+      return callHostWindowAsync("dialog-save-file", payload, false);
+    },
+    saveBase64File(options) {
+      const opts = options && typeof options === "object" ? options : {};
+      const payload = JSON.stringify({
+        name: opts.name ? String(opts.name) : "export.bin",
+        extensions: Array.isArray(opts.extensions) ? opts.extensions.map(String) : [],
+        dataBase64: opts.dataBase64 == null ? "" : String(opts.dataBase64),
+      });
+      return callHostWindow("dialog-save-file", payload);
+    },
+    saveBase64FileAsync(options) {
+      const opts = options && typeof options === "object" ? options : {};
+      const payload = JSON.stringify({
+        name: opts.name ? String(opts.name) : "export.bin",
+        extensions: Array.isArray(opts.extensions) ? opts.extensions.map(String) : [],
+        dataBase64: opts.dataBase64 == null ? "" : String(opts.dataBase64),
+      });
+      return callHostWindowAsync("dialog-save-file", payload, false);
+    },
+  });
+
+  const filesApi = Object.freeze({
+    readText(token) { return callHostWindow("file-read-text", token == null ? "" : String(token)); },
+    readTextAsync(token) { return callHostWindowAsync("file-read-text", token == null ? "" : String(token), false); },
+    readBase64(token) { return callHostWindow("file-read-base64", token == null ? "" : String(token)); },
+    readBase64Async(token) { return callHostWindowAsync("file-read-base64", token == null ? "" : String(token), false); },
+  });
+
+  const safeStorageApi = Object.freeze({
+    encrypt(plaintext) { return callHostWindow("safe-storage-encrypt", plaintext == null ? "" : String(plaintext)); },
+    encryptAsync(plaintext) { return callHostWindowAsync("safe-storage-encrypt", plaintext == null ? "" : String(plaintext), false); },
+    decrypt(ciphertextBase64) { return callHostWindow("safe-storage-decrypt", ciphertextBase64 == null ? "" : String(ciphertextBase64)); },
+    decryptAsync(ciphertextBase64) { return callHostWindowAsync("safe-storage-decrypt", ciphertextBase64 == null ? "" : String(ciphertextBase64), false); },
+  });
+
+  const clipboardApi = Object.freeze({
+    readText() { return callHostWindow("clipboard-read-text", ""); },
+    readTextAsync() { return callHostWindowAsync("clipboard-read-text", "", false); },
+    writeText(text) { return callHostWindow("clipboard-write-text", text == null ? "" : String(text)); },
+    writeTextAsync(text) { return callHostWindowAsync("clipboard-write-text", text == null ? "" : String(text), false); },
+    readHtml() { return callHostWindow("clipboard-read-html", ""); },
+    readHtmlAsync() { return callHostWindowAsync("clipboard-read-html", "", false); },
+    writeHtml(html) { return callHostWindow("clipboard-write-html", html == null ? "" : String(html)); },
+    writeHtmlAsync(html) { return callHostWindowAsync("clipboard-write-html", html == null ? "" : String(html), false); },
+    readImage() { return parseJsonReply(callHostWindow("clipboard-read-image", "")); },
+    readImageAsync() { return callHostWindowAsync("clipboard-read-image", "", true); },
+    writeImage(options) {
+      const opts = options && typeof options === "object" ? options : {};
+      return callHostWindow("clipboard-write-image", JSON.stringify({
+        width: Number(opts.width) || 0,
+        height: Number(opts.height) || 0,
+        rgbaBase64: opts.rgbaBase64 ? String(opts.rgbaBase64) : "",
+        bmpBase64: opts.bmpBase64 ? String(opts.bmpBase64) : "",
+      }));
+    },
+    writeImageAsync(options) {
+      const opts = options && typeof options === "object" ? options : {};
+      return callHostWindowAsync("clipboard-write-image", JSON.stringify({
+        width: Number(opts.width) || 0,
+        height: Number(opts.height) || 0,
+        rgbaBase64: opts.rgbaBase64 ? String(opts.rgbaBase64) : "",
+        bmpBase64: opts.bmpBase64 ? String(opts.bmpBase64) : "",
+      }), false);
+    },
+    clear() { return callHostWindow("clipboard-clear", ""); },
+  });
+
+  const autostartApi = Object.freeze({
+    isEnabled() { return parseJsonReply(callHostWindow("autostart-get", "")); },
+    setEnabled(enabled) { return callHostWindow("autostart-set", enabled ? "true" : "false"); },
+  });
+
+  const protocolClientApi = Object.freeze({
+    register(scheme) { return callHostWindow("protocol-client-set", scheme == null ? "" : String(scheme)); },
+    unregister(scheme) { return callHostWindow("protocol-client-remove", scheme == null ? "" : String(scheme)); },
+  });
+
+  const sessionApi = Object.freeze({
+    listSiteData() { return parseJsonReply(callHostWindow("session-list-site-data", "")); },
+    listSiteDataAsync() { return callHostWindowAsync("session-list-site-data", "", true); },
+    clearSiteData() { return callHostWindow("session-clear-site-data", ""); },
+    clearSiteDataAsync() { return callHostWindowAsync("session-clear-site-data", "", false); },
+    clearCookies(options) {
+      const sessionOnly = Boolean(options && options.sessionOnly);
+      return callHostWindow("session-clear-cookies", sessionOnly ? "session" : "all");
+    },
+    clearCookiesAsync(options) {
+      const sessionOnly = Boolean(options && options.sessionOnly);
+      return callHostWindowAsync("session-clear-cookies", sessionOnly ? "session" : "all", false);
+    },
+    clearCache() { return callHostWindow("session-clear-cache", ""); },
+    clearCacheAsync() { return callHostWindowAsync("session-clear-cache", "", false); },
+  });
+
+  const api = Object.freeze({
+    __installed: true,
+    invoke: callApp,
+    invokeAsync: callAppAsync,
+    on(event, fn) {
+      if (typeof fn !== "function") return;
+      if (!listeners.has(event)) listeners.set(event, new Set());
+      listeners.get(event).add(fn);
+    },
+    off(event, fn) {
+      const set = listeners.get(event);
+      if (set) set.delete(fn);
+    },
+    notify(options) {
+      const opts = typeof options === "string" ? { title: document.title || "QuantumView", body: options } : (options || {});
+      return callHostWindow("notify", JSON.stringify({
+        title: opts.title == null ? (document.title || "QuantumView") : String(opts.title),
+        body: opts.body == null ? "" : String(opts.body),
+      }));
+    },
+    window: windowApi,
+    dialog: dialogApi,
+    files: filesApi,
+    safeStorage: safeStorageApi,
+    clipboard: clipboardApi,
+    autostart: autostartApi,
+    protocolClient: protocolClientApi,
+    session: sessionApi,
+  });
+
+  Object.defineProperty(window, "QuantumView", {
+    value: api,
+    writable: false,
+    configurable: false,
+    enumerable: true,
+  });
+
+  // Fallback for window.print() (unsupported in Servo 0.7.0) -> raster PDF export dialog.
+  try {
+    window.print = () => {
+      const title = (typeof document !== "undefined" && document.title) ? document.title : "page";
+      return windowApi.exportPdf(title + ".pdf");
+    };
+  } catch (_) {}
+
+  // --- Engine-gap shim 1: HTML Popover API polyfill (missing in Servo 0.7.0) ---
+  // Note: Popover CSS rules are injected at Origin::User via UserStyleSheet
+  // (POPOVER_POLYFILL_CSS) so strict author `style-src 'self'` CSP is preserved.
+  if (typeof HTMLElement !== "undefined" && !("popover" in HTMLElement.prototype)) {
+    const openAuto = [];
+    const normalizeMode = (el) => {
+      if (!el.hasAttribute("popover")) return null;
+      const raw = (el.getAttribute("popover") || "").toLowerCase();
+      return raw === "manual" ? "manual" : "auto";
+    };
+    const emitToggle = (el, type, oldState, newState, cancelable) => {
+      const ev = new Event(type, { bubbles: false, cancelable });
+      try {
+        Object.defineProperty(ev, "oldState", { value: oldState });
+        Object.defineProperty(ev, "newState", { value: newState });
+      } catch (_) {}
+      return el.dispatchEvent(ev);
+    };
+    const hideOne = (el) => {
+      if (!el.classList.contains("qv-popover-open")) return;
+      emitToggle(el, "beforetoggle", "open", "closed", false);
+      el.classList.remove("qv-popover-open");
+      const idx = openAuto.indexOf(el);
+      if (idx >= 0) openAuto.splice(idx, 1);
+      emitToggle(el, "toggle", "open", "closed", false);
+    };
+    const hideAutoExceptAncestors = (target) => {
+      for (let i = openAuto.length - 1; i >= 0; i--) {
+        const pop = openAuto[i];
+        if (target && (pop === target || pop.contains(target))) continue;
+        hideOne(pop);
+      }
+    };
+    Object.defineProperty(HTMLElement.prototype, "popover", {
+      configurable: true,
+      get() { return normalizeMode(this); },
+      set(val) {
+        if (val == null) this.removeAttribute("popover");
+        else this.setAttribute("popover", String(val));
+      },
+    });
+    HTMLElement.prototype.showPopover = function showPopover() {
+      const mode = normalizeMode(this);
+      if (!mode) throw new DOMException("Element does not have a popover attribute", "NotSupportedError");
+      if (this.classList.contains("qv-popover-open")) return;
+      if (!emitToggle(this, "beforetoggle", "closed", "open", true)) return;
+      if (mode === "auto") {
+        hideAutoExceptAncestors(this);
+        openAuto.push(this);
+      }
+      this.classList.add("qv-popover-open");
+      emitToggle(this, "toggle", "closed", "open", false);
+    };
+    HTMLElement.prototype.hidePopover = function hidePopover() {
+      const mode = normalizeMode(this);
+      if (!mode) throw new DOMException("Element does not have a popover attribute", "NotSupportedError");
+      hideOne(this);
+    };
+    HTMLElement.prototype.togglePopover = function togglePopover(force) {
+      const isOpen = this.classList.contains("qv-popover-open");
+      const wantOpen = force === undefined ? !isOpen : Boolean(force);
+      if (wantOpen) {
+        this.showPopover();
+        return this.classList.contains("qv-popover-open");
+      }
+      this.hidePopover();
+      return false;
+    };
+    if (typeof document !== "undefined") {
+      document.addEventListener("click", (event) => {
+        const el = event.target instanceof Element ? event.target : null;
+        const trigger = el ? el.closest("[popovertarget]") : null;
+        if (trigger) {
+          const id = trigger.getAttribute("popovertarget");
+          const target = id ? document.getElementById(id) : null;
+          if (target && normalizeMode(target)) {
+            const action = (trigger.getAttribute("popovertargetaction") || "toggle").toLowerCase();
+            if (action === "show") target.showPopover();
+            else if (action === "hide") target.hidePopover();
+            else target.togglePopover();
+            return;
+          }
+        }
+        hideAutoExceptAncestors(el);
+      });
+      document.addEventListener("keydown", (event) => {
+        if (event.key === "Escape" && openAuto.length > 0) {
+          hideOne(openAuto[openAuto.length - 1]);
+        }
+      });
+    }
+  }
+
+  // --- Engine-gap shim 2: Declarative -webkit-app-region: drag / [data-qv-drag] ---
+  if (typeof document !== "undefined") {
+    const INTERACTIVE = "button, a, input, select, textarea, label, [contenteditable='true'], [role='button']";
+    const readAppRegion = (el) => {
+      if (el.hasAttribute("data-qv-no-drag")) return "no-drag";
+      if (el.hasAttribute("data-qv-drag")) return "drag";
+      const inline = el.style && el.style.getPropertyValue ? el.style.getPropertyValue("-webkit-app-region").trim().toLowerCase() : "";
+      if (inline === "drag" || inline === "no-drag") return inline;
+      if (typeof window.getComputedStyle === "function") {
+        const custom = window.getComputedStyle(el).getPropertyValue("--qv-app-region").trim().toLowerCase();
+        if (custom === "drag" || custom === "no-drag") return custom;
+      }
+      return "";
+    };
+    document.addEventListener("mousedown", (event) => {
+      if (event.button !== 0 || event.defaultPrevented) return;
+      let node = event.target instanceof Element ? event.target : null;
+      while (node) {
+        if (node.matches && node.matches(INTERACTIVE)) return;
+        const region = readAppRegion(node);
+        if (region === "no-drag") return;
+        if (region === "drag") {
+          windowApi.drag();
+          return;
+        }
+        node = node.parentElement;
+      }
+    });
+  }
+
+  // --- Engine-gap shim 3: <a download> for data: and blob: URLs ---
+  if (typeof document !== "undefined") {
+    document.addEventListener("click", (event) => {
+      if (event.defaultPrevented) return;
+      const el = event.target instanceof Element ? event.target : null;
+      const anchor = el ? el.closest("a[download][href]") : null;
+      if (!anchor) return;
+      const href = anchor.getAttribute("href") || "";
+      const suggested = anchor.getAttribute("download") || "download.bin";
+      if (href.startsWith("data:")) {
+        event.preventDefault();
+        const comma = href.indexOf(",");
+        if (comma < 0) return;
+        const meta = href.slice(5, comma);
+        const body = href.slice(comma + 1);
+        let dataBase64;
+        if (/;base64/i.test(meta)) {
+          dataBase64 = body;
+        } else {
+          const decoded = decodeURIComponent(body);
+          dataBase64 = bytesToBase64(new TextEncoder().encode(decoded));
+        }
+        callHostWindow("save-download", JSON.stringify({ name: suggested, dataBase64 }));
+      } else if (href.startsWith("blob:")) {
+        event.preventDefault();
+        fetch(href)
+          .then((res) => res.arrayBuffer())
+          .then((buf) => {
+            const dataBase64 = bytesToBase64(new Uint8Array(buf));
+            callHostWindow("save-download", JSON.stringify({ name: suggested, dataBase64 }));
+          })
+          .catch((error) => console.error("[qv download]", error));
+      }
+    }, true);
+  }
+})();
+"#;
+
+/// Escape a string as a double-quoted JavaScript string literal (including
+/// the surrounding quotes), safe to embed in an evaluated script.
+pub fn js_string_literal(value: &str) -> String {
+    let mut out = String::with_capacity(value.len() + 2);
+    out.push('"');
+    for ch in value.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            '\u{2028}' => out.push_str("\\u2028"),
+            '\u{2029}' => out.push_str("\\u2029"),
+            ch if (ch as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", ch as u32)),
+            ch => out.push(ch),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// Build the script that delivers a host → page event to the preload
+/// listener registry. `data_json` must already be a JSON value (for example
+/// `{"x":10,"y":20}` or `"chips"`); it is parsed back into a JS value by the
+/// evaluated script so listeners receive objects, not strings.
+pub fn dispatch_script(event: &str, data_json: &str) -> String {
+    format!(
+        "window.__quantumviewDispatch && window.__quantumviewDispatch({}, JSON.parse({}));",
+        js_string_literal(event),
+        js_string_literal(data_json),
+    )
+}
+
+/// Build the script that resolves a pending `QuantumView.invokeAsync` /
+/// `*Async` Promise in the preload bridge.
+pub fn resolve_async_script(call_id: u64, ok: bool, payload: &str, is_json: bool) -> String {
+    format!(
+        "window.__quantumviewResolveAsync && window.__quantumviewResolveAsync({call_id}, {ok}, {}, {is_json});",
+        js_string_literal(payload),
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn window_commands_parse() {
+        assert_eq!(
+            parse_window_command("qv-window:drag"),
+            Some(WindowCommand::Drag)
+        );
+        for (name, command) in [
+            ("set-title", WindowCommand::SetTitle),
+            ("set-fullscreen", WindowCommand::SetFullscreen),
+            ("is-fullscreen", WindowCommand::IsFullscreen),
+            ("set-always-on-top", WindowCommand::SetAlwaysOnTop),
+            ("focus", WindowCommand::Focus),
+            (
+                "request-user-attention",
+                WindowCommand::RequestUserAttention,
+            ),
+            ("get-bounds", WindowCommand::GetBounds),
+            ("set-size", WindowCommand::SetSize),
+            ("go-back", WindowCommand::GoBack),
+            ("go-forward", WindowCommand::GoForward),
+            ("can-go-back", WindowCommand::CanGoBack),
+            ("can-go-forward", WindowCommand::CanGoForward),
+        ] {
+            assert_eq!(
+                parse_window_command(&format!("qv-window:{name}")),
+                Some(command)
+            );
+            assert_eq!(command.as_str(), name);
+        }
+        assert_eq!(
+            parse_window_command("qv-window:chips"),
+            Some(WindowCommand::ShowChips)
+        );
+        assert_eq!(
+            parse_window_command("qv-window:flyout"),
+            Some(WindowCommand::ShowFlyout)
+        );
+        assert_eq!(
+            parse_window_command("qv-window:hard-reload"),
+            Some(WindowCommand::HardReload)
+        );
+        assert_eq!(
+            parse_window_command("qv-window:zoom-in"),
+            Some(WindowCommand::ZoomIn)
+        );
+        assert_eq!(
+            parse_window_command("qv-window:zoom-out"),
+            Some(WindowCommand::ZoomOut)
+        );
+        assert_eq!(
+            parse_window_command("qv-window:zoom-reset"),
+            Some(WindowCommand::ZoomReset)
+        );
+        assert_eq!(
+            parse_window_command("qv-window:open-external"),
+            Some(WindowCommand::OpenExternal)
+        );
+        assert_eq!(
+            parse_window_command("qv-window:set-opacity"),
+            Some(WindowCommand::SetOpacity)
+        );
+        assert_eq!(
+            parse_window_command("qv-window:set-click-through"),
+            Some(WindowCommand::SetClickThrough)
+        );
+        assert_eq!(
+            parse_window_command("qv-window:capture-png"),
+            Some(WindowCommand::CapturePng)
+        );
+        assert_eq!(
+            parse_window_command("qv-window:export-html"),
+            Some(WindowCommand::ExportHtml)
+        );
+        assert_eq!(
+            parse_window_command("qv-window:export-pdf"),
+            Some(WindowCommand::ExportPdf)
+        );
+        assert_eq!(
+            parse_window_command("qv-window:save-download"),
+            Some(WindowCommand::SaveDownload)
+        );
+        assert_eq!(
+            parse_window_command("qv-window:dialog-open-file"),
+            Some(WindowCommand::DialogOpenFile)
+        );
+        assert_eq!(
+            parse_window_command("qv-window:dialog-save-file"),
+            Some(WindowCommand::DialogSaveFile)
+        );
+        assert_eq!(
+            parse_window_command("qv-window:file-read-text"),
+            Some(WindowCommand::FileReadText)
+        );
+        assert_eq!(
+            parse_window_command("qv-window:file-read-base64"),
+            Some(WindowCommand::FileReadBase64)
+        );
+        assert_eq!(
+            parse_window_command("qv-window:safe-storage-encrypt"),
+            Some(WindowCommand::SafeStorageEncrypt)
+        );
+        assert_eq!(
+            parse_window_command("qv-window:safe-storage-decrypt"),
+            Some(WindowCommand::SafeStorageDecrypt)
+        );
+        assert_eq!(
+            parse_window_command("qv-window:notify"),
+            Some(WindowCommand::Notify)
+        );
+        assert_eq!(
+            parse_window_command("qv-window:get-theme"),
+            Some(WindowCommand::GetTheme)
+        );
+        assert_eq!(
+            parse_window_command("qv-window:get-platform"),
+            Some(WindowCommand::GetPlatform)
+        );
+        assert_eq!(
+            parse_window_command("qv-window:clipboard-read-text"),
+            Some(WindowCommand::ClipboardReadText)
+        );
+        assert_eq!(
+            parse_window_command("qv-window:clipboard-write-html"),
+            Some(WindowCommand::ClipboardWriteHtml)
+        );
+        assert_eq!(
+            parse_window_command("qv-window:clipboard-read-image"),
+            Some(WindowCommand::ClipboardReadImage)
+        );
+        assert_eq!(
+            parse_window_command("qv-window:autostart-set"),
+            Some(WindowCommand::AutostartSet)
+        );
+        assert_eq!(
+            parse_window_command("qv-window:protocol-client-set"),
+            Some(WindowCommand::ProtocolClientSet)
+        );
+        assert_eq!(
+            parse_window_command("qv-window:session-clear-cookies"),
+            Some(WindowCommand::SessionClearCookies)
+        );
+        assert_eq!(
+            parse_window_command("qv-window:open-child-window"),
+            Some(WindowCommand::OpenChildWindow)
+        );
+        assert_eq!(parse_window_command("qv-window:nope"), None);
+        assert_eq!(parse_window_command("load"), None);
+        assert_eq!(parse_window_command("save"), None);
+    }
+
+    #[test]
+    fn window_titles_are_sanitized_and_bounded() {
+        assert_eq!(
+            sanitize_window_title(" \tHello\nWorld\u{7f} ", "Fallback"),
+            "HelloWorld"
+        );
+        assert_eq!(sanitize_window_title(" \n\t", "  Fallback\n"), "Fallback");
+
+        let long_title = "界".repeat(300);
+        let sanitized = sanitize_window_title(&long_title, "Fallback");
+        assert_eq!(sanitized.chars().count(), 256);
+        assert_eq!(sanitized, "界".repeat(256));
+
+        let unicode_boundary = format!("{}🌋", "é".repeat(255));
+        assert_eq!(
+            sanitize_window_title(&unicode_boundary, "Fallback"),
+            unicode_boundary
+        );
+    }
+
+    #[test]
+    fn session_token_auth_and_async_command_classification() {
+        let token = generate_session_token();
+        assert_eq!(token.len(), 32);
+
+        let valid = format!("qv-tok:{token}:qv-window:zoom-in");
+        assert_eq!(
+            classify_command(&valid, &token),
+            BridgeCommand::Window(WindowCommand::ZoomIn)
+        );
+
+        let valid_win_async = format!("qv-tok:{token}:qv-window-async:42:capture-png");
+        assert_eq!(
+            classify_command(&valid_win_async, &token),
+            BridgeCommand::WindowAsync {
+                call_id: 42,
+                command: WindowCommand::CapturePng,
+            }
+        );
+
+        let valid_app_async = format!("qv-tok:{token}:qv-app-async:7:load_state");
+        assert_eq!(
+            classify_command(&valid_app_async, &token),
+            BridgeCommand::AppAsync {
+                call_id: 7,
+                command: "load_state",
+            }
+        );
+
+        // Zero call_id or unauthenticated async commands must be rejected.
+        let zero_async = format!("qv-tok:{token}:qv-app-async:0:load");
+        assert!(matches!(
+            classify_command(&zero_async, &token),
+            BridgeCommand::Rejected(_)
+        ));
+        assert!(matches!(
+            classify_command("qv-app-async:1:load", &token),
+            BridgeCommand::Rejected(_)
+        ));
+        assert!(matches!(
+            classify_command("qv-window-async:1:close", &token),
+            BridgeCommand::Rejected(_)
+        ));
+        assert!(matches!(
+            classify_command("qv-window:close", &token),
+            BridgeCommand::Rejected(_)
+        ));
+        assert!(matches!(
+            classify_command("qv-tok:0000:qv-window:close", &token),
+            BridgeCommand::Rejected(_)
+        ));
+        let unknown = format!("qv-tok:{token}:qv-window:nope");
+        assert!(matches!(
+            classify_command(&unknown, &token),
+            BridgeCommand::Rejected(_)
+        ));
+        assert_eq!(classify_command("load", &token), BridgeCommand::App("load"));
+    }
+
+    #[test]
+    fn dev_origin_validation_and_scoped_navigation() {
+        let dev = DevOrigin::parse("http://127.0.0.1:5173").unwrap();
+        assert_eq!(dev.host, "127.0.0.1");
+        assert_eq!(dev.port, 5173);
+        assert_eq!(dev.initial_url, "http://127.0.0.1:5173/");
+        assert!(dev.matches_url("http://127.0.0.1:5173/workspace.html"));
+        assert!(dev.matches_url("http://127.0.0.1:5173/assets/app.js?v=1"));
+        assert!(!dev.matches_url("http://127.0.0.1:3000/workspace.html"));
+        assert!(!dev.matches_url("http://localhost:5173/workspace.html"));
+        assert!(!dev.matches_url("https://127.0.0.1:5173/workspace.html"));
+
+        let ipv6 = DevOrigin::parse("http://[::1]:3000/app").unwrap();
+        assert_eq!(ipv6.host, "[::1]");
+        assert_eq!(ipv6.port, 3000);
+        assert_eq!(ipv6.initial_url, "http://[::1]:3000/app");
+        assert!(ipv6.matches_url("http://[::1]:3000/index.html"));
+
+        assert!(DevOrigin::parse("http://0.0.0.0:5173").is_err());
+        assert!(DevOrigin::parse("http://192.168.1.10:5173").is_err());
+        assert!(DevOrigin::parse("https://127.0.0.1:5173").is_err());
+        assert!(DevOrigin::parse("http://127.0.0.1").is_err());
+        assert!(DevOrigin::parse("http://127.0.0.1:0").is_err());
+        assert!(DevOrigin::parse("http://user@127.0.0.1:5173").is_err());
+
+        assert!(!allows_navigation_with_dev(
+            "http://127.0.0.1:5173/index.html",
+            None
+        ));
+        assert!(allows_navigation_with_dev(
+            "http://127.0.0.1:5173/index.html",
+            Some(&dev)
+        ));
+        assert!(!allows_navigation_with_dev(
+            "http://example.com/index.html",
+            Some(&dev)
+        ));
+    }
+
+    #[test]
+    fn external_url_allowlist_is_strict() {
+        assert!(allows_external_url("https://example.com/docs"));
+        assert!(allows_external_url(
+            "HTTPS://github.com/watanuki-azuma/QuantumView"
+        ));
+        assert!(allows_external_url("mailto:user@example.com"));
+        assert!(!allows_external_url("http://example.com/"));
+        assert!(!allows_external_url("file:///C:/Windows/System32/cmd.exe"));
+        assert!(!allows_external_url(r"\\server\share\run.exe"));
+        assert!(!allows_external_url("javascript:alert(1)"));
+        assert!(!allows_external_url("https://"));
+        assert!(!allows_external_url("https://example.com/foo bar"));
+        assert!(!allows_external_url("https://example.com/a\nb"));
+        assert!(!allows_external_url("mailto:not-an-address"));
+    }
+
+    #[test]
+    fn navigation_policy_allows_local_only() {
+        assert!(allows_navigation("file:///C:/app/ui/workspace.html"));
+        assert!(allows_navigation(
+            "file://localhost/C:/app/ui/workspace.html"
+        ));
+        assert!(allows_navigation("qv://app/workspace.html"));
+        assert!(allows_navigation("about:blank"));
+        assert!(!allows_navigation("file://attacker/share/evil.html"));
+        assert!(!allows_navigation("qv://other/workspace.html"));
+        assert!(!allows_navigation("about:config"));
+        assert!(!allows_navigation("data:text/html,hi"));
+        assert!(!allows_navigation("blob:file:///1234"));
+        assert!(!allows_navigation("https://example.com/"));
+        assert!(!allows_navigation("http://example.com/"));
+        assert!(!allows_navigation("javascript:alert(1)"));
+        assert!(allows_navigation("FILE:///upper/case"));
+        assert!(!allows_navigation("relative/path.html"));
+        assert!(!allows_navigation(""));
+    }
+
+    #[test]
+    fn preload_renders_session_token_and_includes_engine_gap_shims() {
+        let rendered = render_preload_script("deadbeef1234");
+        assert!(!rendered.contains(TOKEN_PLACEHOLDER));
+        assert!(rendered.contains("\"deadbeef1234\""));
+        assert!(rendered.contains("Object.defineProperty(window, \"QuantumView\""));
+        assert!(rendered.contains("invokeAsync"));
+        assert!(rendered.contains("__quantumviewResolveAsync"));
+        assert!(rendered.contains("showPopover"));
+        assert!(!rendered.contains("createElement(\"style\")"));
+        assert!(rendered.contains("-webkit-app-region"));
+        assert!(rendered.contains("a[download][href]"));
+        assert!(rendered.contains("safeStorage"));
+        assert!(rendered.contains("clipboard"));
+        assert!(rendered.contains("qv:file-drop"));
+        assert!(rendered.contains("windowApi.exportPdf(title + \".pdf\")"));
+    }
+
+    #[test]
+    fn js_string_literal_escapes() {
+        assert_eq!(js_string_literal("plain"), "\"plain\"");
+        assert_eq!(js_string_literal("a\"b\\c"), "\"a\\\"b\\\\c\"");
+        assert_eq!(js_string_literal("x\ny"), "\"x\\ny\"");
+    }
+
+    #[test]
+    fn dispatch_and_resolve_async_script_shape() {
+        let script = dispatch_script("window-moved", "{\"x\":10,\"y\":20}");
+        assert!(script.starts_with("window.__quantumviewDispatch"));
+        assert!(script.contains("\"window-moved\""));
+        assert!(script.contains("JSON.parse"));
+
+        let async_script = resolve_async_script(9, true, "{\"ok\":1}", true);
+        assert!(async_script.starts_with("window.__quantumviewResolveAsync"));
+        assert!(async_script.contains("9, true,"));
+    }
+}

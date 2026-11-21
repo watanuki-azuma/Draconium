@@ -1,0 +1,15 @@
+{
+  "MeasuredAtJst": "2026-11-20T00:55:24+09:00",
+  "OsCaption": "Microsoft Windows 10 Home",
+  "OsVersion": "10.0.19045",
+  "OsBuild": "19045",
+  "CpuName": "Intel(R) Core(TM) i7-4790 CPU @ 3.60GHz",
+  "CpuCores": 4,
+  "CpuLogical": 8,
+  "GpuName": "NVIDIA GeForce GTX 1070 Ti",
+  "GpuDriver": "32.0.15.6094",
+  "WebView2RuntimeVersion": "157.0.4341.60",
+  "Runs": 3,
+  "WarmupSeconds": 10,
+  "SampleSeconds": 30
+}

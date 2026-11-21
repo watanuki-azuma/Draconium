@@ -1,0 +1,14 @@
+[
+  {
+    "Label": "servo-0.8.0",
+    "Name": "quantumview-servo.exe",
+    "Bytes": 117377024,
+    "MiB": 111.94
+  },
+  {
+    "Label": "webview2-wry-0.57.1",
+    "Name": "quantumview-webview2.exe",
+    "Bytes": 1044480,
+    "MiB": 1.0
+  }
+]
