@@ -34,7 +34,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include: ${{ fromJSON(inputs.target_os == 'windows' && '[{"runner":"windows-latest","target_os":"windows"}]' || inputs.target_os == 'macos' && '[{"runner":"macos-latest","target_os":"macos"}]' || inputs.target_os == 'linux' && '[{"runner":"ubuntu-latest","target_os":"linux"}]' || '[{"runner":"windows-latest","target_os":"windows"},{"runner":"macos-latest","target_os":"macos"},{"runner":"ubuntu-latest","target_os":"linux"}]') }}
+        include: ${{ fromJSON(inputs.target_os == 'windows' && '[{"runner":"windows-2022","target_os":"windows"}]' || inputs.target_os == 'macos' && '[{"runner":"macos-latest","target_os":"macos"}]' || inputs.target_os == 'linux' && '[{"runner":"ubuntu-latest","target_os":"linux"}]' || '[{"runner":"windows-2022","target_os":"windows"},{"runner":"macos-latest","target_os":"macos"},{"runner":"ubuntu-latest","target_os":"linux"}]') }}
     steps:
       - uses: actions/checkout@v4
 
