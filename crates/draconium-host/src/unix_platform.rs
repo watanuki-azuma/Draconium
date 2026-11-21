@@ -3,11 +3,11 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 //! Cross-platform OS integration layer (`macos` / `linux`) and runtime
-//! [`PlatformCapabilities`] introspection for `quantumview-host`.
+//! [`PlatformCapabilities`] introspection for `draconium-host`.
 //!
 //! All formatting, escaping, parsing, and capability metadata functions are
 //! compiled and unit-tested on every host OS (including Windows) via
-//! `rustc --edition 2024 --test -D warnings crates/quantumview-host/src/unix_platform.rs`.
+//! `rustc --edition 2024 --test -D warnings crates/draconium-host/src/unix_platform.rs`.
 //! Native OS command/IPC backends under `#[cfg(target_os = "macos")]`,
 //! `#[cfg(target_os = "linux")]`, and `#[cfg(unix)]` require zero external
 //! crates beyond Rust `std`.
@@ -167,7 +167,7 @@ impl PlatformCapabilities {
         }
     }
 
-    /// Serializes this capability matrix to a JSON object string for `QuantumView.window.getPlatform()`.
+    /// Serializes this capability matrix to a JSON object string for `Draconium.window.getPlatform()`.
     pub fn to_json(&self) -> String {
         format!(
             concat!(
@@ -228,7 +228,7 @@ pub fn sanitize_unix_identifier(raw: &str) -> String {
     }
     let trimmed = out.trim_matches(|c| c == '-' || c == '.').to_owned();
     if trimmed.is_empty() {
-        "quantumview".to_owned()
+        "draconium".to_owned()
     } else {
         trimmed
     }
@@ -266,7 +266,7 @@ fn fnv1a_32(input: &str) -> u32 {
 fn instance_path(dir: &Path, tag: &str, suffix: &str) -> PathBuf {
     let sanitized = sanitize_unix_identifier(tag);
     let prefix: String = sanitized.chars().take(12).collect();
-    dir.join(format!("qv-{prefix}-{:08x}{suffix}", fnv1a_32(tag)))
+    dir.join(format!("dn-{prefix}-{:08x}{suffix}", fnv1a_32(tag)))
 }
 
 #[cfg_attr(not(any(target_os = "macos", target_os = "linux")), allow(dead_code))]
@@ -467,7 +467,7 @@ pub fn escape_xml_text(input: &str) -> String {
 /// Derives a reverse-DNS macOS LaunchAgent label from `app_name`.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub fn macos_launch_agent_label(app_name: &str) -> String {
-    format!("io.quantumview.{}", sanitize_unix_identifier(app_name))
+    format!("io.draconium.{}", sanitize_unix_identifier(app_name))
 }
 
 /// Builds a macOS `LaunchAgents` `.plist` XML file for user login autostart.
@@ -609,7 +609,7 @@ fn format_xdg_exec(exe: &Path, args: &[&str]) -> Result<String, String> {
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub fn xdg_protocol_handler_filename(scheme: &str) -> String {
     format!(
-        "qv-scheme-{}-{:08x}.desktop",
+        "dn-scheme-{}-{:08x}.desktop",
         sanitize_unix_identifier(scheme),
         fnv1a_32(scheme)
     )
@@ -956,7 +956,7 @@ mod runtime {
         let dir = std::env::temp_dir();
         let pid = std::process::id();
         for attempt in 0..16 {
-            let path = dir.join(format!("qv-uid-{pid}-{}-{attempt}", timestamp.as_nanos()));
+            let path = dir.join(format!("dn-uid-{pid}-{}-{attempt}", timestamp.as_nanos()));
             match OpenOptions::new()
                 .write(true)
                 .create_new(true)
@@ -1005,7 +1005,7 @@ mod runtime {
         }
 
         // Use a short, user-owned location even when TMPDIR is too long for sun_path.
-        let path = PathBuf::from(format!("/tmp/qv-{uid}"));
+        let path = PathBuf::from(format!("/tmp/dn-{uid}"));
         match DirBuilder::new().mode(0o700).create(&path) {
             Ok(()) => {}
             Err(err) if err.kind() == ErrorKind::AlreadyExists => {}
@@ -1119,7 +1119,7 @@ mod runtime {
             let stop = Arc::new(AtomicBool::new(false));
             let stop_bg = Arc::clone(&stop);
             let thread = thread::Builder::new()
-                .name("qv-unix-ipc".to_owned())
+                .name("dn-unix-ipc".to_owned())
                 .spawn(move || {
                     while !stop_bg.load(Ordering::Relaxed) {
                         match listener.accept() {
@@ -1794,7 +1794,7 @@ mod runtime {
             let uid = current_uid().unwrap();
             let timestamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
             let dir = std::env::temp_dir().join(format!(
-                "qv-ipc-test-{}-{}",
+                "dn-ipc-test-{}-{}",
                 std::process::id(),
                 timestamp.as_nanos()
             ));
@@ -1915,18 +1915,18 @@ mod tests {
     #[test]
     fn sanitize_unix_identifier_and_build_instance_paths() {
         assert_eq!(
-            sanitize_unix_identifier(r"Local\QuantumView.Servo.Workspace"),
-            "Local-QuantumView.Servo.Workspace"
+            sanitize_unix_identifier(r"Local\Draconium.Workspace"),
+            "Local-Draconium.Workspace"
         );
-        assert_eq!(sanitize_unix_identifier("../..///"), "quantumview");
+        assert_eq!(sanitize_unix_identifier("../..///"), "draconium");
         let dir = Path::new("/run/user/1000");
         let socket = instance_path(dir, "Local\\App", ".sock");
         let lock = instance_path(dir, "Local\\App", ".lock");
         assert_eq!(socket.with_extension("lock"), lock);
         assert_ne!(socket, instance_path(dir, "Local-App", ".sock"));
-        let long_tag = r"Local\QuantumView.Servo.Workspace.VeryLongInstanceIdentifier";
+        let long_tag = r"Local\Draconium.Workspace.VeryLongInstanceIdentifier";
         assert!(
-            instance_path(Path::new("/tmp/qv-1000"), long_tag, ".sock")
+            instance_path(Path::new("/tmp/dn-1000"), long_tag, ".sock")
                 .as_os_str()
                 .len()
                 <= 96
@@ -2056,30 +2056,29 @@ mod tests {
 
     #[test]
     fn autostart_plist_and_xdg_desktop_generators() {
-        let label = macos_launch_agent_label("QuantumView.Folio");
-        assert_eq!(label, "io.quantumview.QuantumView.Folio");
+        let label = macos_launch_agent_label("Draconium.Folio");
+        assert_eq!(label, "io.draconium.Draconium.Folio");
         let plist = build_launch_agent_plist(
             &label,
             &[
-                "/usr/local/bin/qv & <test>".to_owned(),
+                "/usr/local/bin/draconium & <test>".to_owned(),
                 "--workspace".to_owned(),
             ],
         );
-        assert!(plist.contains("<string>io.quantumview.QuantumView.Folio</string>"));
+        assert!(plist.contains("<string>io.draconium.Draconium.Folio</string>"));
         assert!(plist.contains("&amp; &lt;test&gt;"));
         assert!(plist.contains("<key>RunAtLoad</key>"));
 
         let desktop = build_xdg_autostart_desktop(
-            "QuantumView Folio",
-            Path::new("/opt/my;apps/quantumview 100%"),
+            "Draconium Folio",
+            Path::new("/opt/my;apps/draconium 100%"),
             &["--workspace", "--tag=$HOME"],
         )
         .unwrap();
         assert!(desktop.contains("[Desktop Entry]"));
-        assert!(desktop.contains("Name=QuantumView Folio"));
+        assert!(desktop.contains("Name=Draconium Folio"));
         assert!(
-            desktop
-                .contains(r#"Exec="/opt/my;apps/quantumview 100%%" --workspace "--tag=\\$HOME""#),
+            desktop.contains(r#"Exec="/opt/my;apps/draconium 100%%" --workspace "--tag=\\$HOME""#),
             "{desktop}"
         );
     }
@@ -2154,12 +2153,12 @@ mod tests {
         );
         for input in ["\0", "with\nline", "with\rreturn"] {
             assert!(format_xdg_exec_arg(input).is_err());
-            assert!(build_xdg_autostart_desktop(input, Path::new("/opt/qv"), &[]).is_err());
+            assert!(build_xdg_autostart_desktop(input, Path::new("/opt/draconium"), &[]).is_err());
             assert!(
                 build_xdg_protocol_handler_desktop(
                     "Example",
                     "example",
-                    Path::new("/opt/qv"),
+                    Path::new("/opt/draconium"),
                     &[input]
                 )
                 .is_err()
@@ -2173,7 +2172,7 @@ mod tests {
         let dash = xdg_protocol_handler_filename("foo-bar");
         assert_eq!(
             plus,
-            format!("qv-scheme-foo-bar-{:08x}.desktop", fnv1a_32("foo+bar"))
+            format!("dn-scheme-foo-bar-{:08x}.desktop", fnv1a_32("foo+bar"))
         );
         assert_ne!(plus, dash);
 

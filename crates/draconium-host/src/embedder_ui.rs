@@ -784,7 +784,7 @@ pub fn show_open_file_dialog(
 }
 
 /// Show a native file-save dialog for `<a download>`,
-/// `QuantumView.dialog.saveTextFile/saveBase64File`, and PNG capture fallback.
+/// `Draconium.dialog.saveTextFile/saveBase64File`, and PNG capture fallback.
 pub fn show_save_file_dialog(
     hwnd: isize,
     default_name: &str,

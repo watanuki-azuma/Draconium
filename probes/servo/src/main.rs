@@ -8,8 +8,8 @@ mod workspace;
 use std::error::Error;
 use std::path::{Path, PathBuf};
 
-use quantumview_host::platform;
-use quantumview_host::{
+use draconium_host::platform;
+use draconium_host::{
     Capabilities, DevOrigin, EmbeddedAsset, HostConfig, HostHandler, Url, WindowConfig,
     resolve_app_url_from, resolve_ui_path_from, run,
 };
@@ -17,7 +17,7 @@ use quantumview_host::{
 use crate::starter::StarterApp;
 use crate::workspace::{WorkspaceApp, default_workspace_dir};
 
-/// Compiled-in UI fallback assets for single-binary `qv://app/` delivery.
+/// Compiled-in UI fallback assets for single-binary `dn://app/` delivery.
 const EMBEDDED_ASSETS: &[EmbeddedAsset] = &[
     EmbeddedAsset {
         path: "workspace.html",
@@ -55,17 +55,17 @@ enum Mode {
 impl Mode {
     fn mutex_name(self) -> &'static str {
         match self {
-            Mode::Workspace => "Local\\QuantumView.Servo.Workspace",
-            Mode::Starter => "Local\\QuantumView.Servo.Starter",
-            Mode::Probe => "Local\\QuantumView.Servo.Probe",
+            Mode::Workspace => "Local\\Draconium.Workspace",
+            Mode::Starter => "Local\\Draconium.Starter",
+            Mode::Probe => "Local\\Draconium.Probe",
         }
     }
 
     fn autostart_app_name(self) -> &'static str {
         match self {
-            Mode::Workspace => "QuantumView.Folio",
-            Mode::Starter => "QuantumView.Starter",
-            Mode::Probe => "QuantumView.Probe",
+            Mode::Workspace => "Draconium.Folio",
+            Mode::Starter => "Draconium.Starter",
+            Mode::Probe => "Draconium.Probe",
         }
     }
 
@@ -136,7 +136,7 @@ struct CliArgs {
     workspace_dir: Option<PathBuf>,
     crash_dir: Option<PathBuf>,
     self_test: Option<String>,
-    qv_assets: bool,
+    dn_assets: bool,
     csp_wasm: bool,
     dev_url: Option<String>,
     dev_origin: Option<DevOrigin>,
@@ -156,7 +156,7 @@ fn parse_args() -> Result<CliArgs, String> {
     let mut workspace_dir = None;
     let mut crash_dir = None;
     let mut self_test = None;
-    let mut qv_assets = false;
+    let mut dn_assets = false;
     let mut csp_wasm = false;
     let mut dev_url = None;
     let mut dev_origin = None;
@@ -176,7 +176,7 @@ fn parse_args() -> Result<CliArgs, String> {
             "--workspace" => mode = Mode::Workspace,
             "--starter" => mode = Mode::Starter,
             "--probe" => mode = Mode::Probe,
-            "--qv-assets" => qv_assets = true,
+            "--dn-assets" => dn_assets = true,
             "--csp-wasm" => csp_wasm = true,
             "--tray" => tray = true,
             "--transparent" => transparent = true,
@@ -270,7 +270,7 @@ fn parse_args() -> Result<CliArgs, String> {
         workspace_dir,
         crash_dir,
         self_test,
-        qv_assets,
+        dn_assets,
         csp_wasm,
         dev_url,
         dev_origin,
@@ -337,14 +337,14 @@ fn main() -> Result<(), Box<dyn Error>> {
             let data_dir = default_workspace_dir(cli.workspace_dir.clone());
             let (url, asset_root) = resolve_app_url_from(
                 manifest_dir(),
-                cli.qv_assets,
+                cli.dn_assets,
                 cli.dev_url.as_deref(),
                 "workspace.html",
                 "ui/workspace.html",
                 "ui/workspace.html",
             );
             let config = build_host_config(
-                "QuantumView Folio",
+                "Draconium Folio",
                 url,
                 asset_root,
                 apply_cli_window(WindowConfig::custom_chrome(1240, 800), &cli),
@@ -357,14 +357,14 @@ fn main() -> Result<(), Box<dyn Error>> {
             let base_dir = default_workspace_dir(None);
             let (url, asset_root) = resolve_app_url_from(
                 manifest_dir(),
-                cli.qv_assets,
+                cli.dn_assets,
                 cli.dev_url.as_deref(),
                 "starter.html",
                 "ui/starter.html",
                 "ui/starter.html",
             );
             let config = build_host_config(
-                "QuantumView Starter",
+                "Draconium Starter",
                 url,
                 asset_root,
                 apply_cli_window(WindowConfig::standard(760, 560), &cli),
@@ -374,7 +374,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             run(config, StarterApp::default(), cli.self_test)
         }
         Mode::Probe => {
-            if cli.qv_assets {
+            if cli.dn_assets {
                 eprintln!(
                     "[info] --probe opens the shared comparison page (ui/index.html) via file://"
                 );
@@ -386,7 +386,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                 file_url("ui/index.html", "../../ui/index.html")
             };
             let config = build_host_config(
-                "QuantumView - Servo",
+                "Draconium - Servo",
                 url,
                 None,
                 apply_cli_window(WindowConfig::default(), &cli),

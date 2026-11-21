@@ -1,12 +1,12 @@
-//! The JS ↔ Rust bridge contract for the QuantumView host.
+//! The JS ↔ Rust bridge contract for the Draconium host.
 //!
 //! The host's synchronous channel from page JS to Rust is Servo's
 //! `SimpleDialog::Prompt` embedder control: page code calls
-//! `window.QuantumView.*`, which delegates to a closure-captured native
+//! `window.Draconium.*`, which delegates to a closure-captured native
 //! `window.prompt` prefixed with a per-launch session token for privileged
-//! host commands (`qv-tok:<nonce>:qv-window:<cmd>`) and correlated non-blocking
-//! async commands (`qv-tok:<nonce>:qv-app-async:<id>:<cmd>` and
-//! `qv-tok:<nonce>:qv-window-async:<id>:<cmd>`).
+//! host commands (`dn-tok:<nonce>:dn-window:<cmd>`) and correlated non-blocking
+//! async commands (`dn-tok:<nonce>:dn-app-async:<id>:<cmd>` and
+//! `dn-tok:<nonce>:dn-window-async:<id>:<cmd>`).
 //!
 //! Beyond the IPC bridge, [`PRELOAD_SCRIPT`] also injects lightweight shims
 //! for web/Electron capabilities missing in Servo 0.7.0:
@@ -14,10 +14,10 @@
 //!   `popovertarget`, light-dismiss), paired with [`POPOVER_POLYFILL_CSS`]
 //!   injected at `Origin::User` via `UserStyleSheet` so strict `style-src 'self'`
 //!   Content-Security-Policy is preserved
-//! - Declarative `-webkit-app-region: drag` / `[data-qv-drag]` window drag
+//! - Declarative `-webkit-app-region: drag` / `[data-dn-drag]` window drag
 //! - `<a download>` interception for `data:` / `blob:` URLs → native Save dialog
 //! - `window.print()` fallback → raster PDF export dialog
-//! - Synthetic `qv:file-drop` DOM events paired with capability-scoped file tokens
+//! - Synthetic `dn:file-drop` DOM events paired with capability-scoped file tokens
 //!
 //! All items in this module are dependency-free pure Rust so they can be
 //! unit-tested on any OS with `rustc --edition 2024 --test`.
@@ -28,20 +28,20 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Prefix marking a bridge command as a host window command rather than an
 /// application command.
-pub const WINDOW_COMMAND_PREFIX: &str = "qv-window:";
+pub const WINDOW_COMMAND_PREFIX: &str = "dn-window:";
 /// Prefix marking a correlated async host window command.
-pub const WINDOW_ASYNC_PREFIX: &str = "qv-window-async:";
+pub const WINDOW_ASYNC_PREFIX: &str = "dn-window-async:";
 /// Prefix marking a correlated async application command.
-pub const APP_ASYNC_PREFIX: &str = "qv-app-async:";
+pub const APP_ASYNC_PREFIX: &str = "dn-app-async:";
 /// Prefix wrapping privileged host commands with the per-launch session token.
-pub const TOKEN_COMMAND_PREFIX: &str = "qv-tok:";
+pub const TOKEN_COMMAND_PREFIX: &str = "dn-tok:";
 /// Placeholder inside [`PRELOAD_SCRIPT`] replaced by [`render_preload_script`].
-const TOKEN_PLACEHOLDER: &str = "__QV_SESSION_TOKEN__";
+const TOKEN_PLACEHOLDER: &str = "__DN_SESSION_TOKEN__";
 
 /// User-origin stylesheet registered via `UserContentManager::add_stylesheet`
 /// to support the HTML Popover API polyfill without requiring `'unsafe-inline'`
 /// in author `style-src` Content-Security-Policy.
-pub const POPOVER_POLYFILL_CSS: &str = "[popover]:not(.qv-popover-open){display:none !important;}[popover].qv-popover-open{position:fixed;z-index:2147483647;}";
+pub const POPOVER_POLYFILL_CSS: &str = "[popover]:not(.dn-popover-open){display:none !important;}[popover].dn-popover-open{position:fixed;z-index:2147483647;}";
 
 /// Validated loopback development server origin (`--dev-url http://127.0.0.1:5173`).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -201,7 +201,7 @@ pub enum WindowCommand {
     /// Show the window again (`set_visible(true)`).
     Show,
     /// Ask the host to run its normal close flow (including the page's
-    /// `__quantumviewBeforeClose` hook).
+    /// `__draconiumBeforeClose` hook).
     Close,
     /// Reload the page (`WebView::reload`).
     Reload,
@@ -283,7 +283,7 @@ pub enum WindowCommand {
 }
 
 impl WindowCommand {
-    /// Canonical wire suffix name (without `qv-window:`), used for capability checks.
+    /// Canonical wire suffix name (without `dn-window:`), used for capability checks.
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Drag => "drag",
@@ -393,7 +393,7 @@ pub enum BridgeCommand<'a> {
 }
 
 /// Generate a per-launch 128-bit hex session token for same-realm preload
-/// hardening (defense-in-depth against raw `window.prompt("qv-window:...")`
+/// hardening (defense-in-depth against raw `window.prompt("dn-window:...")`
 /// spoofing; not a substitute for an isolated JS compartment).
 pub fn generate_session_token() -> String {
     let nanos = SystemTime::now()
@@ -498,9 +498,9 @@ pub fn parse_window_command(command: &str) -> Option<WindowCommand> {
 
 /// Classify an incoming prompt message using the per-launch session token.
 ///
-/// Privileged commands (`qv-window:*`) and async correlated commands
-/// (`qv-window-async:<id>:<cmd>`, `qv-app-async:<id>:<cmd>`) MUST arrive
-/// wrapped with `qv-tok:<session_token>:` via the frozen preload bridge;
+/// Privileged commands (`dn-window:*`) and async correlated commands
+/// (`dn-window-async:<id>:<cmd>`, `dn-app-async:<id>:<cmd>`) MUST arrive
+/// wrapped with `dn-tok:<session_token>:` via the frozen preload bridge;
 /// raw unauthenticated calls or wrong tokens are rejected.
 pub fn classify_command<'a>(raw_message: &'a str, session_token: &str) -> BridgeCommand<'a> {
     if let Some(rest) = raw_message.strip_prefix(TOKEN_COMMAND_PREFIX) {
@@ -536,7 +536,7 @@ pub fn classify_command<'a>(raw_message: &'a str, session_token: &str) -> Bridge
             let Ok(call_id) = id_str.parse::<u64>() else {
                 return BridgeCommand::Rejected("非同期 call_id が不正です".to_owned());
             };
-            if call_id == 0 || app_cmd.is_empty() || app_cmd.starts_with("qv-") {
+            if call_id == 0 || app_cmd.is_empty() || app_cmd.starts_with("dn-") {
                 return BridgeCommand::Rejected("不正な非同期アプリコマンド指定です".to_owned());
             }
             return BridgeCommand::AppAsync {
@@ -554,14 +554,14 @@ pub fn classify_command<'a>(raw_message: &'a str, session_token: &str) -> Bridge
         || raw_message.starts_with(APP_ASYNC_PREFIX)
     {
         return BridgeCommand::Rejected(
-            "未認証の特権コマンドは拒否されました（window.QuantumView API を使用してください）"
+            "未認証の特権コマンドは拒否されました（window.Draconium API を使用してください）"
                 .to_owned(),
         );
     }
     BridgeCommand::App(raw_message)
 }
 
-/// Strict allowlist for `qv-window:open-external` (see `docs/electron-mapping.md`
+/// Strict allowlist for `dn-window:open-external` (see `docs/electron-mapping.md`
 /// §1 `shell`). Only `https://` URLs with a non-empty host and `mailto:`
 /// addresses without control/whitespace characters are permitted; `file:`,
 /// `http:`, `javascript:`, executables, and UNC paths are always rejected.
@@ -594,7 +594,7 @@ pub fn allows_external_url(url: &str) -> bool {
     }
 }
 
-/// Navigation policy for local QuantumView apps (Milestone B: external URL
+/// Navigation policy for local Draconium apps (Milestone B: external URL
 /// blocking).
 pub fn allows_navigation(url: &str) -> bool {
     let Some((scheme, rest)) = url.split_once(':') else {
@@ -619,7 +619,7 @@ pub fn allows_navigation(url: &str) -> bool {
             let authority = after_slashes.split('/').next().unwrap_or("");
             authority.is_empty() || authority.eq_ignore_ascii_case("localhost")
         }
-        "qv" => {
+        "dn" => {
             let Some(after_slashes) = rest.strip_prefix("//") else {
                 return false;
             };
@@ -652,8 +652,8 @@ pub fn render_preload_script(session_token: &str) -> String {
 /// before passing the script to `UserScript::new`.
 pub const PRELOAD_SCRIPT: &str = r#"
 (() => {
-  if (window.QuantumView && window.QuantumView.__installed) return;
-  const SESSION_TOKEN = __QV_SESSION_TOKEN__;
+  if (window.Draconium && window.Draconium.__installed) return;
+  const SESSION_TOKEN = __DN_SESSION_TOKEN__;
   const nativePrompt = window.prompt.bind(window);
   const listeners = new Map();
   const pendingAsync = new Map();
@@ -677,26 +677,26 @@ pub const PRELOAD_SCRIPT: &str = r#"
 
   function callApp(command, payload) {
     const cmd = String(command);
-    if (cmd.startsWith("qv-")) {
-      return { ok: false, error: "特権コマンドは window.QuantumView API 経由で呼んでください" };
+    if (cmd.startsWith("dn-")) {
+      return { ok: false, error: "特権コマンドは window.Draconium API 経由で呼んでください" };
     }
     return parseReply(nativePrompt(cmd, payload == null ? "" : String(payload)));
   }
 
   function callHostWindow(name, payload) {
-    const tagged = "qv-tok:" + SESSION_TOKEN + ":qv-window:" + name;
+    const tagged = "dn-tok:" + SESSION_TOKEN + ":dn-window:" + name;
     return parseReply(nativePrompt(tagged, payload == null ? "" : String(payload)));
   }
 
   function callAppAsync(command, payload) {
     const cmd = String(command);
-    if (cmd.startsWith("qv-")) {
-      return Promise.resolve({ ok: false, error: "特権コマンドは window.QuantumView API 経由で呼んでください" });
+    if (cmd.startsWith("dn-")) {
+      return Promise.resolve({ ok: false, error: "特権コマンドは window.Draconium API 経由で呼んでください" });
     }
     const callId = nextAsyncId++;
     return new Promise((resolve) => {
       pendingAsync.set(callId, { resolve, parseJson: false });
-      const tagged = "qv-tok:" + SESSION_TOKEN + ":qv-app-async:" + callId + ":" + cmd;
+      const tagged = "dn-tok:" + SESSION_TOKEN + ":dn-app-async:" + callId + ":" + cmd;
       const syncAck = parseReply(nativePrompt(tagged, payload == null ? "" : String(payload)));
       if (!syncAck.ok) {
         pendingAsync.delete(callId);
@@ -709,7 +709,7 @@ pub const PRELOAD_SCRIPT: &str = r#"
     const callId = nextAsyncId++;
     return new Promise((resolve) => {
       pendingAsync.set(callId, { resolve, parseJson: Boolean(parseJson) });
-      const tagged = "qv-tok:" + SESSION_TOKEN + ":qv-window-async:" + callId + ":" + name;
+      const tagged = "dn-tok:" + SESSION_TOKEN + ":dn-window-async:" + callId + ":" + name;
       const syncAck = parseReply(nativePrompt(tagged, payload == null ? "" : String(payload)));
       if (!syncAck.ok) {
         pendingAsync.delete(callId);
@@ -736,7 +736,7 @@ pub const PRELOAD_SCRIPT: &str = r#"
       entry.resolve({ ok: true, data: payload });
     }
   };
-  Object.defineProperty(window, "__quantumviewResolveAsync", {
+  Object.defineProperty(window, "__draconiumResolveAsync", {
     value: resolveAsyncFn,
     writable: false,
     configurable: false,
@@ -755,18 +755,18 @@ pub const PRELOAD_SCRIPT: &str = r#"
   function dispatchSyntheticDropEvent(event, data) {
     if (typeof document === "undefined" || typeof CustomEvent !== "function") return;
     if (event === "file-drop-hover") {
-      if (document.documentElement) document.documentElement.classList.add("qv-file-drop-hover");
-      document.dispatchEvent(new CustomEvent("qv:file-drop-hover", { detail: data }));
+      if (document.documentElement) document.documentElement.classList.add("dn-file-drop-hover");
+      document.dispatchEvent(new CustomEvent("dn:file-drop-hover", { detail: data }));
     } else if (event === "file-drop-cancel") {
-      if (document.documentElement) document.documentElement.classList.remove("qv-file-drop-hover");
-      document.dispatchEvent(new CustomEvent("qv:file-drop-cancel", { detail: data }));
+      if (document.documentElement) document.documentElement.classList.remove("dn-file-drop-hover");
+      document.dispatchEvent(new CustomEvent("dn:file-drop-cancel", { detail: data }));
     } else if (event === "file-drop") {
-      if (document.documentElement) document.documentElement.classList.remove("qv-file-drop-hover");
+      if (document.documentElement) document.documentElement.classList.remove("dn-file-drop-hover");
       let target = document.body || document.documentElement || document;
       if (data && typeof data.x === "number" && typeof data.y === "number" && typeof document.elementFromPoint === "function") {
         target = document.elementFromPoint(data.x, data.y) || target;
       }
-      target.dispatchEvent(new CustomEvent("qv:file-drop", { detail: data, bubbles: true, cancelable: true }));
+      target.dispatchEvent(new CustomEvent("dn:file-drop", { detail: data, bubbles: true, cancelable: true }));
     }
   }
 
@@ -778,7 +778,7 @@ pub const PRELOAD_SCRIPT: &str = r#"
       try { fn(data); } catch (error) { console.error(error); }
     }
   };
-  Object.defineProperty(window, "__quantumviewDispatch", {
+  Object.defineProperty(window, "__draconiumDispatch", {
     value: dispatchFn,
     writable: false,
     configurable: false,
@@ -1019,9 +1019,9 @@ pub const PRELOAD_SCRIPT: &str = r#"
       if (set) set.delete(fn);
     },
     notify(options) {
-      const opts = typeof options === "string" ? { title: document.title || "QuantumView", body: options } : (options || {});
+      const opts = typeof options === "string" ? { title: document.title || "Draconium", body: options } : (options || {});
       return callHostWindow("notify", JSON.stringify({
-        title: opts.title == null ? (document.title || "QuantumView") : String(opts.title),
+        title: opts.title == null ? (document.title || "Draconium") : String(opts.title),
         body: opts.body == null ? "" : String(opts.body),
       }));
     },
@@ -1035,7 +1035,7 @@ pub const PRELOAD_SCRIPT: &str = r#"
     session: sessionApi,
   });
 
-  Object.defineProperty(window, "QuantumView", {
+  Object.defineProperty(window, "Draconium", {
     value: api,
     writable: false,
     configurable: false,
@@ -1069,9 +1069,9 @@ pub const PRELOAD_SCRIPT: &str = r#"
       return el.dispatchEvent(ev);
     };
     const hideOne = (el) => {
-      if (!el.classList.contains("qv-popover-open")) return;
+      if (!el.classList.contains("dn-popover-open")) return;
       emitToggle(el, "beforetoggle", "open", "closed", false);
-      el.classList.remove("qv-popover-open");
+      el.classList.remove("dn-popover-open");
       const idx = openAuto.indexOf(el);
       if (idx >= 0) openAuto.splice(idx, 1);
       emitToggle(el, "toggle", "open", "closed", false);
@@ -1094,13 +1094,13 @@ pub const PRELOAD_SCRIPT: &str = r#"
     HTMLElement.prototype.showPopover = function showPopover() {
       const mode = normalizeMode(this);
       if (!mode) throw new DOMException("Element does not have a popover attribute", "NotSupportedError");
-      if (this.classList.contains("qv-popover-open")) return;
+      if (this.classList.contains("dn-popover-open")) return;
       if (!emitToggle(this, "beforetoggle", "closed", "open", true)) return;
       if (mode === "auto") {
         hideAutoExceptAncestors(this);
         openAuto.push(this);
       }
-      this.classList.add("qv-popover-open");
+      this.classList.add("dn-popover-open");
       emitToggle(this, "toggle", "closed", "open", false);
     };
     HTMLElement.prototype.hidePopover = function hidePopover() {
@@ -1109,11 +1109,11 @@ pub const PRELOAD_SCRIPT: &str = r#"
       hideOne(this);
     };
     HTMLElement.prototype.togglePopover = function togglePopover(force) {
-      const isOpen = this.classList.contains("qv-popover-open");
+      const isOpen = this.classList.contains("dn-popover-open");
       const wantOpen = force === undefined ? !isOpen : Boolean(force);
       if (wantOpen) {
         this.showPopover();
-        return this.classList.contains("qv-popover-open");
+        return this.classList.contains("dn-popover-open");
       }
       this.hidePopover();
       return false;
@@ -1143,16 +1143,16 @@ pub const PRELOAD_SCRIPT: &str = r#"
     }
   }
 
-  // --- Engine-gap shim 2: Declarative -webkit-app-region: drag / [data-qv-drag] ---
+  // --- Engine-gap shim 2: Declarative -webkit-app-region: drag / [data-dn-drag] ---
   if (typeof document !== "undefined") {
     const INTERACTIVE = "button, a, input, select, textarea, label, [contenteditable='true'], [role='button']";
     const readAppRegion = (el) => {
-      if (el.hasAttribute("data-qv-no-drag")) return "no-drag";
-      if (el.hasAttribute("data-qv-drag")) return "drag";
+      if (el.hasAttribute("data-dn-no-drag")) return "no-drag";
+      if (el.hasAttribute("data-dn-drag")) return "drag";
       const inline = el.style && el.style.getPropertyValue ? el.style.getPropertyValue("-webkit-app-region").trim().toLowerCase() : "";
       if (inline === "drag" || inline === "no-drag") return inline;
       if (typeof window.getComputedStyle === "function") {
-        const custom = window.getComputedStyle(el).getPropertyValue("--qv-app-region").trim().toLowerCase();
+        const custom = window.getComputedStyle(el).getPropertyValue("--dn-app-region").trim().toLowerCase();
         if (custom === "drag" || custom === "no-drag") return custom;
       }
       return "";
@@ -1204,7 +1204,7 @@ pub const PRELOAD_SCRIPT: &str = r#"
             const dataBase64 = bytesToBase64(new Uint8Array(buf));
             callHostWindow("save-download", JSON.stringify({ name: suggested, dataBase64 }));
           })
-          .catch((error) => console.error("[qv download]", error));
+          .catch((error) => console.error("[dn download]", error));
       }
     }, true);
   }
@@ -1239,17 +1239,17 @@ pub fn js_string_literal(value: &str) -> String {
 /// evaluated script so listeners receive objects, not strings.
 pub fn dispatch_script(event: &str, data_json: &str) -> String {
     format!(
-        "window.__quantumviewDispatch && window.__quantumviewDispatch({}, JSON.parse({}));",
+        "window.__draconiumDispatch && window.__draconiumDispatch({}, JSON.parse({}));",
         js_string_literal(event),
         js_string_literal(data_json),
     )
 }
 
-/// Build the script that resolves a pending `QuantumView.invokeAsync` /
+/// Build the script that resolves a pending `Draconium.invokeAsync` /
 /// `*Async` Promise in the preload bridge.
 pub fn resolve_async_script(call_id: u64, ok: bool, payload: &str, is_json: bool) -> String {
     format!(
-        "window.__quantumviewResolveAsync && window.__quantumviewResolveAsync({call_id}, {ok}, {}, {is_json});",
+        "window.__draconiumResolveAsync && window.__draconiumResolveAsync({call_id}, {ok}, {}, {is_json});",
         js_string_literal(payload),
     )
 }
@@ -1261,7 +1261,7 @@ mod tests {
     #[test]
     fn window_commands_parse() {
         assert_eq!(
-            parse_window_command("qv-window:drag"),
+            parse_window_command("dn-window:drag"),
             Some(WindowCommand::Drag)
         );
         for (name, command) in [
@@ -1282,128 +1282,128 @@ mod tests {
             ("can-go-forward", WindowCommand::CanGoForward),
         ] {
             assert_eq!(
-                parse_window_command(&format!("qv-window:{name}")),
+                parse_window_command(&format!("dn-window:{name}")),
                 Some(command)
             );
             assert_eq!(command.as_str(), name);
         }
         assert_eq!(
-            parse_window_command("qv-window:chips"),
+            parse_window_command("dn-window:chips"),
             Some(WindowCommand::ShowChips)
         );
         assert_eq!(
-            parse_window_command("qv-window:flyout"),
+            parse_window_command("dn-window:flyout"),
             Some(WindowCommand::ShowFlyout)
         );
         assert_eq!(
-            parse_window_command("qv-window:hard-reload"),
+            parse_window_command("dn-window:hard-reload"),
             Some(WindowCommand::HardReload)
         );
         assert_eq!(
-            parse_window_command("qv-window:zoom-in"),
+            parse_window_command("dn-window:zoom-in"),
             Some(WindowCommand::ZoomIn)
         );
         assert_eq!(
-            parse_window_command("qv-window:zoom-out"),
+            parse_window_command("dn-window:zoom-out"),
             Some(WindowCommand::ZoomOut)
         );
         assert_eq!(
-            parse_window_command("qv-window:zoom-reset"),
+            parse_window_command("dn-window:zoom-reset"),
             Some(WindowCommand::ZoomReset)
         );
         assert_eq!(
-            parse_window_command("qv-window:open-external"),
+            parse_window_command("dn-window:open-external"),
             Some(WindowCommand::OpenExternal)
         );
         assert_eq!(
-            parse_window_command("qv-window:set-opacity"),
+            parse_window_command("dn-window:set-opacity"),
             Some(WindowCommand::SetOpacity)
         );
         assert_eq!(
-            parse_window_command("qv-window:set-click-through"),
+            parse_window_command("dn-window:set-click-through"),
             Some(WindowCommand::SetClickThrough)
         );
         assert_eq!(
-            parse_window_command("qv-window:capture-png"),
+            parse_window_command("dn-window:capture-png"),
             Some(WindowCommand::CapturePng)
         );
         assert_eq!(
-            parse_window_command("qv-window:export-html"),
+            parse_window_command("dn-window:export-html"),
             Some(WindowCommand::ExportHtml)
         );
         assert_eq!(
-            parse_window_command("qv-window:export-pdf"),
+            parse_window_command("dn-window:export-pdf"),
             Some(WindowCommand::ExportPdf)
         );
         assert_eq!(
-            parse_window_command("qv-window:save-download"),
+            parse_window_command("dn-window:save-download"),
             Some(WindowCommand::SaveDownload)
         );
         assert_eq!(
-            parse_window_command("qv-window:dialog-open-file"),
+            parse_window_command("dn-window:dialog-open-file"),
             Some(WindowCommand::DialogOpenFile)
         );
         assert_eq!(
-            parse_window_command("qv-window:dialog-save-file"),
+            parse_window_command("dn-window:dialog-save-file"),
             Some(WindowCommand::DialogSaveFile)
         );
         assert_eq!(
-            parse_window_command("qv-window:file-read-text"),
+            parse_window_command("dn-window:file-read-text"),
             Some(WindowCommand::FileReadText)
         );
         assert_eq!(
-            parse_window_command("qv-window:file-read-base64"),
+            parse_window_command("dn-window:file-read-base64"),
             Some(WindowCommand::FileReadBase64)
         );
         assert_eq!(
-            parse_window_command("qv-window:safe-storage-encrypt"),
+            parse_window_command("dn-window:safe-storage-encrypt"),
             Some(WindowCommand::SafeStorageEncrypt)
         );
         assert_eq!(
-            parse_window_command("qv-window:safe-storage-decrypt"),
+            parse_window_command("dn-window:safe-storage-decrypt"),
             Some(WindowCommand::SafeStorageDecrypt)
         );
         assert_eq!(
-            parse_window_command("qv-window:notify"),
+            parse_window_command("dn-window:notify"),
             Some(WindowCommand::Notify)
         );
         assert_eq!(
-            parse_window_command("qv-window:get-theme"),
+            parse_window_command("dn-window:get-theme"),
             Some(WindowCommand::GetTheme)
         );
         assert_eq!(
-            parse_window_command("qv-window:get-platform"),
+            parse_window_command("dn-window:get-platform"),
             Some(WindowCommand::GetPlatform)
         );
         assert_eq!(
-            parse_window_command("qv-window:clipboard-read-text"),
+            parse_window_command("dn-window:clipboard-read-text"),
             Some(WindowCommand::ClipboardReadText)
         );
         assert_eq!(
-            parse_window_command("qv-window:clipboard-write-html"),
+            parse_window_command("dn-window:clipboard-write-html"),
             Some(WindowCommand::ClipboardWriteHtml)
         );
         assert_eq!(
-            parse_window_command("qv-window:clipboard-read-image"),
+            parse_window_command("dn-window:clipboard-read-image"),
             Some(WindowCommand::ClipboardReadImage)
         );
         assert_eq!(
-            parse_window_command("qv-window:autostart-set"),
+            parse_window_command("dn-window:autostart-set"),
             Some(WindowCommand::AutostartSet)
         );
         assert_eq!(
-            parse_window_command("qv-window:protocol-client-set"),
+            parse_window_command("dn-window:protocol-client-set"),
             Some(WindowCommand::ProtocolClientSet)
         );
         assert_eq!(
-            parse_window_command("qv-window:session-clear-cookies"),
+            parse_window_command("dn-window:session-clear-cookies"),
             Some(WindowCommand::SessionClearCookies)
         );
         assert_eq!(
-            parse_window_command("qv-window:open-child-window"),
+            parse_window_command("dn-window:open-child-window"),
             Some(WindowCommand::OpenChildWindow)
         );
-        assert_eq!(parse_window_command("qv-window:nope"), None);
+        assert_eq!(parse_window_command("dn-window:nope"), None);
         assert_eq!(parse_window_command("load"), None);
         assert_eq!(parse_window_command("save"), None);
     }
@@ -1433,13 +1433,13 @@ mod tests {
         let token = generate_session_token();
         assert_eq!(token.len(), 32);
 
-        let valid = format!("qv-tok:{token}:qv-window:zoom-in");
+        let valid = format!("dn-tok:{token}:dn-window:zoom-in");
         assert_eq!(
             classify_command(&valid, &token),
             BridgeCommand::Window(WindowCommand::ZoomIn)
         );
 
-        let valid_win_async = format!("qv-tok:{token}:qv-window-async:42:capture-png");
+        let valid_win_async = format!("dn-tok:{token}:dn-window-async:42:capture-png");
         assert_eq!(
             classify_command(&valid_win_async, &token),
             BridgeCommand::WindowAsync {
@@ -1448,7 +1448,7 @@ mod tests {
             }
         );
 
-        let valid_app_async = format!("qv-tok:{token}:qv-app-async:7:load_state");
+        let valid_app_async = format!("dn-tok:{token}:dn-app-async:7:load_state");
         assert_eq!(
             classify_command(&valid_app_async, &token),
             BridgeCommand::AppAsync {
@@ -1458,28 +1458,28 @@ mod tests {
         );
 
         // Zero call_id or unauthenticated async commands must be rejected.
-        let zero_async = format!("qv-tok:{token}:qv-app-async:0:load");
+        let zero_async = format!("dn-tok:{token}:dn-app-async:0:load");
         assert!(matches!(
             classify_command(&zero_async, &token),
             BridgeCommand::Rejected(_)
         ));
         assert!(matches!(
-            classify_command("qv-app-async:1:load", &token),
+            classify_command("dn-app-async:1:load", &token),
             BridgeCommand::Rejected(_)
         ));
         assert!(matches!(
-            classify_command("qv-window-async:1:close", &token),
+            classify_command("dn-window-async:1:close", &token),
             BridgeCommand::Rejected(_)
         ));
         assert!(matches!(
-            classify_command("qv-window:close", &token),
+            classify_command("dn-window:close", &token),
             BridgeCommand::Rejected(_)
         ));
         assert!(matches!(
-            classify_command("qv-tok:0000:qv-window:close", &token),
+            classify_command("dn-tok:0000:dn-window:close", &token),
             BridgeCommand::Rejected(_)
         ));
-        let unknown = format!("qv-tok:{token}:qv-window:nope");
+        let unknown = format!("dn-tok:{token}:dn-window:nope");
         assert!(matches!(
             classify_command(&unknown, &token),
             BridgeCommand::Rejected(_)
@@ -1530,7 +1530,7 @@ mod tests {
     fn external_url_allowlist_is_strict() {
         assert!(allows_external_url("https://example.com/docs"));
         assert!(allows_external_url(
-            "HTTPS://github.com/watanuki-azuma/QuantumView"
+            "HTTPS://github.com/watanuki-azuma/Draconium"
         ));
         assert!(allows_external_url("mailto:user@example.com"));
         assert!(!allows_external_url("http://example.com/"));
@@ -1549,10 +1549,10 @@ mod tests {
         assert!(allows_navigation(
             "file://localhost/C:/app/ui/workspace.html"
         ));
-        assert!(allows_navigation("qv://app/workspace.html"));
+        assert!(allows_navigation("dn://app/workspace.html"));
         assert!(allows_navigation("about:blank"));
         assert!(!allows_navigation("file://attacker/share/evil.html"));
-        assert!(!allows_navigation("qv://other/workspace.html"));
+        assert!(!allows_navigation("dn://other/workspace.html"));
         assert!(!allows_navigation("about:config"));
         assert!(!allows_navigation("data:text/html,hi"));
         assert!(!allows_navigation("blob:file:///1234"));
@@ -1569,16 +1569,16 @@ mod tests {
         let rendered = render_preload_script("deadbeef1234");
         assert!(!rendered.contains(TOKEN_PLACEHOLDER));
         assert!(rendered.contains("\"deadbeef1234\""));
-        assert!(rendered.contains("Object.defineProperty(window, \"QuantumView\""));
+        assert!(rendered.contains("Object.defineProperty(window, \"Draconium\""));
         assert!(rendered.contains("invokeAsync"));
-        assert!(rendered.contains("__quantumviewResolveAsync"));
+        assert!(rendered.contains("__draconiumResolveAsync"));
         assert!(rendered.contains("showPopover"));
         assert!(!rendered.contains("createElement(\"style\")"));
         assert!(rendered.contains("-webkit-app-region"));
         assert!(rendered.contains("a[download][href]"));
         assert!(rendered.contains("safeStorage"));
         assert!(rendered.contains("clipboard"));
-        assert!(rendered.contains("qv:file-drop"));
+        assert!(rendered.contains("dn:file-drop"));
         assert!(rendered.contains("windowApi.exportPdf(title + \".pdf\")"));
     }
 
@@ -1592,12 +1592,12 @@ mod tests {
     #[test]
     fn dispatch_and_resolve_async_script_shape() {
         let script = dispatch_script("window-moved", "{\"x\":10,\"y\":20}");
-        assert!(script.starts_with("window.__quantumviewDispatch"));
+        assert!(script.starts_with("window.__draconiumDispatch"));
         assert!(script.contains("\"window-moved\""));
         assert!(script.contains("JSON.parse"));
 
         let async_script = resolve_async_script(9, true, "{\"ok\":1}", true);
-        assert!(async_script.starts_with("window.__quantumviewResolveAsync"));
+        assert!(async_script.starts_with("window.__draconiumResolveAsync"));
         assert!(async_script.contains("9, true,"));
     }
 }

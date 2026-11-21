@@ -27,7 +27,7 @@ impl ApplicationHandler for App {
         let window = event_loop
             .create_window(
                 Window::default_attributes()
-                    .with_title("QuantumView - WebView2")
+                    .with_title("Draconium - WebView2")
                     .with_inner_size(LogicalSize::new(1000.0, 720.0)),
             )
             .expect("Could not create window");

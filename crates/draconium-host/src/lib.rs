@@ -2,7 +2,7 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-//! # `quantumview-host`
+//! # `draconium-host`
 //!
 //! Lightweight, self-contained Rust desktop WebView host powered by **Servo 0.8.0**
 //! (Stylo, WebRender, SpiderMonkey) — no Chromium or OS WebView runtime required.
@@ -10,7 +10,7 @@
 //! ## Quick Start
 //!
 //! ```no_run
-//! use quantumview_host::{
+//! use draconium_host::{
 //!     Capabilities, EmbeddedAsset, HostConfig, HostHandler, WindowConfig, resolve_app_url_from,
 //!     run,
 //! };
@@ -18,7 +18,7 @@
 //!
 //! const ASSETS: &[EmbeddedAsset] = &[EmbeddedAsset {
 //!     path: "index.html",
-//!     bytes: b"<!doctype html><html><body><h1>Hello QuantumView</h1></body></html>",
+//!     bytes: b"<!doctype html><html><body><h1>Hello Draconium</h1></body></html>",
 //! }];
 //!
 //! struct MyApp;
@@ -51,13 +51,13 @@
 //! ```
 
 mod bridge;
+mod dn_protocol;
 #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 mod embedder_ui;
 mod host;
 mod input;
 mod policy;
 mod protocol;
-mod qv_protocol;
 #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 mod tray;
 mod unix_platform;

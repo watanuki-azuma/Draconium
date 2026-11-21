@@ -1,4 +1,4 @@
-//! Window geometry and presentation state for the QuantumView host.
+//! Window geometry and presentation state for the Draconium host.
 //!
 //! This module is deliberately free of `winit` / `servo` dependencies so the
 //! geometry math and the `config.json` field handling can be unit-tested with

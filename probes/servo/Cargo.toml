@@ -1,5 +1,5 @@
 [package]
-name = "quantumview-servo"
+name = "draconium"
 version = "0.1.0"
 edition = "2024"
 license = "MPL-2.0"
@@ -7,10 +7,10 @@ publish = false
 
 [features]
 default = []
-media-gstreamer = ["quantumview-host/media-gstreamer"]
+media-gstreamer = ["draconium-host/media-gstreamer"]
 
 [dependencies]
-quantumview-host = { path = "../../crates/quantumview-host" }
+draconium-host = { path = "../../crates/draconium-host" }
 url = "2.5"
 
 [patch.crates-io]

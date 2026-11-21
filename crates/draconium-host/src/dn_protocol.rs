@@ -2,7 +2,7 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-//! Servo-facing `qv://` protocol handler (Milestone B + generalized SDK asset serving).
+//! Servo-facing `dn://` protocol handler (Milestone B + generalized SDK asset serving).
 //!
 //! The routing rules live in the dependency-free `protocol` module; this
 //! file translates between Servo's fetch types and that resolver,
@@ -10,7 +10,7 @@
 //! `net/protocols/data.rs`.
 //!
 //! Features:
-//! - Serves safe nested paths under `asset_root` (`qv://app/assets/...`),
+//! - Serves safe nested paths under `asset_root` (`dn://app/assets/...`),
 //!   verifying canonical path confinement inside `root_canon` to prevent
 //!   symlink or junction escapes.
 //! - Falls back to compiled-in [`protocol::EMBEDDED_ASSETS`] when `asset_root`
@@ -29,15 +29,15 @@ use servo::protocol_handler::{
 
 use crate::protocol;
 
-/// Serves bundled UI assets under `qv://app/` from an optional on-disk
+/// Serves bundled UI assets under `dn://app/` from an optional on-disk
 /// directory with compiled-in fallback and CSP header injection.
-pub struct QvAssetHandler {
+pub struct DnAssetHandler {
     root_canon: Option<PathBuf>,
     embedded_assets: &'static [protocol::EmbeddedAsset],
     csp_header: Option<String>,
 }
 
-impl QvAssetHandler {
+impl DnAssetHandler {
     pub fn new(
         root: Option<PathBuf>,
         embedded_assets: &'static [protocol::EmbeddedAsset],
@@ -113,7 +113,7 @@ impl QvAssetHandler {
     }
 }
 
-impl ProtocolHandler for QvAssetHandler {
+impl ProtocolHandler for DnAssetHandler {
     fn load<'a>(
         &'a self,
         request: &'a mut Request,

@@ -2,7 +2,7 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-//! Declarative capability ACLs (`Capabilities`) for QuantumView host apps.
+//! Declarative capability ACLs (`Capabilities`) for Draconium host apps.
 //!
 //! Each hosted app mode declares which privileged host APIs and application
 //! commands its renderer is allowed to invoke. Child windows opened from a
@@ -63,7 +63,7 @@ impl Capability {
     }
 }
 
-/// Per-application capability configuration enforced by the QuantumView host.
+/// Per-application capability configuration enforced by the Draconium host.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Capabilities {
     pub allow_external_links: bool,
@@ -213,7 +213,7 @@ impl Capabilities {
     }
 
     /// Produce an attenuated capability set for child windows (`window.open`
-    /// or `QuantumView.window.openChild`), stripping sensitive OS persistence,
+    /// or `Draconium.window.openChild`), stripping sensitive OS persistence,
     /// DPAPI, registry, file-picker, clipboard, and app-command privileges.
     pub fn attenuate_for_child(&self) -> Self {
         Self {
@@ -256,13 +256,13 @@ impl Capabilities {
         if allowed { Ok(()) } else { Err(cap.as_str()) }
     }
 
-    /// Check whether a `qv-window:<name>` command is allowed by this policy.
+    /// Check whether a `dn-window:<name>` command is allowed by this policy.
     ///
     /// Accepts either the bare command suffix (e.g. `"open-external"`) or the
-    /// prefixed form (`"qv-window:open-external"`).
+    /// prefixed form (`"dn-window:open-external"`).
     pub fn check_window_command_name(&self, command_name: &str) -> Result<(), &'static str> {
         let name = command_name
-            .strip_prefix("qv-window:")
+            .strip_prefix("dn-window:")
             .unwrap_or(command_name);
         match name {
             "drag" | "drag-resize" | "minimize" | "toggle-maximize" | "is-maximized"

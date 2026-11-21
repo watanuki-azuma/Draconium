@@ -1,15 +1,15 @@
 <#
 .SYNOPSIS
-    Creates a clean, self-contained portable distribution folder for QuantumView.
+    Creates a clean, self-contained portable distribution folder for Draconium.
 
 .PARAMETER App
     Which UI bundle to include: 'all' (default), 'workspace', or 'starter'.
 
 .PARAMETER OutputDir
-    Destination directory (defaults to dist\quantumview).
+    Destination directory (defaults to dist\draconium).
 
 .PARAMETER ExePath
-    Path to the release quantumview-servo.exe binary.
+    Path to the release draconium.exe binary.
 
 .PARAMETER GStreamerDir
     Optional GStreamer MSVC install root containing bin\ and lib\gstreamer-1.0\,
@@ -32,11 +32,11 @@ $ErrorActionPreference = 'Stop'
 
 $repoRoot = Split-Path -Parent $PSScriptRoot
 if ([string]::IsNullOrWhiteSpace($OutputDir)) {
-    $folderName = if ($App -eq 'all') { 'quantumview' } else { "quantumview-$App" }
+    $folderName = if ($App -eq 'all') { 'draconium' } else { "draconium-$App" }
     $OutputDir = Join-Path $repoRoot ("dist\$folderName")
 }
 if ([string]::IsNullOrWhiteSpace($ExePath)) {
-    $ExePath = Join-Path $repoRoot 'probes\servo\target\release\quantumview-servo.exe'
+    $ExePath = Join-Path $repoRoot 'probes\servo\target\release\draconium.exe'
 }
 
 if (-not (Test-Path -LiteralPath $ExePath -PathType Leaf)) {
@@ -137,14 +137,14 @@ if ($existing -and (-not $existing.PSIsContainer -or
 }
 
 $nonce = [Guid]::NewGuid().ToString('N')
-$stage = Join-Path $parent ".qv-package-$nonce"
-$backup = Join-Path $parent ".qv-package-backup-$nonce"
+$stage = Join-Path $parent ".dn-package-$nonce"
+$backup = Join-Path $parent ".dn-package-backup-$nonce"
 [System.IO.Directory]::CreateDirectory($parent) | Out-Null
 New-Item -ItemType Directory -Path $stage | Out-Null
 try {
     $uiOutputDir = Join-Path $stage 'ui'
     [System.IO.Directory]::CreateDirectory($uiOutputDir) | Out-Null
-    Copy-Item -LiteralPath $ExePath -Destination (Join-Path $stage 'quantumview-servo.exe')
+    Copy-Item -LiteralPath $ExePath -Destination (Join-Path $stage 'draconium.exe')
     foreach ($dll in ($runtimeDlls + $pluginFiles)) {
         Copy-Item -LiteralPath $dll.FullName -Destination (Join-Path $stage $dll.Name) -Force
     }
@@ -189,4 +189,4 @@ try {
 if ($runtimeDlls.Count -gt 0) {
     Write-Output "Packaged GStreamer runtime ($($runtimeDlls.Count) runtime DLLs, $($pluginFiles.Count)/$($requiredPlugins.Count) plugins) to $OutputDir"
 }
-Write-Output "Packaged QuantumView ($App, $copied UI files) to $OutputDir"
+Write-Output "Packaged Draconium ($App, $copied UI files) to $OutputDir"

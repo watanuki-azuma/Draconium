@@ -34,14 +34,14 @@
   }
 
   function sendSync() {
-    if (!window.QuantumView) return;
-    const res = window.QuantumView.invoke("echo", inputEl ? inputEl.value : "");
+    if (!window.Draconium) return;
+    const res = window.Draconium.invoke("echo", inputEl ? inputEl.value : "");
     if (replyEl) replyEl.textContent = formatReply(res);
   }
 
   async function sendAsync() {
-    if (!window.QuantumView) return;
-    const res = await window.QuantumView.invokeAsync("echo", inputEl ? inputEl.value : "");
+    if (!window.Draconium) return;
+    const res = await window.Draconium.invokeAsync("echo", inputEl ? inputEl.value : "");
     if (replyEl) replyEl.textContent = formatReply(res);
   }
 
@@ -51,14 +51,14 @@
     if (syncBtn) syncBtn.addEventListener("click", sendSync);
     if (asyncBtn) asyncBtn.addEventListener("click", sendAsync);
 
-    if (window.QuantumView) {
-      const themeRes = window.QuantumView.window.getTheme();
+    if (window.Draconium) {
+      const themeRes = window.Draconium.window.getTheme();
       if (themeRes && themeRes.ok) applyTheme(themeRes.data);
-      window.QuantumView.on("theme-changed", function (payload) {
+      window.Draconium.on("theme-changed", function (payload) {
         if (payload && payload.theme) applyTheme(payload.theme);
       });
 
-      const info = window.QuantumView.invoke("host_info", "");
+      const info = window.Draconium.invoke("host_info", "");
       if (info && info.ok && hostMetaEl) {
         try {
           const parsed = JSON.parse(info.data);

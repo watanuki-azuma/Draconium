@@ -1,6 +1,6 @@
 #![allow(dead_code, unused_imports)]
 
-#[path = "../crates/quantumview-host/src/win_platform.rs"]
+#[path = "../crates/draconium-host/src/win_platform.rs"]
 mod win_platform;
 
 use std::path::PathBuf;
@@ -11,7 +11,7 @@ fn main() {
     let out_root = std::env::args_os()
         .nth(1)
         .map(PathBuf::from)
-        .unwrap_or_else(|| std::env::temp_dir().join("quantumview-win32-probe"));
+        .unwrap_or_else(|| std::env::temp_dir().join("draconium-win32-probe"));
     std::fs::create_dir_all(&out_root).expect("failed to create probe output directory");
 
     let unique = SystemTime::now()
@@ -30,17 +30,17 @@ fn main() {
     // 2. Win32 Clipboard Text / CF_HTML / CF_DIB Image round-trip (preserving prior text)
     let saved_prev_text = win_platform::clipboard_read_text(0).ok();
 
-    win_platform::clipboard_write_text(0, "QuantumView実機テスト😀")
+    win_platform::clipboard_write_text(0, "Draconium実機テスト😀")
         .expect("clipboard_write_text failed");
     let got_text = win_platform::clipboard_read_text(0).expect("clipboard_read_text failed");
-    assert_eq!(got_text, "QuantumView実機テスト😀");
+    assert_eq!(got_text, "Draconium実機テスト😀");
     println!("WIN32_CLIPBOARD_TEXT_OK");
 
-    let html_frag = "<b>太字テスト</b><span>QuantumView</span>";
+    let html_frag = "<b>太字テスト</b><span>Draconium</span>";
     win_platform::clipboard_write_html(0, html_frag).expect("clipboard_write_html failed");
     let got_html = win_platform::clipboard_read_html(0).expect("clipboard_read_html failed");
     assert!(
-        got_html.contains("太字テスト") && got_html.contains("QuantumView"),
+        got_html.contains("太字テスト") && got_html.contains("Draconium"),
         "unexpected CF_HTML roundtrip: {got_html}"
     );
     println!("WIN32_CLIPBOARD_HTML_OK");
@@ -74,13 +74,17 @@ fn main() {
     println!("WIN32_CLIPBOARD_CLEAR_OK");
 
     // 3. HKCU Registry Autostart round-trip (temporary key + cleanup)
-    let app_name = format!("QuantumViewVerifyTemp{unique}");
+    let app_name = format!("DraconiumVerifyTemp{unique}");
     assert!(
         !win_platform::autostart_is_enabled(&app_name).expect("is_enabled initial failed"),
         "fresh unique autostart key should not exist"
     );
-    win_platform::autostart_set_enabled(&app_name, true, r#""C:\NonExistent\qv.exe" --starter"#)
-        .expect("autostart enable failed");
+    win_platform::autostart_set_enabled(
+        &app_name,
+        true,
+        r#""C:\NonExistent\draconium.exe" --starter"#,
+    )
+    .expect("autostart enable failed");
     let enabled_ok = win_platform::autostart_is_enabled(&app_name);
     let disable_res = win_platform::autostart_set_enabled(&app_name, false, "");
     assert_eq!(enabled_ok.expect("is_enabled after set failed"), true);
@@ -92,9 +96,12 @@ fn main() {
     println!("WIN32_AUTOSTART_HKCU_OK");
 
     // 4. HKCU Custom URI Scheme registration + unregister cleanup
-    let scheme = format!("qvverify{}", std::process::id());
-    win_platform::register_uri_scheme(&scheme, r#""C:\NonExistent\qv.exe" --deep-link "%1""#)
-        .expect("register_uri_scheme failed");
+    let scheme = format!("dnverify{}", std::process::id());
+    win_platform::register_uri_scheme(
+        &scheme,
+        r#""C:\NonExistent\draconium.exe" --deep-link "%1""#,
+    )
+    .expect("register_uri_scheme failed");
     let reg_out = Command::new("reg.exe")
         .args([
             "query",
@@ -130,8 +137,8 @@ fn main() {
     let _ = std::fs::remove_dir_all(&crash_dir);
     for idx in 0..12 {
         let mut rpt = win_platform::CrashReport::new(
-            "QuantumView Verify",
-            "qv://app/workspace.html?secret=token123#frag",
+            "Draconium Verify",
+            "dn://app/workspace.html?secret=token123#frag",
             "rust-panic",
             &format!("simulated panic #{idx}"),
             Some("host.rs:100:1".to_owned()),
@@ -151,7 +158,7 @@ fn main() {
     let sample_crash =
         std::fs::read_to_string(crash_files[0].path()).expect("read sample crash failed");
     assert!(!sample_crash.contains("secret=token123") && !sample_crash.contains("#frag"));
-    assert!(sample_crash.contains("\"url\": \"qv://app/workspace.html\""));
+    assert!(sample_crash.contains("\"url\": \"dn://app/workspace.html\""));
     assert!(sample_crash.contains("\"source\": \"rust-panic\""));
     println!("WIN32_CRASH_REPORT_ROTATION_OK count={}", crash_files.len());
 

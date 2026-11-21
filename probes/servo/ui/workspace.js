@@ -25,18 +25,18 @@
   }
 
   function hasBridge() {
-    return Boolean(window.QuantumView && typeof window.QuantumView.invoke === "function");
+    return Boolean(window.Draconium && typeof window.Draconium.invoke === "function");
   }
 
   function syncWindowTitle() {
     const titleEl = byId("input-title");
     const title = titleEl ? titleEl.value : "";
     const windowTitle = state.activeId
-      ? (state.dirty ? "• " : "") + (title || "Untitled") + " — QuantumView Folio"
-      : "QuantumView Folio";
+      ? (state.dirty ? "• " : "") + (title || "Untitled") + " — Draconium Folio"
+      : "Draconium Folio";
     document.title = windowTitle;
-    const qvWin = window.QuantumView && window.QuantumView.window;
-    if (qvWin && typeof qvWin.setTitle === "function") qvWin.setTitle(windowTitle);
+    const hostWindow = window.Draconium && window.Draconium.window;
+    if (hostWindow && typeof hostWindow.setTitle === "function") hostWindow.setTitle(windowTitle);
   }
 
   function callAppSync(command, payloadObj) {
@@ -44,7 +44,7 @@
     if (!hasBridge()) {
       return { ok: false, error: "Host bridge unavailable" };
     }
-    const res = window.QuantumView.invoke(command, raw);
+    const res = window.Draconium.invoke(command, raw);
     if (!res || !res.ok) {
       return { ok: false, error: (res && res.error) || "Request failed" };
     }
@@ -57,8 +57,8 @@
 
   async function callAppAsync(command, payloadObj) {
     const raw = payloadObj == null ? "{}" : JSON.stringify(payloadObj);
-    if (window.QuantumView && typeof window.QuantumView.invokeAsync === "function") {
-      const res = await window.QuantumView.invokeAsync(command, raw);
+    if (window.Draconium && typeof window.Draconium.invokeAsync === "function") {
+      const res = await window.Draconium.invokeAsync(command, raw);
       if (!res || !res.ok) {
         return { ok: false, error: (res && res.error) || "Request failed" };
       }
@@ -208,8 +208,8 @@
         link.href = href;
         link.addEventListener("click", function (ev) {
           ev.preventDefault();
-          if (window.QuantumView && window.QuantumView.window) {
-            window.QuantumView.window.openExternal(href);
+          if (window.Draconium && window.Draconium.window) {
+            window.Draconium.window.openExternal(href);
           }
         });
         parent.appendChild(link);
@@ -657,12 +657,12 @@
 
   async function importFileTokens(files) {
     if (!Array.isArray(files) || files.length === 0) return;
-    if (!window.QuantumView || !window.QuantumView.files) return;
+    if (!window.Draconium || !window.Draconium.files) return;
 
     let lastImportedId = null;
     for (let i = 0; i < files.length; i++) {
       const entry = files[i];
-      const readRes = await window.QuantumView.files.readTextAsync(entry.token);
+      const readRes = await window.Draconium.files.readTextAsync(entry.token);
       if (!readRes || !readRes.ok) {
         showToast("Could not read " + (entry.name || "file"));
         continue;
@@ -682,11 +682,11 @@
   }
 
   async function openNativeFilePicker() {
-    if (!window.QuantumView || !window.QuantumView.dialog) {
+    if (!window.Draconium || !window.Draconium.dialog) {
       showToast("File picker unavailable");
       return;
     }
-    const picked = await window.QuantumView.dialog.openFileAsync({
+    const picked = await window.Draconium.dialog.openFileAsync({
       extensions: ["md", "markdown", "txt"],
       multiple: true,
     });
@@ -850,17 +850,17 @@
   }
 
   window.__folioRunBenchmark = runRenderBenchmark;
-  window.__quantumviewBeforeClose = function () {
+  window.__draconiumBeforeClose = function () {
     return !state.activeId || flushSaveSync();
   };
 
   function wireWindowChrome() {
     const shell = byId("window-shell");
-    const qvWin = window.QuantumView && window.QuantumView.window;
-    if (!qvWin) return;
+    const hostWindow = window.Draconium && window.Draconium.window;
+    if (!hostWindow) return;
 
     function syncMaximizedClass() {
-      const res = qvWin.isMaximized();
+      const res = hostWindow.isMaximized();
       if (shell && res && res.ok) {
         if (res.data === "true") shell.classList.add("is-maximized");
         else shell.classList.remove("is-maximized");
@@ -871,33 +871,33 @@
       if (shell) shell.classList.toggle("is-fullscreen", enabled === true || enabled === "true");
     }
 
-    if (typeof qvWin.isFullscreen === "function") {
-      const res = qvWin.isFullscreen();
+    if (typeof hostWindow.isFullscreen === "function") {
+      const res = hostWindow.isFullscreen();
       if (res && res.ok) syncFullscreenClass(res.data);
     }
-    if (typeof window.QuantumView.on === "function") {
-      window.QuantumView.on("fullscreen-changed", syncFullscreenClass);
+    if (typeof window.Draconium.on === "function") {
+      window.Draconium.on("fullscreen-changed", syncFullscreenClass);
     }
 
     const minBtn = byId("btn-win-min");
-    if (minBtn) minBtn.addEventListener("click", function () { qvWin.minimize(); });
+    if (minBtn) minBtn.addEventListener("click", function () { hostWindow.minimize(); });
 
     const maxBtn = byId("btn-win-max");
     if (maxBtn) {
       maxBtn.addEventListener("click", function () {
-        qvWin.toggleMaximize();
+        hostWindow.toggleMaximize();
         setTimeout(syncMaximizedClass, 60);
       });
     }
 
     const closeBtn = byId("btn-win-close");
-    if (closeBtn) closeBtn.addEventListener("click", function () { qvWin.close(); });
+    if (closeBtn) closeBtn.addEventListener("click", function () { hostWindow.close(); });
 
     const titlebar = byId("titlebar");
     if (titlebar) {
       titlebar.addEventListener("dblclick", function (ev) {
-        if (ev.target && ev.target.closest && ev.target.closest("button, [data-qv-no-drag]")) return;
-        qvWin.toggleMaximize();
+        if (ev.target && ev.target.closest && ev.target.closest("button, [data-dn-no-drag]")) return;
+        hostWindow.toggleMaximize();
         setTimeout(syncMaximizedClass, 60);
       });
     }
@@ -907,7 +907,7 @@
       handles[i].addEventListener("mousedown", function (ev) {
         if (ev.button !== 0) return;
         ev.preventDefault();
-        qvWin.dragResize(this.getAttribute("data-resize"));
+        hostWindow.dragResize(this.getAttribute("data-resize"));
       });
     }
 
@@ -968,8 +968,8 @@
       byId("act-copy-md").addEventListener("click", function () {
         hideExportMenu();
         const text = areaEl ? areaEl.value : "";
-        if (window.QuantumView && window.QuantumView.clipboard) {
-          const res = window.QuantumView.clipboard.writeText(text);
+        if (window.Draconium && window.Draconium.clipboard) {
+          const res = window.Draconium.clipboard.writeText(text);
           showToast(res && res.ok ? "Copied Markdown" : "Clipboard copy failed");
         }
       });
@@ -979,8 +979,8 @@
       byId("act-copy-html").addEventListener("click", function () {
         hideExportMenu();
         const html = byId("preview-prose") ? byId("preview-prose").innerHTML : "";
-        if (window.QuantumView && window.QuantumView.clipboard) {
-          const res = window.QuantumView.clipboard.writeHtml(html);
+        if (window.Draconium && window.Draconium.clipboard) {
+          const res = window.Draconium.clipboard.writeHtml(html);
           showToast(res && res.ok ? "Copied formatted HTML" : "Clipboard copy failed");
         }
       });
@@ -989,9 +989,9 @@
     if (byId("act-save-md")) {
       byId("act-save-md").addEventListener("click", async function () {
         hideExportMenu();
-        if (!window.QuantumView || !window.QuantumView.dialog) return;
+        if (!window.Draconium || !window.Draconium.dialog) return;
         const name = (state.activeId || "note") + ".md";
-        const res = await window.QuantumView.dialog.saveTextFileAsync({
+        const res = await window.Draconium.dialog.saveTextFileAsync({
           name: name,
           extensions: ["md", "txt"],
           text: areaEl ? areaEl.value : "",
@@ -1003,8 +1003,8 @@
     if (byId("act-export-html")) {
       byId("act-export-html").addEventListener("click", async function () {
         hideExportMenu();
-        if (!window.QuantumView || !window.QuantumView.window) return;
-        const res = await window.QuantumView.window.exportHtmlAsync((state.activeId || "note") + ".html");
+        if (!window.Draconium || !window.Draconium.window) return;
+        const res = await window.Draconium.window.exportHtmlAsync((state.activeId || "note") + ".html");
         if (res && res.ok) showToast("Exported HTML");
       });
     }
@@ -1012,8 +1012,8 @@
     if (byId("act-export-pdf")) {
       byId("act-export-pdf").addEventListener("click", async function () {
         hideExportMenu();
-        if (!window.QuantumView || !window.QuantumView.window) return;
-        const res = await window.QuantumView.window.exportPdfAsync((state.activeId || "note") + ".pdf");
+        if (!window.Draconium || !window.Draconium.window) return;
+        const res = await window.Draconium.window.exportPdfAsync((state.activeId || "note") + ".pdf");
         if (res && res.ok) showToast("Exported PDF");
       });
     }
@@ -1021,8 +1021,8 @@
     if (byId("act-capture-png")) {
       byId("act-capture-png").addEventListener("click", async function () {
         hideExportMenu();
-        if (!window.QuantumView || !window.QuantumView.window) return;
-        const res = await window.QuantumView.window.capturePngAsync((state.activeId || "note") + ".png");
+        if (!window.Draconium || !window.Draconium.window) return;
+        const res = await window.Draconium.window.capturePngAsync((state.activeId || "note") + ".png");
         if (res && res.ok) showToast("Saved PNG snapshot");
       });
     }
@@ -1052,20 +1052,20 @@
     });
 
     const dropOverlay = byId("drop-overlay");
-    document.addEventListener("qv:file-drop-hover", function () {
+    document.addEventListener("dn:file-drop-hover", function () {
       if (dropOverlay) dropOverlay.classList.remove("is-hidden");
     });
-    document.addEventListener("qv:file-drop-cancel", function () {
+    document.addEventListener("dn:file-drop-cancel", function () {
       if (dropOverlay) dropOverlay.classList.add("is-hidden");
     });
-    document.addEventListener("qv:file-drop", function (ev) {
+    document.addEventListener("dn:file-drop", function (ev) {
       if (dropOverlay) dropOverlay.classList.add("is-hidden");
       const files = ev && ev.detail && ev.detail.files;
       importFileTokens(files);
     });
 
-    if (window.QuantumView && typeof window.QuantumView.on === "function") {
-      window.QuantumView.on("theme-changed", function (payload) {
+    if (window.Draconium && typeof window.Draconium.on === "function") {
+      window.Draconium.on("theme-changed", function (payload) {
         if (payload && payload.theme) applyTheme(payload.theme);
       });
     }
@@ -1103,8 +1103,8 @@
     applyNoteToEditor(null);
     bindEvents();
 
-    if (window.QuantumView && window.QuantumView.window) {
-      const themeRes = window.QuantumView.window.getTheme();
+    if (window.Draconium && window.Draconium.window) {
+      const themeRes = window.Draconium.window.getTheme();
       if (themeRes && themeRes.ok && (themeRes.data === "dark" || themeRes.data === "light")) {
         applyTheme(themeRes.data);
       }

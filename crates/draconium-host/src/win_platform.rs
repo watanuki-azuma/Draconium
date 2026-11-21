@@ -34,8 +34,8 @@ const MAX_CAPABILITY_TOKENS: usize = 64;
 /// Maximum number of `.crash.json` reports retained in the crash directory.
 const MAX_CRASH_REPORTS: usize = 10;
 
-/// Magic `dwData` tag identifying QuantumView single-instance `WM_COPYDATA` packets (`"QVIP"`).
-pub const QV_COPYDATA_MAGIC: usize = 0x5156_4950;
+/// Magic `dwData` tag identifying Draconium single-instance `WM_COPYDATA` packets (`"DNIP"`).
+pub const DN_COPYDATA_MAGIC: usize = 0x444E_4950;
 /// Maximum byte length of a `WM_COPYDATA` second-instance JSON payload.
 pub const MAX_COPYDATA_BYTES: usize = 65_536;
 
@@ -331,7 +331,7 @@ impl FileAccessRegistry {
     pub fn register(&mut self, path: PathBuf) -> String {
         let id = self.next_id;
         self.next_id = self.next_id.wrapping_add(1);
-        let token = format!("qvfile-{:016x}-{id}", self.salt ^ id.rotate_left(17));
+        let token = format!("dnfile-{:016x}-{id}", self.salt ^ id.rotate_left(17));
         if self.entries.len() >= MAX_CAPABILITY_TOKENS
             && let Some(oldest) = self.order.pop_front()
         {
@@ -897,7 +897,7 @@ pub fn validate_custom_uri_scheme(scheme: &str) -> Result<String, String> {
         "ftp",
         "ws",
         "wss",
-        "qv",
+        "dn",
         "about",
         "blob",
         "data",
@@ -922,7 +922,7 @@ pub fn validate_custom_uri_scheme(scheme: &str) -> Result<String, String> {
 }
 
 /// Sanitize a single-instance / app tag into a safe suffix for the hidden OS
-/// event window class and title (`"QuantumViewOsEventWindow.<tag>"`).
+/// event window class and title (`"Draconium.TrayWindow.<tag>"`).
 pub fn sanitize_instance_tag(tag: &str) -> String {
     let cleaned: String = tag
         .chars()
@@ -938,7 +938,7 @@ pub fn sanitize_instance_tag(tag: &str) -> String {
 
 /// Compute the scoped Win32 window class/title name for a given instance tag.
 pub fn instance_window_name(tag: &str) -> String {
-    format!("QuantumViewOsEventWindow.{}", sanitize_instance_tag(tag))
+    format!("Draconium.TrayWindow.{}", sanitize_instance_tag(tag))
 }
 
 /// Build the compact JSON payload sent from a second instance to the primary
@@ -1250,7 +1250,7 @@ mod win32 {
     use std::time::Duration;
 
     use super::{
-        MAX_CLIPBOARD_BYTES, MAX_COPYDATA_BYTES, QV_COPYDATA_MAGIC, base64_encode, build_cf_html,
+        DN_COPYDATA_MAGIC, MAX_CLIPBOARD_BYTES, MAX_COPYDATA_BYTES, base64_encode, build_cf_html,
         dib_to_rgba, encode_rgba_as_stored_png, instance_window_name, parse_cf_html,
         validate_custom_uri_scheme, validate_registry_app_name,
     };
@@ -1873,7 +1873,7 @@ mod win32 {
             return false;
         }
         let cds = CopyDataStruct {
-            dw_data: QV_COPYDATA_MAGIC,
+            dw_data: DN_COPYDATA_MAGIC,
             cb_data: json_payload.len() as u32,
             lp_data: json_payload.as_ptr().cast(),
         };
@@ -2568,7 +2568,7 @@ mod tests {
 
     #[test]
     fn capability_file_registry_scopes_reads_and_evicts() {
-        let dir = std::env::temp_dir().join(format!("qv-cap-test-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("dn-cap-test-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
         let file = dir.join("sample.txt");
         std::fs::write(&file, "こんにちは😀").unwrap();
@@ -2583,7 +2583,7 @@ mod tests {
             base64_decode(&reg.read_base64(&token).unwrap(), 1024).unwrap(),
             "こんにちは😀".as_bytes()
         );
-        assert!(reg.read_text("qvfile-forged-999").is_err());
+        assert!(reg.read_text("dnfile-forged-999").is_err());
 
         let _ = std::fs::remove_file(&file);
         let _ = std::fs::remove_dir(&dir);
@@ -2678,39 +2678,39 @@ mod tests {
     #[test]
     fn registry_uri_scheme_and_crash_report_helpers_validate() {
         assert_eq!(
-            validate_registry_app_name("QuantumView.Folio").unwrap(),
-            "QuantumView.Folio"
+            validate_registry_app_name("Draconium.Folio").unwrap(),
+            "Draconium.Folio"
         );
         assert!(validate_registry_app_name("bad\\name").is_err());
         assert!(validate_registry_app_name("").is_err());
 
         let cmd = format_win32_command_line(
-            Path::new(r"C:\Program Files\QuantumView\quantumview-servo.exe"),
+            Path::new(r"C:\Program Files\Draconium\draconium.exe"),
             &["--workspace", "--tray"],
         );
         assert_eq!(
             cmd,
-            r#""C:\Program Files\QuantumView\quantumview-servo.exe" --workspace --tray"#
+            r#""C:\Program Files\Draconium\draconium.exe" --workspace --tray"#
         );
 
         assert_eq!(
-            validate_custom_uri_scheme("QuantumView").unwrap(),
-            "quantumview"
+            validate_custom_uri_scheme("Draconium").unwrap(),
+            "draconium"
         );
         assert!(validate_custom_uri_scheme("http").is_err());
         assert!(validate_custom_uri_scheme("https").is_err());
         assert!(validate_custom_uri_scheme("file").is_err());
         assert!(validate_custom_uri_scheme("javascript").is_err());
-        assert!(validate_custom_uri_scheme("qv").is_err());
+        assert!(validate_custom_uri_scheme("dn").is_err());
         assert!(validate_custom_uri_scheme("ms-settings").is_err());
 
         assert_eq!(
-            instance_window_name("Local\\QuantumView.Workspace"),
-            "QuantumViewOsEventWindow.LocalQuantumViewWorkspace"
+            instance_window_name("Local\\Draconium.Workspace"),
+            "Draconium.TrayWindow.LocalDraconiumWorkspace"
         );
 
         let report = CrashReport::new(
-            "QuantumView Folio",
+            "Draconium Folio",
             "http://user:pass@127.0.0.1:5173/workspace.html?token=secret#hash",
             "webview-crashed",
             "pipeline panic",
@@ -2721,7 +2721,7 @@ mod tests {
         assert!(!json.contains("secret"));
         assert!(!json.contains("pass"));
 
-        let crash_dir = std::env::temp_dir().join(format!("qv-crash-test-{}", std::process::id()));
+        let crash_dir = std::env::temp_dir().join(format!("dn-crash-test-{}", std::process::id()));
         let written = write_crash_report(&crash_dir, &report).unwrap();
         assert!(written.is_file());
         let _ = std::fs::remove_file(&written);

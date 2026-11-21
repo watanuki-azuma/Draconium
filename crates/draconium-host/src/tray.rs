@@ -46,7 +46,7 @@ pub struct TrayConfig {
     /// Optional Win32 `(modifiers, vk)` global hotkey to register.
     pub hotkey: Option<(u32, u32)>,
     /// Per-mode instance tag scoping the hidden OS event window class and title
-    /// (`"QuantumViewOsEventWindow.<tag>"`) so concurrent modes do not collide
+    /// (`"Draconium.TrayWindow.<tag>"`) so concurrent modes do not collide
     /// under `FindWindowExW`.
     pub instance_window_tag: String,
 }
@@ -60,8 +60,8 @@ const PBT_APMSUSPEND: usize = 0x0004;
 const PBT_APMPOWERSTATUSCHANGE: usize = 0x000A;
 const PBT_APMRESUMEAUTOMATIC: usize = 0x0012;
 
-/// Magic `dwData` tag identifying QuantumView `WM_COPYDATA` packets (`"QVIP"`).
-pub const QV_COPYDATA_MAGIC: usize = 0x5156_4950;
+/// Magic `dwData` tag identifying Draconium `WM_COPYDATA` packets (`"DNIP"`).
+pub const DN_COPYDATA_MAGIC: usize = 0x444E_4950;
 /// Maximum byte length accepted for a `WM_COPYDATA` second-instance payload.
 pub const MAX_COPYDATA_BYTES: usize = 65_536;
 
@@ -98,13 +98,13 @@ pub fn os_event_window_name(tag: &str) -> String {
     } else {
         cleaned.as_str()
     };
-    format!("QuantumViewOsEventWindow.{suffix}")
+    format!("Draconium.TrayWindow.{suffix}")
 }
 
 /// Validate a raw `WM_COPYDATA` byte slice (must be non-empty, `<= MAX_COPYDATA_BYTES`,
 /// valid UTF-8 JSON object without NUL bytes).
 pub fn decode_copydata_payload(magic: usize, raw: &[u8]) -> Option<String> {
-    if magic != QV_COPYDATA_MAGIC || raw.is_empty() || raw.len() > MAX_COPYDATA_BYTES {
+    if magic != DN_COPYDATA_MAGIC || raw.is_empty() || raw.len() > MAX_COPYDATA_BYTES {
         return None;
     }
     let text = std::str::from_utf8(raw).ok()?.trim();
@@ -486,7 +486,7 @@ mod win32 {
                         let tip = if !ptr.is_null() {
                             (*ptr).tooltip.as_str()
                         } else {
-                            "QuantumView"
+                            "Draconium"
                         };
                         cleanup_ephemeral_balloon(hwnd);
                         let mut nid = ephemeral_nid(hwnd);
@@ -594,7 +594,7 @@ mod win32 {
         ) -> Result<Self, String> {
             let (tx, rx) = mpsc::channel::<Result<(Hwnd, bool), String>>();
             let thread = thread::Builder::new()
-                .name("quantumview-tray".to_owned())
+                .name("draconium-tray".to_owned())
                 .spawn(move || unsafe {
                     let hinstance = GetModuleHandleW(ptr::null());
                     let scoped_name = os_event_window_name(&config.instance_window_tag);
@@ -785,7 +785,7 @@ impl TrayHandle {
                 &config.instance_window_tag,
                 move |raw| {
                     if let Some(payload) =
-                        decode_copydata_payload(QV_COPYDATA_MAGIC, raw.as_bytes())
+                        decode_copydata_payload(DN_COPYDATA_MAGIC, raw.as_bytes())
                     {
                         on_action(TrayAction::SecondInstance(payload));
                     }
@@ -880,27 +880,27 @@ mod tests {
     #[test]
     fn os_event_window_name_and_copydata_validation() {
         assert_eq!(
-            os_event_window_name("Local\\QuantumView.Workspace"),
-            "QuantumViewOsEventWindow.LocalQuantumViewWorkspace"
+            os_event_window_name("Local\\Draconium.Workspace"),
+            "Draconium.TrayWindow.LocalDraconiumWorkspace"
         );
-        assert_eq!(os_event_window_name(""), "QuantumViewOsEventWindow.Default");
+        assert_eq!(os_event_window_name(""), "Draconium.TrayWindow.Default");
 
-        let payload = br#"{"argv":["--workspace"],"deepLink":"qvfolio://open"}"#;
+        let payload = br#"{"argv":["--workspace"],"deepLink":"dnfolio://open"}"#;
         assert_eq!(
-            decode_copydata_payload(QV_COPYDATA_MAGIC, payload).as_deref(),
-            Some(r#"{"argv":["--workspace"],"deepLink":"qvfolio://open"}"#)
+            decode_copydata_payload(DN_COPYDATA_MAGIC, payload).as_deref(),
+            Some(r#"{"argv":["--workspace"],"deepLink":"dnfolio://open"}"#)
         );
         assert!(decode_copydata_payload(0x1234, payload).is_none());
-        assert!(decode_copydata_payload(QV_COPYDATA_MAGIC, b"not-json").is_none());
-        assert!(decode_copydata_payload(QV_COPYDATA_MAGIC, b"").is_none());
+        assert!(decode_copydata_payload(DN_COPYDATA_MAGIC, b"not-json").is_none());
+        assert!(decode_copydata_payload(DN_COPYDATA_MAGIC, b"").is_none());
     }
 
     #[test]
     fn tray_tip_and_notification_buffers_truncate_safely() {
-        let short = encode_tray_tip("QuantumView");
-        assert_eq!(short[11], 0);
-        let decoded = String::from_utf16(&short[..11]).unwrap();
-        assert_eq!(decoded, "QuantumView");
+        let short = encode_tray_tip("Draconium");
+        let short_nul = short.iter().position(|&c| c == 0).unwrap();
+        let decoded = String::from_utf16(&short[..short_nul]).unwrap();
+        assert_eq!(decoded, "Draconium");
 
         let mut boundary = "a".repeat(126);
         boundary.push('😀');

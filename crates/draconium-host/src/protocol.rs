@@ -2,11 +2,11 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-//! Routing core for the `qv://` custom protocol.
+//! Routing core for the `dn://` custom protocol.
 //!
 //! Servo lets an embedder register custom protocols through
 //! `servo::protocol_handler::ProtocolRegistry`, so local desktop apps can be
-//! served from `qv://app/<path>` instead of loose `file://` URLs.
+//! served from `dn://app/<path>` instead of loose `file://` URLs.
 //!
 //! This module keeps the testable part — multi-segment path normalization,
 //! traversal/dotfile rejection, embedded fallback bytes (`include_bytes!`),
@@ -22,28 +22,28 @@ pub struct EmbeddedAsset {
 }
 
 /// The custom scheme the host registers for bundled assets.
-pub const SCHEME: &str = "qv";
+pub const SCHEME: &str = "dn";
 
 /// The authority (host part) under which app assets are served.
 pub const APP_AUTHORITY: &str = "app";
 
-/// Default strict Content-Security-Policy header injected on `qv://app/*.html`
-/// responses. Because `rust-url` treats non-special schemes like `qv://` as
+/// Default strict Content-Security-Policy header injected on `dn://app/*.html`
+/// responses. Because `rust-url` treats non-special schemes like `dn://` as
 /// opaque origins and `content-security-policy` never matches `'self'` across
-/// two opaque origins, `qv://app` is listed explicitly alongside `'self'`, and
+/// two opaque origins, `dn://app` is listed explicitly alongside `'self'`, and
 /// `blob:` is permitted in `connect-src` for `<a download href="blob:...">`.
 /// Popover polyfill styles are registered at `Origin::User` via
 /// `UserStyleSheet`, so author `style-src` remains strict without
 /// `'unsafe-inline'`.
-pub const DEFAULT_CSP: &str = "default-src 'self' qv://app; script-src 'self' qv://app; style-src 'self' qv://app; img-src 'self' qv://app data: blob:; font-src 'self' qv://app data:; connect-src 'self' qv://app blob:; object-src 'none'; base-uri 'self' qv://app; frame-ancestors 'none'; form-action 'self' qv://app";
+pub const DEFAULT_CSP: &str = "default-src 'self' dn://app; script-src 'self' dn://app; style-src 'self' dn://app; img-src 'self' dn://app data: blob:; font-src 'self' dn://app data:; connect-src 'self' dn://app blob:; object-src 'none'; base-uri 'self' dn://app; frame-ancestors 'none'; form-action 'self' dn://app";
 
-/// Build the `Content-Security-Policy` header string for `qv://app/` HTML
+/// Build the `Content-Security-Policy` header string for `dn://app/` HTML
 /// documents, optionally enabling `'wasm-unsafe-eval'` for WebAssembly apps.
 pub fn build_csp_header(allow_wasm: bool) -> String {
     if allow_wasm {
         DEFAULT_CSP.replacen(
-            "script-src 'self' qv://app;",
-            "script-src 'self' qv://app 'wasm-unsafe-eval';",
+            "script-src 'self' dn://app;",
+            "script-src 'self' dn://app 'wasm-unsafe-eval';",
             1,
         )
     } else {
@@ -51,7 +51,7 @@ pub fn build_csp_header(allow_wasm: bool) -> String {
     }
 }
 
-/// Build the `qv://` URL for a bundled asset file name or relative path.
+/// Build the `dn://` URL for a bundled asset file name or relative path.
 pub fn asset_url(file_name: &str) -> String {
     let rel = file_name.strip_prefix('/').unwrap_or(file_name);
     format!("{SCHEME}://{APP_AUTHORITY}/{rel}")
@@ -89,7 +89,7 @@ pub fn content_type_for(file_name: &str) -> &'static str {
     }
 }
 
-/// Normalize and validate a `qv://app/<path>` request path into a safe
+/// Normalize and validate a `dn://app/<path>` request path into a safe
 /// relative path (supporting nested asset subdirectories such as
 /// `assets/index.js` or `fonts/inter.woff2`).
 ///
@@ -223,13 +223,13 @@ mod tests {
 
     #[test]
     fn asset_url_and_csp_header_shape() {
-        assert_eq!(asset_url("workspace.html"), "qv://app/workspace.html");
-        assert_eq!(asset_url("/assets/app.js"), "qv://app/assets/app.js");
+        assert_eq!(asset_url("workspace.html"), "dn://app/workspace.html");
+        assert_eq!(asset_url("/assets/app.js"), "dn://app/assets/app.js");
         let default_csp = build_csp_header(false);
-        assert!(default_csp.contains("default-src 'self' qv://app"));
-        assert!(default_csp.contains("connect-src 'self' qv://app blob:"));
+        assert!(default_csp.contains("default-src 'self' dn://app"));
+        assert!(default_csp.contains("connect-src 'self' dn://app blob:"));
         assert!(!default_csp.contains("wasm-unsafe-eval"));
         let wasm_csp = build_csp_header(true);
-        assert!(wasm_csp.contains("script-src 'self' qv://app 'wasm-unsafe-eval';"));
+        assert!(wasm_csp.contains("script-src 'self' dn://app 'wasm-unsafe-eval';"));
     }
 }

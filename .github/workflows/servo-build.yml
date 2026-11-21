@@ -14,7 +14,7 @@ on:
         default: all
         required: true
       build_example:
-        description: Also build the quantumview-host hello example
+        description: Also build the draconium-host hello example
         type: boolean
         default: true
         required: true
@@ -132,11 +132,11 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             probes/servo/target
-          key: ${{ runner.os }}-cargo-servo${{ inputs.media_gstreamer && '-gst' || '' }}-${{ hashFiles('probes/servo/Cargo.lock', 'probes/servo/Cargo.toml', 'crates/quantumview-host/Cargo.toml') }}
+          key: ${{ runner.os }}-cargo-servo${{ inputs.media_gstreamer && '-gst' || '' }}-${{ hashFiles('probes/servo/Cargo.lock', 'probes/servo/Cargo.toml', 'crates/draconium-host/Cargo.toml') }}
 
       - name: Build Servo release
         run: cargo build --release --locked ${{ inputs.media_gstreamer && '--features media-gstreamer' || '' }} --manifest-path probes/servo/Cargo.toml
 
       - name: Build host hello example
         if: ${{ inputs.build_example }}
-        run: cargo build --release --locked ${{ inputs.media_gstreamer && '--features media-gstreamer' || '' }} -p quantumview-host --example hello --manifest-path probes/servo/Cargo.toml
+        run: cargo build --release --locked ${{ inputs.media_gstreamer && '--features media-gstreamer' || '' }} -p draconium-host --example hello --manifest-path probes/servo/Cargo.toml

@@ -1,38 +1,38 @@
-# QuantumView Host API Specification (`quantumview-host`)
+# Draconium Host API Specification (`draconium-host`)
 
-QuantumView's host layer lives in the standalone library crate [`crates/quantumview-host`](../crates/quantumview-host/Cargo.toml) ([`src/lib.rs`](../crates/quantumview-host/src/lib.rs) / [`src/host.rs`](../crates/quantumview-host/src/host.rs)), enabling external Rust projects to embed **Servo 0.8.0** as a desktop WebView host via `Cargo.toml`.
+Draconium's host layer lives in the standalone library crate [`crates/draconium-host`](../crates/draconium-host/Cargo.toml) ([`src/lib.rs`](../crates/draconium-host/src/lib.rs) / [`src/host.rs`](../crates/draconium-host/src/host.rs)), enabling external Rust projects to embed **Servo 0.8.0** as a desktop WebView host via `Cargo.toml`.
 
-See [`crates/quantumview-host/examples/hello.rs`](../crates/quantumview-host/examples/hello.rs) for a complete minimal standalone example.
+See [`crates/draconium-host/examples/hello.rs`](../crates/draconium-host/examples/hello.rs) for a complete minimal standalone example.
 
 ---
 
-## 1. Adding `quantumview-host` to a Project
+## 1. Adding `draconium-host` to a Project
 
 ```toml
 [dependencies]
-quantumview-host = { path = "../QuantumView/crates/quantumview-host" }
+draconium-host = { path = "../Draconium/crates/draconium-host" }
 
 [patch.crates-io]
-servo-paint = { path = "../QuantumView/probes/servo/vendor/servo-paint" }
+servo-paint = { path = "../Draconium/probes/servo/vendor/servo-paint" }
 ```
 
-Native GStreamer media is opt-in: add `features = ["media-gstreamer"]` to the `quantumview-host` dependency to select Servo 0.8.0's GStreamer backend. Build and runtime prerequisites are documented in [Optional Native Media (`media-gstreamer`)](media-gstreamer.md).
+Native GStreamer media is opt-in: add `features = ["media-gstreamer"]` to the `draconium-host` dependency to select Servo 0.8.0's GStreamer backend. Build and runtime prerequisites are documented in [Optional Native Media (`media-gstreamer`)](media-gstreamer.md).
 
 ---
 
-## 2. Rust Host API (`quantumview_host`)
+## 2. Rust Host API (`draconium_host`)
 
 ### 2.1 Entry Points and Core Types
 
 | Symbol | Responsibility |
 | --- | --- |
-| `HostConfig` | Launch configuration (window title, URL, `WindowConfig`, `Capabilities`, `qv://` asset root, caller-supplied `EmbeddedAsset` slice, tray, single-instance tag, crash directory, DevTools, deep link). Construct via `HostConfig::new(title, url)` and customize with fluent `with_*` builders. |
+| `HostConfig` | Launch configuration (window title, URL, `WindowConfig`, `Capabilities`, `dn://` asset root, caller-supplied `EmbeddedAsset` slice, tray, single-instance tag, crash directory, DevTools, deep link). Construct via `HostConfig::new(title, url)` and customize with fluent `with_*` builders. |
 | `WindowConfig` | Native window attributes (decorations, alpha transparency, always-on-top, taskbar visibility, logical size/position and size limits, system tray, layered opacity, global hotkey). |
 | `HostHandler` | Trait implemented by each hosted application to handle IPC commands and optional window/background hooks. |
 | `Capabilities` | Declarative per-app security ACL (`Capabilities::restricted()`, `Capabilities::standard_desktop()`, fluent `with_*` builders, `attenuate_for_child()`). |
-| `EmbeddedAsset` | `{ path: &'static str, bytes: &'static [u8] }` entry supplied via `HostConfig::with_embedded_assets(...)` for single-binary `qv://app/` fallback. |
+| `EmbeddedAsset` | `{ path: &'static str, bytes: &'static [u8] }` entry supplied via `HostConfig::with_embedded_assets(...)` for single-binary `dn://app/` fallback. |
 | `resolve_ui_path_from(base_dir, exe_rel, manifest_rel)` | Resolves UI files relative to the executable first (portable distributions), then current working directory, then `base_dir` (typically `Path::new(env!("CARGO_MANIFEST_DIR"))`). |
-| `resolve_app_url_from(base_dir, qv_assets, dev_url, file_name, exe_rel, manifest_rel)` | Resolves `--dev-url`, `qv://app/<file>` (with compiled-in fallback), or local `file://` startup URL and optional `asset_root`. |
+| `resolve_app_url_from(base_dir, dn_assets, dev_url, file_name, exe_rel, manifest_rel)` | Resolves `--dev-url`, `dn://app/<file>` (with compiled-in fallback), or local `file://` startup URL and optional `asset_root`. |
 | `run(config, handler, self_test)` | Starts the winit event loop and embedded Servo 0.8.0 runtime. |
 | `platform::*` | Runtime capability introspection (`PlatformCapabilities`, `platform_capabilities`) and validation/parsing helpers (`parse_hotkey`, `opacity_to_alpha`, `validate_custom_uri_scheme`, `validate_devtools_addr`). See [docs/cross-platform.md](cross-platform.md). |
 | Window geometry types | `LogicalSize`, `LogicalPosition`, `Presentation`, `SavedWindowState`, `DEFAULT_WINDOW_SIZE`, `CHIPS_SIZE`, `FLYOUT_SIZE`. |
@@ -59,7 +59,7 @@ Modifiers:
 
 ```rust
 use std::path::Path;
-use quantumview_host::{
+use draconium_host::{
     Capabilities, EmbeddedAsset, HostConfig, WindowConfig, resolve_app_url_from, run,
 };
 
@@ -71,7 +71,7 @@ const EMBEDDED_ASSETS: &[EmbeddedAsset] = &[
 
 let (url, asset_root) = resolve_app_url_from(
     Path::new(env!("CARGO_MANIFEST_DIR")),
-    qv_assets,
+    dn_assets,
     dev_url.as_deref(),
     "app.html",
     "ui/app.html",
@@ -100,13 +100,13 @@ Additional builders:
 - `.with_screenshot(Option<PathBuf>)`: automated first-paint PNG capture and non-blank analysis
 - `.with_deep_link(Option<String>)` / `.with_raw_args(Vec<String>)`: custom URI scheme startup and single-instance forwarding
 - `.with_dev_origin(Option<DevOrigin>)`: loopback dev server origin allowed by `--dev-url`
-- `.with_wasm_csp(bool)`: appends `'wasm-unsafe-eval'` to `script-src` in `qv://app/` CSP headers
+- `.with_wasm_csp(bool)`: appends `'wasm-unsafe-eval'` to `script-src` in `dn://app/` CSP headers
 
 ### 2.4 `HostHandler` Trait
 
 ```rust
 pub trait HostHandler {
-    /// Handles `QuantumView.invoke(command, payload)` and `invokeAsync(command, payload)`.
+    /// Handles `Draconium.invoke(command, payload)` and `invokeAsync(command, payload)`.
     fn handle_request(&mut self, command: &str, payload: &str) -> Result<String, String>;
 
     /// Called once a window move burst settles (default: ignore).
@@ -125,7 +125,7 @@ pub trait HostHandler {
         false
     }
 
-    /// Optional background event pushed to JS listeners via `QuantumView.on(event, fn)`.
+    /// Optional background event pushed to JS listeners via `Draconium.on(event, fn)`.
     fn poll_background_event(&mut self) -> Option<(&'static str, String)> {
         None
     }
@@ -136,24 +136,24 @@ pub trait HostHandler {
 
 ## 3. Security Boundaries & `Capabilities` ACL
 
-All privileged operations are gated by [`crates/quantumview-host/src/policy.rs`](../crates/quantumview-host/src/policy.rs) and a per-launch 128-bit session token:
+All privileged operations are gated by [`crates/draconium-host/src/policy.rs`](../crates/draconium-host/src/policy.rs) and a per-launch 128-bit session token:
 
 - **Application command allowlist**: Only command names listed in `Capabilities.allowed_app_commands` reach `HostHandler::handle_request`.
-- **Child window attenuation**: Secondary windows created via `window.open` or `QuantumView.window.openChild` (up to 4 windows, restricted to local `qv://app/` or `file://`) automatically receive `Capabilities::attenuate_for_child()`, stripping file access, clipboard, DPAPI, autostart, session control, and application commands.
-- **Navigation & permissions**: `request_navigation` allows only `qv://app/`, local `file://` (UNC paths rejected), `about:blank`, and an explicitly configured loopback `--dev-url`. `request_permission` denies all requests by default.
-- **`qv://app/` serving & strict CSP**: [`crates/quantumview-host/src/protocol.rs`](../crates/quantumview-host/src/protocol.rs) and [`crates/quantumview-host/src/qv_protocol.rs`](../crates/quantumview-host/src/qv_protocol.rs) reject directory traversal/dotfiles, confine disk lookups via `canonicalize()`, fall back to caller-supplied `EmbeddedAsset` bytes, and attach `Content-Security-Policy` (`default-src 'self' qv://app; script-src 'self' qv://app; style-src 'self' qv://app; ...; object-src 'none'`) plus `X-Content-Type-Options: nosniff`.
+- **Child window attenuation**: Secondary windows created via `window.open` or `Draconium.window.openChild` (up to 4 windows, restricted to local `dn://app/` or `file://`) automatically receive `Capabilities::attenuate_for_child()`, stripping file access, clipboard, DPAPI, autostart, session control, and application commands.
+- **Navigation & permissions**: `request_navigation` allows only `dn://app/`, local `file://` (UNC paths rejected), `about:blank`, and an explicitly configured loopback `--dev-url`. `request_permission` denies all requests by default.
+- **`dn://app/` serving & strict CSP**: [`crates/draconium-host/src/protocol.rs`](../crates/draconium-host/src/protocol.rs) and [`crates/draconium-host/src/dn_protocol.rs`](../crates/draconium-host/src/dn_protocol.rs) reject directory traversal/dotfiles, confine disk lookups via `canonicalize()`, fall back to caller-supplied `EmbeddedAsset` bytes, and attach `Content-Security-Policy` (`default-src 'self' dn://app; script-src 'self' dn://app; style-src 'self' dn://app; ...; object-src 'none'`) plus `X-Content-Type-Options: nosniff`.
 
 ---
 
-## 4. JavaScript Preload API (`window.QuantumView`)
+## 4. JavaScript Preload API (`window.Draconium`)
 
-Injected automatically before page scripts via `UserContentManager` and recursively frozen with `Object.freeze` ([`crates/quantumview-host/src/bridge.rs`](../crates/quantumview-host/src/bridge.rs)).
+Injected automatically before page scripts via `UserContentManager` and recursively frozen with `Object.freeze` ([`crates/draconium-host/src/bridge.rs`](../crates/draconium-host/src/bridge.rs)).
 
 ### 4.1 Application IPC & Events
 
-- `QuantumView.invoke(command, payloadString)` -> `{ ok: boolean, data?: string, error?: string }`
-- `QuantumView.invokeAsync(command, payloadString)` -> `Promise<{ ok: boolean, data?: string, error?: string }>`
-- `QuantumView.on(eventName, listener)` / `QuantumView.off(eventName, listener)`
+- `Draconium.invoke(command, payloadString)` -> `{ ok: boolean, data?: string, error?: string }`
+- `Draconium.invokeAsync(command, payloadString)` -> `Promise<{ ok: boolean, data?: string, error?: string }>`
+- `Draconium.on(eventName, listener)` / `Draconium.off(eventName, listener)`
   - Built-in host events: `state-updated`, `file-drop-hover`, `file-drop-cancel`, `file-drop`, `theme-changed`, `fullscreen-changed` (`"true"` / `"false"`), `power-event`, `global-hotkey`, `capture-saved`, `second-instance`, `open-url`, `notification-clicked`
 
 > [!IMPORTANT]
@@ -163,15 +163,15 @@ Injected automatically before page scripts via `UserContentManager` and recursiv
 
 | Namespace | Methods |
 | --- | --- |
-| `QuantumView.window` | `drag()`, `dragResize(edge)`, `minimize()`, `toggleMaximize()`, `isMaximized()`, `setTitle(title)`, `setFullscreen(enabled)`, `isFullscreen()`, `setAlwaysOnTop(enabled)`, `focus()`, `requestUserAttention(level)`, `getBounds()`, `setSize(width, height)`, `goBack()`, `goForward()`, `canGoBack()`, `canGoForward()`, `showChips()`, `showFlyout()`, `hide()`, `show()`, `close()`, `reload()`, `hardReload()`, `zoomIn()`, `zoomOut()`, `zoomReset()`, `openExternal(url)`, `setOpacity(v)`, `setClickThrough(b)`, `capturePng(name)`, `capturePngAsync(name)`, `exportHtml(name)`, `exportHtmlAsync(name)`, `exportPdf(name)`, `exportPdfAsync(name)`, `openChild(opts)`, `getTheme()`, `getPlatform()` |
-| `QuantumView.dialog` | `openFile(opts)`, `openFileAsync(opts)`, `selectFolder(opts)`, `selectFolderAsync(opts)`, `saveTextFile(opts)`, `saveTextFileAsync(opts)`, `saveBase64File(opts)`, `saveBase64FileAsync(opts)` |
-| `QuantumView.files` | `readText(token)`, `readTextAsync(token)`, `readBase64(token)`, `readBase64Async(token)` (capability-scoped tokens only) |
-| `QuantumView.clipboard` | `readText()`, `writeText(s)`, `readHtml()`, `writeHtml(h)`, `readImage()`, `writeImage(opts)`, `clear()` (plus `*Async` variants) |
-| `QuantumView.safeStorage` | `encrypt(s)`, `decrypt(b64)` (plus `*Async` variants backed by Win32 DPAPI) |
-| `QuantumView.notify` | `notify({ title, body })` |
-| `QuantumView.autostart` | `isEnabled()`, `setEnabled(bool)` |
-| `QuantumView.protocolClient` | `register(scheme)`, `unregister(scheme)` |
-| `QuantumView.session` | `listSiteData()`, `clearSiteData()`, `clearCookies(opts)`, `clearCache()` (plus `*Async` variants) |
+| `Draconium.window` | `drag()`, `dragResize(edge)`, `minimize()`, `toggleMaximize()`, `isMaximized()`, `setTitle(title)`, `setFullscreen(enabled)`, `isFullscreen()`, `setAlwaysOnTop(enabled)`, `focus()`, `requestUserAttention(level)`, `getBounds()`, `setSize(width, height)`, `goBack()`, `goForward()`, `canGoBack()`, `canGoForward()`, `showChips()`, `showFlyout()`, `hide()`, `show()`, `close()`, `reload()`, `hardReload()`, `zoomIn()`, `zoomOut()`, `zoomReset()`, `openExternal(url)`, `setOpacity(v)`, `setClickThrough(b)`, `capturePng(name)`, `capturePngAsync(name)`, `exportHtml(name)`, `exportHtmlAsync(name)`, `exportPdf(name)`, `exportPdfAsync(name)`, `openChild(opts)`, `getTheme()`, `getPlatform()` |
+| `Draconium.dialog` | `openFile(opts)`, `openFileAsync(opts)`, `selectFolder(opts)`, `selectFolderAsync(opts)`, `saveTextFile(opts)`, `saveTextFileAsync(opts)`, `saveBase64File(opts)`, `saveBase64FileAsync(opts)` |
+| `Draconium.files` | `readText(token)`, `readTextAsync(token)`, `readBase64(token)`, `readBase64Async(token)` (capability-scoped tokens only) |
+| `Draconium.clipboard` | `readText()`, `writeText(s)`, `readHtml()`, `writeHtml(h)`, `readImage()`, `writeImage(opts)`, `clear()` (plus `*Async` variants) |
+| `Draconium.safeStorage` | `encrypt(s)`, `decrypt(b64)` (plus `*Async` variants backed by Win32 DPAPI) |
+| `Draconium.notify` | `notify({ title, body })` |
+| `Draconium.autostart` | `isEnabled()`, `setEnabled(bool)` |
+| `Draconium.protocolClient` | `register(scheme)`, `unregister(scheme)` |
+| `Draconium.session` | `listSiteData()`, `clearSiteData()`, `clearCookies(opts)`, `clearCache()` (plus `*Async` variants) |
 
 **Window geometry and state**
 
@@ -185,8 +185,8 @@ Injected automatically before page scripts via `UserContentManager` and recursiv
 
 Apps configured with `WindowConfig::custom_chrome(width, height)` (such as [`workspace.html`](../probes/servo/ui/workspace.html) / [`workspace.js`](../probes/servo/ui/workspace.js)) wire native window behavior cleanly from HTML/CSS/JS:
 
-1. Mark the titlebar container with `data-qv-drag` (and interactive controls with `data-qv-no-drag`).
-2. Attach `mousedown` handlers to 8 border handles calling `QuantumView.window.dragResize('n'|'s'|'e'|'w'|'ne'|'nw'|'se'|'sw')`.
+1. Mark the titlebar container with `data-dn-drag` (and interactive controls with `data-dn-no-drag`).
+2. Attach `mousedown` handlers to 8 border handles calling `Draconium.window.dragResize('n'|'s'|'e'|'w'|'ne'|'nw'|'se'|'sw')`.
 3. Wire window controls to `minimize()`, `toggleMaximize()`, `isMaximized()`, and `close()`.
 4. Initialize custom chrome with `isFullscreen()` and update it on `fullscreen-changed`. `F11` toggles borderless fullscreen in interactive main and child windows when `WindowSizing` is enabled. Style `.window-shell.is-fullscreen` with square corners and no outer border, as for maximized windows.
 5. Style `html, body { background: transparent; }` with a rounded inner `.window-shell` container that switches to square corners when maximized.

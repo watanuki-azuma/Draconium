@@ -1,9 +1,9 @@
-# Cross-Platform Host Support (`quantumview-host`)
+# Cross-Platform Host Support (`draconium-host`)
 
-`crates/quantumview-host` separates platform-independent host logic (Servo 0.8.0 embedding, `winit` windowing, `qv://app/` protocol, `Capabilities` ACL, preload bridge, PDF/PNG/HTML export, crash reporting) from OS-specific desktop integrations:
+`crates/draconium-host` separates platform-independent host logic (Servo 0.8.0 embedding, `winit` windowing, `dn://app/` protocol, `Capabilities` ACL, preload bridge, PDF/PNG/HTML export, crash reporting) from OS-specific desktop integrations:
 
-- **Windows**: direct Win32 / DWM / Shell / DPAPI FFI ([`win_platform.rs`](../crates/quantumview-host/src/win_platform.rs), [`embedder_ui.rs`](../crates/quantumview-host/src/embedder_ui.rs), [`tray.rs`](../crates/quantumview-host/src/tray.rs)).
-- **macOS & Linux**: zero-extra-dependency Rust `std` backends ([`unix_platform.rs`](../crates/quantumview-host/src/unix_platform.rs)) using native OS utilities, standard user-session files (`LaunchAgents` / XDG Autostart), and local Unix domain sockets.
+- **Windows**: direct Win32 / DWM / Shell / DPAPI FFI ([`win_platform.rs`](../crates/draconium-host/src/win_platform.rs), [`embedder_ui.rs`](../crates/draconium-host/src/embedder_ui.rs), [`tray.rs`](../crates/draconium-host/src/tray.rs)).
+- **macOS & Linux**: zero-extra-dependency Rust `std` backends ([`unix_platform.rs`](../crates/draconium-host/src/unix_platform.rs)) using native OS utilities, standard user-session files (`LaunchAgents` / XDG Autostart), and local Unix domain sockets.
 
 ---
 
@@ -11,14 +11,14 @@
 
 | Capability | JS / Rust Field | Windows | macOS | Linux |
 | --- | --- | --- | --- | --- |
-| Servo 0.8.0 WebView, `qv://app/`, `Capabilities`, `invoke`/`invokeAsync`, child windows, PNG/HTML/PDF export, DevTools RDP | *(core)* | Supported | Supported | Supported |
+| Servo 0.8.0 WebView, `dn://app/`, `Capabilities`, `invoke`/`invokeAsync`, child windows, PNG/HTML/PDF export, DevTools RDP | *(core)* | Supported | Supported | Supported |
 | Native media backend (optional Cargo feature) | `mediaGstreamer` / `media_gstreamer` | `false` by default; `true` with `media-gstreamer` | `false` by default; `true` with `media-gstreamer` | `false` by default; `true` with `media-gstreamer` |
 | Native dialogs (Alert, Confirm, Open/Save File, Folder Picker, Color Picker) | `nativeDialogs` / `native_dialogs` | Win32 (`MessageBoxW`, `GetOpenFileNameW`, `GetSaveFileNameW`, `IFileOpenDialog`, `ChooseColorW`) | `osascript` (AppleScript) | `zenity` (fallback: `kdialog`) |
 | Clipboard (Text & Clear) | `clipboardText` / `clipboard_text` | Win32 (`CF_UNICODETEXT`) | `pbpaste` / `pbcopy` (`LC_CTYPE=UTF-8`) | `wl-paste` / `wl-copy` (fallback: `xclip`, `xsel`) |
 | Clipboard (HTML) | `clipboardHtml` / `clipboard_html` | Win32 (`CF_HTML`) | `osascript` (`«class HTML»`) | `wl-paste` / `wl-copy` (fallback: `xclip`) |
 | Clipboard (Image) | `clipboardImage` / `clipboard_image` | Win32 (`CF_DIB`) | PNG via `osascript` (`PNGf`) | PNG via `wl-paste` / `wl-copy` (fallback: `xclip`) |
 | Desktop notifications | `notifications` | Win32 `Shell_NotifyIconW` balloon | `osascript` (`display notification`) | `notify-send` |
-| Login autostart | `autostart` | `HKCU\...\Run` | `~/Library/LaunchAgents/io.quantumview.<id>.plist` | `$XDG_CONFIG_HOME/autostart/<id>.desktop` (`~/.config/autostart/`) |
+| Login autostart | `autostart` | `HKCU\...\Run` | `~/Library/LaunchAgents/io.draconium.<id>.plist` | `$XDG_CONFIG_HOME/autostart/<id>.desktop` (`~/.config/autostart/`) |
 | Single-instance lock & forwarding (`--single-instance`) | `singleInstance` / `single_instance` | Named Mutex + `WM_COPYDATA` | Atomic `UnixListener` lock socket + Unix IPC socket | Atomic `UnixListener` lock socket + Unix IPC socket |
 | System Light/Dark theme detection | `systemTheme` / `system_theme` | `AppsUseLightTheme` + `WM_SETTINGCHANGE` | `defaults read -g AppleInterfaceStyle` | `gsettings` (`color-scheme` / `gtk-theme`) + `GTK_THEME` |
 | External URL (`https:` / `mailto:`) | `externalUrl` / `external_url` | `ShellExecuteW` | `open -- <url>` | `xdg-open <url>` |
@@ -35,12 +35,12 @@
 
 Hosted web UIs and Rust callers can query the exact compiled OS and supported host capabilities at runtime rather than sniffing user-agent strings.
 
-### JavaScript (`window.QuantumView.window.getPlatform()`)
+### JavaScript (`window.Draconium.window.getPlatform()`)
 
 Available on all pages (including `Capabilities::restricted()` and attenuated child windows):
 
 ```js
-const res = window.QuantumView.window.getPlatform();
+const res = window.Draconium.window.getPlatform();
 if (res.ok) {
   const platform = res.data;
   // Example on Windows: { os: "windows", nativeDialogs: true, safeStorage: true, mediaGstreamer: false, ... }
@@ -53,10 +53,10 @@ if (res.ok) {
 
 The GStreamer runtime and platform plugin requirements are described in [Optional Native Media (`media-gstreamer`)](media-gstreamer.md).
 
-### Rust (`quantumview_host::platform::platform_capabilities()`)
+### Rust (`draconium_host::platform::platform_capabilities()`)
 
 ```rust
-use quantumview_host::platform::platform_capabilities;
+use draconium_host::platform::platform_capabilities;
 
 let caps = platform_capabilities();
 if caps.single_instance {
@@ -79,7 +79,7 @@ No additional Rust crates are required for the OS utility backends on macOS or L
   - URI scheme registration: XDG applications `.desktop` entries, with best-effort `xdg-mime` and `update-desktop-database` refreshes
   - System theme: `gsettings` (falling back to `GTK_THEME`)
 - **Single-instance Unix sockets**:
-  - Uses two separate local domain sockets (`0o600` permissions) under an absolute `$XDG_RUNTIME_DIR` (or user-scoped `$TMPDIR` / `/tmp` fallback): `qv-<id>.lock.sock` for atomic single-instance exclusion and `qv-<id>.sock` for second-instance JSON payload forwarding (up to 64 KiB, with brief startup connect retries).
+  - Uses two separate local domain sockets (`0o600` permissions) under an absolute `$XDG_RUNTIME_DIR` (or user-scoped `$TMPDIR` / `/tmp` fallback): `dn-<id>.lock.sock` for atomic single-instance exclusion and `dn-<id>.sock` for second-instance JSON payload forwarding (up to 64 KiB, with brief startup connect retries).
   - Long identifiers are deterministically hash-shortened so paths always remain strictly below macOS's 104-byte `sun_path` limit, and stale sockets from crashed processes are cleaned up only when `connect()` returns `ConnectionRefused`.
 
 ---

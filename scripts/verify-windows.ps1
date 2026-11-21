@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-    QuantumView Servo real-machine Windows verification suite.
+    Draconium Servo real-machine Windows verification suite.
 
 .DESCRIPTION
     Runs static checks (rustfmt, cargo metadata, node --check), all standalone
@@ -10,11 +10,11 @@
 
 .PARAMETER Build
     Rebuild probes\servo in release mode (--frozen) via VS 2022 DevShell + LLVM
-    and fail if quantumview-servo emits compiler warnings.
+    and fail if draconium emits compiler warnings.
 
 .PARAMETER Interactive
     After automated checks succeed, print the interactive desktop QA checklist
-    and launch command for QuantumView Folio (--workspace).
+    and launch command for Draconium Folio (--workspace).
 #>
 [CmdletBinding()]
 param(
@@ -32,10 +32,10 @@ if (Get-Variable -Name PSNativeCommandUseErrorActionPreference -ErrorAction Sile
 
 $repoRoot = Split-Path -Parent $PSScriptRoot
 if ([string]::IsNullOrWhiteSpace($ExePath)) {
-    $ExePath = Join-Path $repoRoot 'probes\servo\target\release\quantumview-servo.exe'
+    $ExePath = Join-Path $repoRoot 'probes\servo\target\release\draconium.exe'
 }
 if ([string]::IsNullOrWhiteSpace($WorkDir)) {
-    $WorkDir = Join-Path ([System.IO.Path]::GetTempPath()) 'quantumview-verify-windows'
+    $WorkDir = Join-Path ([System.IO.Path]::GetTempPath()) 'draconium-verify-windows'
 }
 
 function Resolve-Tool {
@@ -56,10 +56,10 @@ function Resolve-Tool {
 }
 
 function Assert-NoRunningHost {
-    $running = @(Get-Process -Name 'quantumview-servo' -ErrorAction SilentlyContinue)
+    $running = @(Get-Process -Name 'draconium' -ErrorAction SilentlyContinue)
     if ($running.Count -gt 0) {
         $pids = ($running | ForEach-Object { $_.Id }) -join ', '
-        throw "Existing quantumview-servo process is still running (PID: $pids). Stop it before running single-instance tests."
+        throw "Existing draconium process is still running (PID: $pids). Stop it before running single-instance tests."
     }
 }
 
@@ -126,16 +126,16 @@ function Invoke-ReleaseBuild {
     }
 
     $lines = Get-Content -LiteralPath $LogPath -Encoding UTF8
-    $qvMatch = $lines | Select-String 'Compiling quantumview-(host|servo)' | Select-Object -First 1
-    if ($qvMatch) {
-        $tailLines = $lines[($qvMatch.LineNumber - 1)..($lines.Length - 1)]
-        $qvWarnings = @($tailLines | Where-Object { $_ -match '^warning(\[[^\]]+\])?:' })
-        if ($qvWarnings.Count -gt 0) {
-            $qvWarnings | Out-Host
-            throw "quantumview-host / quantumview-servo emitted $($qvWarnings.Count) compiler warning(s)."
+    $compileMatch = $lines | Select-String 'Compiling draconium(?:-host)? v' | Select-Object -First 1
+    if ($compileMatch) {
+        $tailLines = $lines[($compileMatch.LineNumber - 1)..($lines.Length - 1)]
+        $draconiumWarnings = @($tailLines | Where-Object { $_ -match '^warning(\[[^\]]+\])?:' })
+        if ($draconiumWarnings.Count -gt 0) {
+            $draconiumWarnings | Out-Host
+            throw "draconium-host / draconium emitted $($draconiumWarnings.Count) compiler warning(s)."
         }
     }
-    Write-Host '[PASS] Release MSVC build succeeded with 0 warnings in quantumview-host and quantumview-servo' -ForegroundColor Green
+    Write-Host '[PASS] Release MSVC build succeeded with 0 warnings in draconium-host and draconium' -ForegroundColor Green
 }
 
 $toolchainBin = Join-Path $env:USERPROFILE '.rustup\toolchains\stable-x86_64-pc-windows-msvc\bin'
@@ -190,11 +190,11 @@ try {
 
 try {
     Write-Host '=== Phase 1: Static Checks (rustfmt, cargo metadata, node --check) ===' -ForegroundColor Cyan
-    $hostManifestPath = Join-Path $repoRoot 'crates\quantumview-host\Cargo.toml'
+    $hostManifestPath = Join-Path $repoRoot 'crates\draconium-host\Cargo.toml'
     & $cargoExe fmt --check --manifest-path $hostManifestPath
-    if ($LASTEXITCODE -ne 0) { throw 'cargo fmt --check failed (quantumview-host)' }
+    if ($LASTEXITCODE -ne 0) { throw 'cargo fmt --check failed (draconium-host)' }
     & $cargoExe fmt --check --manifest-path $manifestPath
-    if ($LASTEXITCODE -ne 0) { throw 'cargo fmt --check failed (quantumview-servo)' }
+    if ($LASTEXITCODE -ne 0) { throw 'cargo fmt --check failed (draconium)' }
     & $rustfmtExe --edition 2024 --check (Join-Path $PSScriptRoot 'win32_live_probe.rs')
     if ($LASTEXITCODE -ne 0) { throw 'rustfmt --check on scripts/win32_live_probe.rs failed' }
     $metaLog = Join-Path $WorkDir 'cargo-metadata.json'
@@ -211,14 +211,14 @@ try {
     $unitDir = Join-Path $WorkDir 'unit-tests'
     New-Item -ItemType Directory -Path $unitDir -Force | Out-Null
     $modules = @(
-        @{ Name = 'win_platform'; RelPath = 'crates\quantumview-host\src\win_platform.rs' },
-        @{ Name = 'unix_platform'; RelPath = 'crates\quantumview-host\src\unix_platform.rs' },
-        @{ Name = 'window_state'; RelPath = 'crates\quantumview-host\src\window_state.rs' },
-        @{ Name = 'bridge'; RelPath = 'crates\quantumview-host\src\bridge.rs' },
-        @{ Name = 'embedder_ui'; RelPath = 'crates\quantumview-host\src\embedder_ui.rs' },
-        @{ Name = 'protocol'; RelPath = 'crates\quantumview-host\src\protocol.rs' },
-        @{ Name = 'tray'; RelPath = 'crates\quantumview-host\src\tray.rs' },
-        @{ Name = 'policy'; RelPath = 'crates\quantumview-host\src\policy.rs' },
+        @{ Name = 'win_platform'; RelPath = 'crates\draconium-host\src\win_platform.rs' },
+        @{ Name = 'unix_platform'; RelPath = 'crates\draconium-host\src\unix_platform.rs' },
+        @{ Name = 'window_state'; RelPath = 'crates\draconium-host\src\window_state.rs' },
+        @{ Name = 'bridge'; RelPath = 'crates\draconium-host\src\bridge.rs' },
+        @{ Name = 'embedder_ui'; RelPath = 'crates\draconium-host\src\embedder_ui.rs' },
+        @{ Name = 'protocol'; RelPath = 'crates\draconium-host\src\protocol.rs' },
+        @{ Name = 'tray'; RelPath = 'crates\draconium-host\src\tray.rs' },
+        @{ Name = 'policy'; RelPath = 'crates\draconium-host\src\policy.rs' },
         @{ Name = 'workspace'; RelPath = 'probes\servo\src\workspace.rs' },
         @{ Name = 'starter'; RelPath = 'probes\servo\src\starter.rs' },
         @{ Name = 'wheel_scroll'; RelPath = 'probes\servo\vendor\servo-paint\wheel_scroll.rs' }
@@ -276,14 +276,14 @@ try {
 
     Write-Host '=== Phase 4: E2E --self-test Matrix ===' -ForegroundColor Cyan
     $wsDirFile = Join-Path $WorkDir 'ws-selftest-file'
-    $wsDirQv = Join-Path $WorkDir 'ws-selftest-qv'
+    $wsDirDn = Join-Path $WorkDir 'ws-selftest-dn'
 
     $selfTests = @(
         @{ Name = 'probe-scroll'; Args = "--probe --self-test scroll"; Expect = 'SCROLL_SELF_TEST_OK y1=40 y2=120 y3=80' },
         @{ Name = 'workspace-file'; Args = "--workspace --workspace-dir `"$wsDirFile`" --self-test workspace"; Expect = 'WORKSPACE_SELF_TEST_OK' },
         @{ Name = 'workspace-reload'; Args = "--workspace --workspace-dir `"$wsDirFile`" --self-test workspace-reload"; Expect = 'WORKSPACE_RELOAD_SELF_TEST_OK' },
-        @{ Name = 'workspace-qv-assets'; Args = "--workspace --qv-assets --workspace-dir `"$wsDirQv`" --self-test workspace"; Expect = 'WORKSPACE_SELF_TEST_OK' },
-        @{ Name = 'starter-qv-assets'; Args = "--starter --qv-assets --self-test starter"; Expect = 'STARTER_SELF_TEST_OK' }
+        @{ Name = 'workspace-dn-assets'; Args = "--workspace --dn-assets --workspace-dir `"$wsDirDn`" --self-test workspace"; Expect = 'WORKSPACE_SELF_TEST_OK' },
+        @{ Name = 'starter-dn-assets'; Args = "--starter --dn-assets --self-test starter"; Expect = 'STARTER_SELF_TEST_OK' }
     )
     foreach ($st in $selfTests) {
         $stLog = Join-Path $WorkDir "selftest-$($st.Name).log"
@@ -303,14 +303,14 @@ try {
     }
 
     Write-Host '=== Phase 6: Package Distribution Smoke Test (scripts/package.ps1) ===' -ForegroundColor Cyan
-    $distDir = Join-Path $WorkDir 'dist-quantumview'
+    $distDir = Join-Path $WorkDir 'dist-draconium'
     & (Join-Path $PSScriptRoot 'package.ps1') -OutputDir $distDir -ExePath $ExePath | Out-Null
-    $distExe = Join-Path $distDir 'quantumview-servo.exe'
+    $distExe = Join-Path $distDir 'draconium.exe'
     $distWsDir = Join-Path $WorkDir 'ws-dist'
     $distLog = Join-Path $WorkDir 'dist-selftest.log'
     Push-Location $distDir
     try {
-        $distExit = Invoke-CmdLogged -CommandLine "`"$distExe`" --workspace --qv-assets --workspace-dir `"$distWsDir`" --self-test workspace" -LogPath $distLog
+        $distExit = Invoke-CmdLogged -CommandLine "`"$distExe`" --workspace --dn-assets --workspace-dir `"$distWsDir`" --self-test workspace" -LogPath $distLog
     } finally {
         Pop-Location
     }
@@ -343,5 +343,5 @@ if ($Interactive) {
     Write-Host '5. Render Lab drawer runs 60-frame render check and plots live frame pacing on 2D canvas.'
     Write-Host '6. System tray icon (--tray) and global hotkey (Ctrl+Alt+F12) toggle window visibility cleanly.'
     Write-Host ''
-    Write-Host "Launch command: `"$ExePath`" --workspace --qv-assets --tray --single-instance --hotkey Ctrl+Alt+F12"
+    Write-Host "Launch command: `"$ExePath`" --workspace --dn-assets --tray --single-instance --hotkey Ctrl+Alt+F12"
 }

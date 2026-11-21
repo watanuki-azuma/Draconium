@@ -2,12 +2,12 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-//! Minimal standalone desktop app example embedding `quantumview-host`.
+//! Minimal standalone desktop app example embedding `draconium-host`.
 
 use std::error::Error;
 use std::path::Path;
 
-use quantumview_host::{
+use draconium_host::{
     Capabilities, EmbeddedAsset, HostConfig, HostHandler, WindowConfig, resolve_app_url_from, run,
 };
 
@@ -15,12 +15,12 @@ const HELLO_HTML: &[u8] = br#"<!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
-  <title>QuantumView Host Example</title>
+  <title>Draconium Host Example</title>
   <link rel="stylesheet" href="hello.css">
 </head>
 <body>
   <main class="card">
-    <h1>Hello from quantumview-host</h1>
+    <h1>Hello from draconium-host</h1>
     <p>Embedded Servo 0.8.0 desktop shell with zero Chromium or OS WebView dependencies.</p>
     <div class="row">
       <input id="msg" type="text" value="Hello Rust!">
@@ -47,7 +47,7 @@ pre { margin: 0; padding: 12px; border-radius: 8px; background: #0f172a; color: 
 const HELLO_JS: &[u8] = br#"
 document.getElementById("send").addEventListener("click", async () => {
   const text = document.getElementById("msg").value;
-  const res = await window.QuantumView.invokeAsync("greet", text);
+  const res = await window.Draconium.invokeAsync("greet", text);
   document.getElementById("out").textContent = res.ok ? res.data : ("Error: " + res.error);
 });
 "#;
@@ -96,7 +96,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         "ui/hello.html",
         "ui/hello.html",
     );
-    let config = HostConfig::new("QuantumView Host Example", url)
+    let config = HostConfig::new("Draconium Host Example", url)
         .with_window(WindowConfig::standard(720, 480))
         .with_asset_root(asset_root)
         .with_embedded_assets(EMBEDDED_ASSETS)

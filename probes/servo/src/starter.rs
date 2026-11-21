@@ -3,7 +3,7 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 //! Minimal developer starter handler (`--starter`) showing how to bind custom
-//! Rust commands to a QuantumView Servo 0.8.0 desktop window.
+//! Rust commands to a Draconium Servo 0.8.0 desktop window.
 //!
 //! Pure Rust (`std` only) so it can be unit-tested standalone via
 //! `rustc --edition 2024 --test -D warnings probes/servo/src/starter.rs`.
@@ -15,7 +15,7 @@ pub struct StarterApp {
 }
 
 impl StarterApp {
-    /// Handles `"echo"` and `"host_info"` commands from `QuantumView.invoke` / `invokeAsync`.
+    /// Handles `"echo"` and `"host_info"` commands from `Draconium.invoke` / `invokeAsync`.
     pub fn handle_request(&mut self, command: &str, payload: &str) -> Result<String, String> {
         match command {
             "echo" => {
@@ -29,7 +29,7 @@ impl StarterApp {
                 ))
             }
             "host_info" => Ok(format!(
-                r#"{{"host":"QuantumView","engine":"Servo 0.8.0","protocol":"qv://app/","requests":{}}}"#,
+                r#"{{"host":"Draconium","engine":"Servo 0.8.0","protocol":"dn://app/","requests":{}}}"#,
                 self.request_count
             )),
             other => Err(format!("Unsupported starter command: {other}")),

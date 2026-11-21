@@ -2,8 +2,8 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-//! Host handler for QuantumView Folio (`--workspace`), a local-first Markdown
-//! and knowledge workspace demonstrating QuantumView's Servo 0.8.0 host API.
+//! Host handler for Draconium Folio (`--workspace`), a local-first Markdown
+//! and knowledge workspace demonstrating Draconium's Servo 0.8.0 host API.
 //!
 //! All notes are stored as standard UTF-8 `.md` files inside the workspace
 //! directory with optional lightweight frontmatter (`title`, `tags`). This
@@ -22,11 +22,11 @@ const SEED_NOTES: &[(&str, &str)] = &[
     (
         "welcome",
         "---\n\
-title: Welcome to QuantumView Folio\n\
+title: Welcome to Draconium Folio\n\
 tags: guide, markdown, desktop\n\
 ---\n\n\
-# Welcome to QuantumView Folio\n\n\
-Folio is a local-first Markdown workspace running on **QuantumView** — a lightweight Rust desktop host powered by **Servo 0.8.0**, with zero Chromium or OS WebView dependencies.\n\n\
+# Welcome to Draconium Folio\n\n\
+Folio is a local-first Markdown workspace running on **Draconium** — a lightweight Rust desktop host powered by **Servo 0.8.0**, with zero Chromium or OS WebView dependencies.\n\n\
 ## What you can try right here\n\n\
 - **Live split writing**: Switch between *Write*, *Split*, and *Preview* modes from the titlebar.\n\
 - **Drag and drop**: Drop any `.md` or `.txt` file from your file manager onto this window to import it as a local note.\n\
@@ -35,7 +35,7 @@ Folio is a local-first Markdown workspace running on **QuantumView** — a light
 - **Render Lab**: Open *Lab* in the header to inspect live frame pacing and run a 60-frame rendering benchmark on WebRender.\n\n\
 > Every note is stored as a plain UTF-8 `.md` file on disk. Changes are saved automatically using atomic temporary-file replacement, and unsaved drafts flush safely before the window closes.\n\n\
 ```rust\n\
-let config = HostConfig::new(\"QuantumView Folio\", url)\n\
+let config = HostConfig::new(\"Draconium Folio\", url)\n\
     .with_window(WindowConfig::custom_chrome(1240, 800))\n\
     .with_capabilities(Capabilities::workspace_defaults());\n\
 host::run(config, WorkspaceApp::new(data_dir), None)?;\n\
@@ -48,17 +48,17 @@ title: Host Architecture Overview\n\
 tags: architecture, servo, security\n\
 ---\n\n\
 # Host Architecture Overview\n\n\
-QuantumView keeps application state and OS access inside a small Rust process while delegating layout, styling, and scripting to embedded Servo 0.8.0.\n\n\
+Draconium keeps application state and OS access inside a small Rust process while delegating layout, styling, and scripting to embedded Servo 0.8.0.\n\n\
 ## Security Boundaries\n\n\
 | Layer | Mechanism | Purpose |\n\
 | --- | --- | --- |\n\
-| Asset serving | `qv://app/` + embedded fallback | Eliminates `file://` path leaks and ships single-binary builds |\n\
+| Asset serving | `dn://app/` + embedded fallback | Eliminates `file://` path leaks and ships single-binary builds |\n\
 | Content policy | Strict `Content-Security-Policy` | Blocks inline script execution and unexpected external origins |\n\
 | IPC bridge | 128-bit session token + `Object.freeze` | Prevents forged privileged commands from page scripts |\n\
 | Capabilities | Declarative `Capabilities` ACL | Restricts each app mode and attenuates child windows |\n\n\
 ## Desktop Primitives Wired in Rust\n\n\
 1. Frameless custom chrome (`drag`, 8-edge `dragResize`, minimize, maximize, rounded alpha surface)\n\
-2. Correlated non-blocking IPC (`QuantumView.invokeAsync`) alongside synchronous calls\n\
+2. Correlated non-blocking IPC (`Draconium.invokeAsync`) alongside synchronous calls\n\
 3. Capability-scoped file access tokens for drag-and-drop and native file pickers\n\
 4. Rich Win32 clipboard (`CF_UNICODETEXT`, `CF_HTML`, `CF_DIB`), DPAPI `safeStorage`, and raster PDF export\n",
     ),
@@ -71,7 +71,7 @@ tags: workflow, checklist\n\
 # Desktop Release Checklist\n\n\
 Track verification items before cutting a portable Windows distribution.\n\n\
 - [x] Verify standalone Rust unit tests pass with `-D warnings`\n\
-- [x] Confirm `qv://app/` embedded fallback runs without external UI files\n\
+- [x] Confirm `dn://app/` embedded fallback runs without external UI files\n\
 - [x] Test UTF-8 multiline, Japanese IME, and emoji round-trip persistence\n\
 - [x] Validate strict CSP with zero inline scripts or stylesheets\n\
 - [ ] Run `scripts/verify-windows.ps1 -Build` on a clean Windows x64 machine\n\
@@ -93,13 +93,13 @@ pub fn default_workspace_dir(custom: Option<PathBuf>) -> PathBuf {
         && !local_app_data.is_empty()
     {
         return PathBuf::from(local_app_data)
-            .join("QuantumView")
+            .join("Draconium")
             .join("workspace");
     }
     if let Some(xdg) = std::env::var_os("XDG_DATA_HOME")
         && !xdg.is_empty()
     {
-        return PathBuf::from(xdg).join("quantumview").join("workspace");
+        return PathBuf::from(xdg).join("draconium").join("workspace");
     }
     if let Some(home) = std::env::var_os("HOME")
         && !home.is_empty()
@@ -107,10 +107,10 @@ pub fn default_workspace_dir(custom: Option<PathBuf>) -> PathBuf {
         return PathBuf::from(home)
             .join(".local")
             .join("share")
-            .join("quantumview")
+            .join("draconium")
             .join("workspace");
     }
-    std::env::temp_dir().join("quantumview-workspace")
+    std::env::temp_dir().join("draconium-workspace")
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -135,7 +135,7 @@ impl WorkspaceApp {
         Self { data_dir }
     }
 
-    /// Dispatches UI commands from `QuantumView.invoke` / `QuantumView.invokeAsync`.
+    /// Dispatches UI commands from `Draconium.invoke` / `Draconium.invokeAsync`.
     pub fn handle_request(&mut self, command: &str, payload: &str) -> Result<String, String> {
         match command {
             "list_notes" => self.list_notes(),
@@ -824,7 +824,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        std::env::temp_dir().join(format!("qv-workspace-{name}-{stamp}"))
+        std::env::temp_dir().join(format!("dn-workspace-{name}-{stamp}"))
     }
 
     #[test]

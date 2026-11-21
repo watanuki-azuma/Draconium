@@ -62,7 +62,7 @@ pub use crate::window_state::{
     LogicalPosition as HostLogicalPosition, LogicalSize as HostLogicalSize, Presentation,
 };
 
-/// Configuration required by the QuantumView WebView host to launch a local UI.
+/// Configuration required by the Draconium WebView host to launch a local UI.
 ///
 /// Construct with [`HostConfig::new`] (which sets minimal, locked-down defaults)
 /// and customize via the fluent `with_*` builders before passing to [`run`].
@@ -71,10 +71,10 @@ pub struct HostConfig {
     pub url: Url,
     pub window: WindowConfig,
     /// Directory holding the bundled UI assets. When set, the host serves
-    /// `qv://app/...` from this directory (falling back to embedded assets).
+    /// `dn://app/...` from this directory (falling back to embedded assets).
     pub asset_root: Option<PathBuf>,
     /// Caller-supplied compiled-in fallback assets (`include_bytes!`) served
-    /// under `qv://app/` when on-disk assets are absent.
+    /// under `dn://app/` when on-disk assets are absent.
     pub embedded_assets: &'static [crate::protocol::EmbeddedAsset],
     /// Optional PNG output path for automated screenshot capture (Milestone C).
     pub screenshot_path: Option<PathBuf>,
@@ -88,7 +88,7 @@ pub struct HostConfig {
     pub initial_deep_link: Option<String>,
     /// Raw CLI arguments forwarded to the primary instance when `--single-instance` exits early.
     pub raw_args: Vec<String>,
-    /// Registry value name under `HKCU\...\Run` for `QuantumView.autostart`.
+    /// Registry value name under `HKCU\...\Run` for `Draconium.autostart`.
     pub autostart_app_name: &'static str,
     /// Default CLI flags appended to the executable path when registering autostart / URI schemes.
     pub autostart_args: Vec<&'static str>,
@@ -98,7 +98,7 @@ pub struct HostConfig {
     pub capabilities: Capabilities,
     /// Optional loopback dev-server origin allowed by `--dev-url`.
     pub dev_origin: Option<DevOrigin>,
-    /// Whether `'wasm-unsafe-eval'` is appended to `script-src` in the `qv://` CSP header.
+    /// Whether `'wasm-unsafe-eval'` is appended to `script-src` in the `dn://` CSP header.
     pub allow_wasm_csp: bool,
     /// Enables Servo's CSS backdrop filters.
     pub backdrop_filter: bool,
@@ -117,12 +117,12 @@ impl HostConfig {
             screenshot_path: None,
             devtools_addr: None,
             single_instance_name: None,
-            instance_tag: "Local\\QuantumView.Servo".to_owned(),
+            instance_tag: "Local\\Draconium".to_owned(),
             initial_deep_link: None,
             raw_args: Vec::new(),
-            autostart_app_name: "QuantumView",
+            autostart_app_name: "Draconium",
             autostart_args: Vec::new(),
-            crash_dir: std::env::temp_dir().join("quantumview-crashes"),
+            crash_dir: std::env::temp_dir().join("draconium-crashes"),
             capabilities: Capabilities::restricted(),
             dev_origin: None,
             allow_wasm_csp: false,
@@ -215,7 +215,7 @@ impl HostConfig {
     }
 }
 
-/// Native window attributes for a hosted QuantumView application.
+/// Native window attributes for a hosted Draconium application.
 ///
 /// The defaults create a decorated 1000x720 window. Use
 /// [`WindowConfig::standard`], [`WindowConfig::custom_chrome`], or
@@ -232,7 +232,7 @@ pub struct WindowConfig {
     pub max_size: Option<window_state::LogicalSize>,
     pub start_hidden: bool,
     /// Whether the app uses compact/expanded HUD presentations, enabling the
-    /// `qv-window:chips` / `qv-window:flyout` bridge commands.
+    /// `dn-window:chips` / `dn-window:flyout` bridge commands.
     pub presentations: bool,
     /// Enable the native system tray icon (Windows) for resident restore/quit.
     pub enable_tray: bool,
@@ -365,7 +365,7 @@ pub trait HostHandler {
     }
 
     /// Optional background poll hook returning `(event_name, json_payload)` to
-    /// push into the page via `window.QuantumView.on(event_name, ...)`.
+    /// push into the page via `window.Draconium.on(event_name, ...)`.
     fn poll_background_event(&mut self) -> Option<(&'static str, String)> {
         None
     }
@@ -405,15 +405,15 @@ pub fn resolve_ui_path(exe_relative: &str, manifest_relative: &str) -> PathBuf {
     resolve_ui_path_from(Path::new("."), exe_relative, manifest_relative)
 }
 
-/// Resolves an app's startup URL and optional `qv://app/` asset root directory
+/// Resolves an app's startup URL and optional `dn://app/` asset root directory
 /// using the caller crate's `base_dir` (typically `Path::new(env!("CARGO_MANIFEST_DIR"))`):
 /// - `dev_url` (`http://127.0.0.1:<port>/...`) when provided,
-/// - `qv://app/<file_name>` when `qv_assets` is true or disk assets are absent
+/// - `dn://app/<file_name>` when `dn_assets` is true or disk assets are absent
 ///   (single-binary embedded fallback),
 /// - `file://` by default during local disk checkout runs.
 pub fn resolve_app_url_from(
     base_dir: &Path,
-    qv_assets: bool,
+    dn_assets: bool,
     dev_url: Option<&str>,
     file_name: &'static str,
     exe_relative: &str,
@@ -428,9 +428,9 @@ pub fn resolve_app_url_from(
         let url = Url::parse(raw_dev).expect("validated --dev-url parses");
         return (url, root);
     }
-    if qv_assets || canonical.is_none() {
+    if dn_assets || canonical.is_none() {
         let url = Url::parse(&crate::protocol::asset_url(file_name))
-            .expect("static qv:// asset URL parses");
+            .expect("static dn:// asset URL parses");
         (url, root)
     } else {
         let url = Url::from_file_path(canonical.unwrap()).expect("Invalid UI file path");
@@ -438,10 +438,10 @@ pub fn resolve_app_url_from(
     }
 }
 
-/// Resolves an app's startup URL and optional `qv://app/` asset root directory
+/// Resolves an app's startup URL and optional `dn://app/` asset root directory
 /// relative to the executable or current working directory.
 pub fn resolve_app_url(
-    qv_assets: bool,
+    dn_assets: bool,
     dev_url: Option<&str>,
     file_name: &'static str,
     exe_relative: &str,
@@ -449,7 +449,7 @@ pub fn resolve_app_url(
 ) -> (Url, Option<PathBuf>) {
     resolve_app_url_from(
         Path::new("."),
-        qv_assets,
+        dn_assets,
         dev_url,
         file_name,
         exe_relative,
@@ -858,7 +858,7 @@ impl Delegate {
     }
 
     /// Perform a host window/platform command sent through the authenticated
-    /// preload bridge (`qv-tok:<nonce>:qv-window:*`).
+    /// preload bridge (`dn-tok:<nonce>:dn-window:*`).
     ///
     /// These commands are intercepted before the application handler: window
     /// and OS platform management is a host responsibility, identical for
@@ -881,7 +881,7 @@ impl Delegate {
                 // press that asked for the drag is still held.
                 if !self.primary_down.get() {
                     return Err(
-                        "qv-window:drag はマウスボタンを押したまま呼ぶ必要があります".to_owned(),
+                        "dn-window:drag はマウスボタンを押したまま呼ぶ必要があります".to_owned(),
                     );
                 }
                 self.window
@@ -895,7 +895,7 @@ impl Delegate {
             WindowCommand::DragResize => {
                 if !self.primary_down.get() {
                     return Err(
-                        "qv-window:drag-resize はマウスボタンを押したまま呼ぶ必要があります"
+                        "dn-window:drag-resize はマウスボタンを押したまま呼ぶ必要があります"
                             .to_owned(),
                     );
                 }
@@ -1713,7 +1713,7 @@ impl WebViewDelegate for Delegate {
     }
 
     /// Navigation guard (Milestone B + Stage 1 `--dev-url` loopback origin):
-    /// QuantumView apps are local, so only local/app-internal schemes (plus an
+    /// Draconium apps are local, so only local/app-internal schemes (plus an
     /// explicit loopback dev server when configured) may navigate.
     fn request_navigation(&self, _: WebView, request: NavigationRequest) {
         if bridge::allows_navigation_with_dev(request.url.as_str(), self.dev_origin.as_ref()) {
@@ -1727,7 +1727,7 @@ impl WebViewDelegate for Delegate {
     /// camera/microphone/geolocation/notification permissions silently.
     fn request_permission(&self, _: WebView, request: PermissionRequest) {
         eprintln!(
-            "[permission denied] {:?} (local QuantumView default policy)",
+            "[permission denied] {:?} (local Draconium default policy)",
             request.feature()
         );
         request.deny();
@@ -1787,7 +1787,7 @@ impl WebViewDelegate for Delegate {
                 );
             }
             EmbedderControl::SimpleDialog(SimpleDialog::Prompt(mut prompt)) => {
-                // Privileged `qv-window:` and async commands require the per-launch
+                // Privileged `dn-window:` and async commands require the per-launch
                 // session token closed inside the frozen preload bridge, and are
                 // checked against the app's declarative `Capabilities` ACL.
                 let reply = match bridge::classify_command(prompt.message(), &self.session_token) {
@@ -1999,7 +1999,7 @@ fn request_close(webview: &WebView, delegate: &Rc<Delegate>) {
     delegate.close_in_progress.set(true);
     let delegate_cb = delegate.clone();
     webview.evaluate_javascript(
-        "typeof window.__quantumviewBeforeClose === 'function' ? Boolean(window.__quantumviewBeforeClose()) : true",
+        "typeof window.__draconiumBeforeClose === 'function' ? Boolean(window.__draconiumBeforeClose()) : true",
         move |result| {
             match result {
                 Ok(JSValue::Boolean(false)) => {
@@ -2029,7 +2029,7 @@ fn request_reload(webview: &WebView, delegate: &Rc<Delegate>) {
     let delegate_cb = delegate.clone();
     let webview_cb = webview.clone();
     webview.evaluate_javascript(
-        "typeof window.__quantumviewBeforeClose === 'function' ? Boolean(window.__quantumviewBeforeClose()) : true",
+        "typeof window.__draconiumBeforeClose === 'function' ? Boolean(window.__draconiumBeforeClose()) : true",
         move |result| {
             delegate_cb.reload_in_progress.set(false);
             if !matches!(result, Ok(JSValue::Boolean(false)))
@@ -2373,7 +2373,7 @@ impl ApplicationHandler<HostEvent> for App {
         let mut servo_builder = ServoBuilder::default()
             .preferences(prefs)
             .event_loop_waker(Box::new(self.waker.clone()));
-        // Milestone B + Stage 1: always register `qv://` with disk asset root
+        // Milestone B + Stage 1: always register `dn://` with disk asset root
         // (if present), compiled-in embedded fallback, and CSP headers.
         {
             let mut registry = servo::protocol_handler::ProtocolRegistry::default();
@@ -2381,7 +2381,7 @@ impl ApplicationHandler<HostEvent> for App {
             if registry
                 .register(
                     crate::protocol::SCHEME,
-                    crate::qv_protocol::QvAssetHandler::new(
+                    crate::dn_protocol::DnAssetHandler::new(
                         config.asset_root.clone(),
                         config.embedded_assets,
                         csp,
@@ -2389,7 +2389,7 @@ impl ApplicationHandler<HostEvent> for App {
                 )
                 .is_err()
             {
-                eprintln!("qv:// プロトコル登録に失敗しました");
+                eprintln!("dn:// プロトコル登録に失敗しました");
             }
             servo_builder = servo_builder.protocol_registry(registry);
         }
@@ -2398,18 +2398,18 @@ impl ApplicationHandler<HostEvent> for App {
         servo.setup_logging();
 
         // Preload bridge + UserStyleSheet (Milestone B + Stage 1 CSP-clean popover shim):
-        // every page gets a frozen `window.QuantumView` bound to this launch's session token.
+        // every page gets a frozen `window.Draconium` bound to this launch's session token.
         let session_token = bridge::generate_session_token();
         let user_content_manager = Rc::new(UserContentManager::new(&servo));
         user_content_manager.add_stylesheet(Rc::new(UserStyleSheet::new(
             bridge::POPOVER_POLYFILL_CSS.to_owned(),
-            Url::parse("qv://app/qv-popover-polyfill.css").expect("valid static stylesheet URL"),
+            Url::parse("dn://app/dn-popover-polyfill.css").expect("valid static stylesheet URL"),
         )));
         if transparent_mode {
             user_content_manager.add_stylesheet(Rc::new(UserStyleSheet::new(
                 "html, body { background: transparent !important; background-image: none !important; }"
                     .to_owned(),
-                Url::parse("qv://app/qv-transparent.css").expect("valid static stylesheet URL"),
+                Url::parse("dn://app/dn-transparent.css").expect("valid static stylesheet URL"),
             )));
         }
         user_content_manager.add_script(Rc::new(UserScript::new(
@@ -2702,7 +2702,7 @@ impl ApplicationHandler<HostEvent> for App {
                 state.servo.spin_event_loop();
             }
         }
-        // Interactive PNG or PDF capture queued by `QuantumView.window.{capturePng,exportPdf}` or `window.print()`.
+        // Interactive PNG or PDF capture queued by `Draconium.window.{capturePng,exportPdf}` or `window.print()`.
         if let Some(state) = &self.state
             && let Some(pending) = state.delegate.pending_captures.borrow_mut().pop_front()
         {
@@ -2872,7 +2872,7 @@ impl ApplicationHandler<HostEvent> for App {
                 state.servo.spin_event_loop();
             }
         }
-        // Spawn any queued child windows (`QuantumView.window.openChild` / `window.open`).
+        // Spawn any queued child windows (`Draconium.window.openChild` / `window.open`).
         if let Some(state) = &mut self.state {
             let mut spawned = false;
             loop {
@@ -2892,7 +2892,7 @@ impl ApplicationHandler<HostEvent> for App {
                 state.servo.spin_event_loop();
             }
         }
-        // Execute queued non-blocking async IPC tasks (`QuantumView.invokeAsync` and `*Async`).
+        // Execute queued non-blocking async IPC tasks (`Draconium.invokeAsync` and `*Async`).
         if let Some(state) = &self.state {
             let mut ran_async = false;
             while let Some(task) = state.delegate.pending_async_tasks.borrow_mut().pop_front() {
@@ -2957,7 +2957,7 @@ impl ApplicationHandler<HostEvent> for App {
                 state.servo.spin_event_loop();
             }
         }
-        // A page-issued `qv-window:close` runs the same close flow as the
+        // A page-issued `dn-window:close` runs the same close flow as the
         // window's close button (including the before-close hook).
         if let Some(state) = &self.state
             && state.delegate.exit_requested.get()
@@ -2966,7 +2966,7 @@ impl ApplicationHandler<HostEvent> for App {
             state.delegate.exit_requested.set(false);
             request_close(&state.webview, &state.delegate);
         }
-        // A page-issued `qv-window:hard-reload` clears the network cache and runs the guarded reload flow.
+        // A page-issued `dn-window:hard-reload` clears the network cache and runs the guarded reload flow.
         if let Some(state) = &self.state
             && state.delegate.hard_reload_requested.get()
         {
@@ -2974,7 +2974,7 @@ impl ApplicationHandler<HostEvent> for App {
             state.servo.network_manager().clear_cache();
             request_reload(&state.webview, &state.delegate);
         }
-        // A page-issued `qv-window:reload` runs the guarded reload flow.
+        // A page-issued `dn-window:reload` runs the guarded reload flow.
         if let Some(state) = &self.state
             && state.delegate.reload_requested.get()
         {
@@ -3806,51 +3806,51 @@ impl SelfTestRunner {
                 self.start_eval(
                     state,
                     "(() => { \
-                        if (!window.QuantumView || !Object.isFrozen(window.QuantumView) || !Object.isFrozen(window.QuantumView.clipboard) || !Object.isFrozen(window.QuantumView.session) || !Object.isFrozen(window.QuantumView.autostart)) { \
+                        if (!window.Draconium || !Object.isFrozen(window.Draconium) || !Object.isFrozen(window.Draconium.clipboard) || !Object.isFrozen(window.Draconium.session) || !Object.isFrozen(window.Draconium.autostart)) { \
                             return 'BAD:preload bridge or namespaces not frozen'; \
                         } \
-                        const deniedCmd = window.QuantumView.invoke('echo', 'forbidden'); \
+                        const deniedCmd = window.Draconium.invoke('echo', 'forbidden'); \
                         if (deniedCmd.ok) { return 'BAD:unauthorized app command allowed'; } \
-                        const deniedProto = window.QuantumView.protocolClient.register('qv-folio'); \
+                        const deniedProto = window.Draconium.protocolClient.register('dn-folio'); \
                         if (deniedProto.ok) { return 'BAD:protocolClient allowed when disabled'; } \
-                        const forged = window.prompt('qv-window:close', ''); \
+                        const forged = window.prompt('dn-window:close', ''); \
                         if (!String(forged).startsWith('err:')) { return 'BAD:forged prompt allowed'; } \
-                        const forgedFile = window.QuantumView.files.readText('qvfile-forged'); \
+                        const forgedFile = window.Draconium.files.readText('dnfile-forged'); \
                         if (forgedFile.ok) { return 'BAD:forged file token allowed'; } \
-                        const badExt = window.QuantumView.window.openExternal('file:///C:/Windows/cmd.exe'); \
+                        const badExt = window.Draconium.window.openExternal('file:///C:/Windows/cmd.exe'); \
                         if (badExt.ok) { return 'BAD:file external URL allowed'; } \
-                        const okExt = window.QuantumView.window.openExternal('https://example.com'); \
+                        const okExt = window.Draconium.window.openExternal('https://example.com'); \
                         if (!okExt.ok) { return 'BAD:https external URL denied: ' + okExt.error; } \
-                        const hideRes = window.QuantumView.window.hide(); \
+                        const hideRes = window.Draconium.window.hide(); \
                         if (hideRes.ok) { return 'BAD:hide succeeded without tray'; } \
-                        const themeRes = window.QuantumView.window.getTheme(); \
+                        const themeRes = window.Draconium.window.getTheme(); \
                         if (!themeRes.ok || (themeRes.data !== 'dark' && themeRes.data !== 'light')) { return 'BAD:getTheme failed'; } \
-                        const platRes = window.QuantumView.window.getPlatform(); \
+                        const platRes = window.Draconium.window.getPlatform(); \
                         if (!platRes.ok || !platRes.data || typeof platRes.data.os !== 'string' || typeof platRes.data.nativeDialogs !== 'boolean' || typeof platRes.data.mediaGstreamer !== 'boolean') { return 'BAD:getPlatform failed'; } \
-                        const maxRes = window.QuantumView.window.isMaximized(); \
+                        const maxRes = window.Draconium.window.isMaximized(); \
                         if (!maxRes.ok) { return 'BAD:isMaximized failed'; } \
-                        const titleRes = window.QuantumView.window.setTitle('QuantumView Folio Self-Test'); \
+                        const titleRes = window.Draconium.window.setTitle('Draconium Folio Self-Test'); \
                         if (!titleRes.ok) { return 'BAD:setTitle failed'; } \
-                        const boundsRes = window.QuantumView.window.getBounds(); \
+                        const boundsRes = window.Draconium.window.getBounds(); \
                         if (!boundsRes.ok || typeof boundsRes.data.width !== 'number' || boundsRes.data.width <= 0 || typeof boundsRes.data.fullscreen !== 'boolean') { return 'BAD:getBounds failed'; } \
-                        const fullscreenRes = window.QuantumView.window.isFullscreen(); \
+                        const fullscreenRes = window.Draconium.window.isFullscreen(); \
                         if (!fullscreenRes.ok || (fullscreenRes.data !== 'true' && fullscreenRes.data !== 'false')) { return 'BAD:isFullscreen failed'; } \
-                        const canBackRes = window.QuantumView.window.canGoBack(); \
-                        const canForwardRes = window.QuantumView.window.canGoForward(); \
+                        const canBackRes = window.Draconium.window.canGoBack(); \
+                        const canForwardRes = window.Draconium.window.canGoForward(); \
                         if (!canBackRes.ok || !canForwardRes.ok) { return 'BAD:history state failed'; } \
-                        const clipWrite = window.QuantumView.clipboard.writeText('folio-self-test'); \
+                        const clipWrite = window.Draconium.clipboard.writeText('folio-self-test'); \
                         if (!clipWrite.ok) { return 'BAD:clipboard.writeText failed: ' + clipWrite.error; } \
-                        const autoGet = window.QuantumView.autostart.isEnabled(); \
+                        const autoGet = window.Draconium.autostart.isEnabled(); \
                         if (!autoGet.ok || autoGet.data !== false) { return 'BAD:autostart.isEnabled failed'; } \
-                        const pdfDry = window.QuantumView.window.exportPdf('folio.pdf'); \
+                        const pdfDry = window.Draconium.window.exportPdf('folio.pdf'); \
                         if (!pdfDry.ok) { return 'BAD:exportPdf dry-run failed: ' + pdfDry.error; } \
-                        const zIn = window.QuantumView.window.zoomIn(); \
-                        const zReset = window.QuantumView.window.zoomReset(); \
+                        const zIn = window.Draconium.window.zoomIn(); \
+                        const zReset = window.Draconium.window.zoomReset(); \
                         if (!zIn.ok || !zReset.ok) { return 'BAD:zoom failed'; } \
                         const pop = document.getElementById('export-popover'); \
                         if (!pop) { return 'BAD:export-popover missing'; } \
                         pop.showPopover(); \
-                        const popOpened = pop.classList.contains('qv-popover-open') || pop.matches(':popover-open'); \
+                        const popOpened = pop.classList.contains('dn-popover-open') || pop.matches(':popover-open'); \
                         pop.hidePopover(); \
                         if (!popOpened) { return 'BAD:popover shim failed'; } \
                         const noteItems = document.querySelectorAll('#note-list .note-item').length; \
@@ -3865,8 +3865,8 @@ impl SelfTestRunner {
                         if (!previewH1 || previewH1.textContent !== '日本語テスト') { \
                             return 'BAD:markdown preview did not update'; \
                         } \
-                        window.__qvAsyncList = null; \
-                        window.QuantumView.invokeAsync('list_notes', '{}').then(r => { window.__qvAsyncList = r; }); \
+                        window.__draconiumAsyncList = null; \
+                        window.Draconium.invokeAsync('list_notes', '{}').then(r => { window.__draconiumAsyncList = r; }); \
                         window.__folioBenchResult = null; \
                         if (typeof window.__folioRunBenchmark !== 'function') { return 'BAD:benchmark harness missing'; } \
                         window.__folioRunBenchmark(12).then(r => { window.__folioBenchResult = r; }); \
@@ -3892,8 +3892,8 @@ impl SelfTestRunner {
                 self.start_eval(
                     state,
                     "(() => { \
-                        if (!window.__folioBenchResult || !window.__qvAsyncList) { return 'PENDING'; } \
-                        if (!window.__qvAsyncList.ok) { return 'BAD:invokeAsync failed'; } \
+                        if (!window.__folioBenchResult || !window.__draconiumAsyncList) { return 'PENDING'; } \
+                        if (!window.__draconiumAsyncList.ok) { return 'BAD:invokeAsync failed'; } \
                         const r = window.__folioBenchResult; \
                         if (r.frames !== 12 || r.domNodes < 40) { return 'BAD_BENCH:' + JSON.stringify(r); } \
                         return 'OK:fps=' + r.fps + '|avg_ms=' + r.avgFrameMs + '|p95_ms=' + r.p95FrameMs + '|dom_nodes=' + r.domNodes; \
@@ -3979,7 +3979,7 @@ impl SelfTestRunner {
                         input.value = 'Hello 日本😀'; \
                         document.getElementById('btn-echo-sync').click(); \
                         const syncReply = document.getElementById('starter-reply').textContent; \
-                        const denied = window.QuantumView.invoke('save_note', '{}'); \
+                        const denied = window.Draconium.invoke('save_note', '{}'); \
                         if (denied.ok) { return 'BAD:unauthorized command allowed'; } \
                         window.__starterAsyncDone = false; \
                         document.getElementById('btn-echo-async').click(); \

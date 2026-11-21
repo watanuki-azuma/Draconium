@@ -2,7 +2,7 @@
 
 ## Vision & Positioning
 
-Draconium (formerly developed under the codename QuantumView) aims to be a **lightweight, self-contained Rust desktop WebView host** powered by Servo — enabling standard HTML, CSS, and JavaScript desktop applications without bundling Chromium or relying on OS WebView runtimes.
+Draconium aims to be a **lightweight, self-contained Rust desktop WebView host** powered by Servo — enabling standard HTML, CSS, and JavaScript desktop applications without bundling Chromium or relying on OS WebView runtimes.
 
 - **Scope**: Focused desktop host (similar in architecture to Tauri, backed by embedded Servo instead of system WebViews) rather than Node.js / full Chromium runtime compatibility.
 - **Benchmark Baseline**: Windows WebView2 (`probes/webview2`, via `wry`) is maintained strictly as a reproducible comparison target, never as a runtime fallback.
@@ -14,18 +14,18 @@ Draconium (formerly developed under the codename QuantumView) aims to be a **lig
 
 ### Engine & Input
 - Migrated to **Servo 0.8.0** (`Stylo 0.23.0`, `WebRender 0.70.1`, `skrifa 0.49.0`, `taffy 0.15.1`), removing upstreamed patches (`servo-paint-api` `#48636`, `servo-script` `#48690`).
-- Maintained a single minimal patch in [`probes/servo/vendor/servo-paint`](../probes/servo/vendor/servo-paint/README.quantumview.md) for 120 ms smooth line-delta wheel interpolation (`2^-10 px` quantization) and `< 1.0 px` subpixel scroll-remainder normalization.
+- Maintained a single minimal patch in [`probes/servo/vendor/servo-paint`](../probes/servo/vendor/servo-paint/README.draconium.md) for 120 ms smooth line-delta wheel interpolation (`2^-10 px` quantization) and `< 1.0 px` subpixel scroll-remainder normalization.
 - Aligned Windows IME commit handling (`CompositionState::Update` -> `CompositionState::End`) with Servo 0.8.0 `servoshell`.
 
-### Reusable Library Crate (`quantumview-host`) & Security Boundaries
-- Extracted the host runtime into a standalone library crate ([`crates/quantumview-host`](../crates/quantumview-host/Cargo.toml)) exporting `HostConfig`, `WindowConfig`, `HostHandler`, `Capabilities`, `EmbeddedAsset`, `SavedWindowState`, `resolve_app_url_from`, and `run`, plus a minimal standalone example ([`examples/hello.rs`](../crates/quantumview-host/examples/hello.rs)) and API reference ([docs/host-api.md](host-api.md)).
-- Decoupled app-specific UI assets (`EmbeddedAsset` passed by callers via `.with_embedded_assets(...)`) and capability builders (`Capabilities::restricted()` / `Capabilities::standard_desktop()`), leaving `probes/servo` as a thin binary consumer of `quantumview-host`.
-- Implemented `qv://app/` custom protocol routing with directory-traversal protection, compiled-in `include_bytes!` fallback, and strict `Content-Security-Policy` headers (`--csp-wasm` optional).
-- Implemented declarative per-app [`Capabilities`](../crates/quantumview-host/src/policy.rs) ACLs, child-window privilege attenuation (`attenuate_for_child()`), per-launch 128-bit session-token preload hardening (`Object.freeze`), and loopback `--dev-url` support.
+### Reusable Library Crate (`draconium-host`) & Security Boundaries
+- Extracted the host runtime into a standalone library crate ([`crates/draconium-host`](../crates/draconium-host/Cargo.toml)) exporting `HostConfig`, `WindowConfig`, `HostHandler`, `Capabilities`, `EmbeddedAsset`, `SavedWindowState`, `resolve_app_url_from`, and `run`, plus a minimal standalone example ([`examples/hello.rs`](../crates/draconium-host/examples/hello.rs)) and API reference ([docs/host-api.md](host-api.md)).
+- Decoupled app-specific UI assets (`EmbeddedAsset` passed by callers via `.with_embedded_assets(...)`) and capability builders (`Capabilities::restricted()` / `Capabilities::standard_desktop()`), leaving `probes/servo` as a thin binary consumer of `draconium-host`.
+- Implemented `dn://app/` custom protocol routing with directory-traversal protection, compiled-in `include_bytes!` fallback, and strict `Content-Security-Policy` headers (`--csp-wasm` optional).
+- Implemented declarative per-app [`Capabilities`](../crates/draconium-host/src/policy.rs) ACLs, child-window privilege attenuation (`attenuate_for_child()`), per-launch 128-bit session-token preload hardening (`Object.freeze`), and loopback `--dev-url` support.
 
 ### Native Desktop Integration & Cross-Platform Layer
-- **Windows (Verified)**: Frameless custom chrome (`drag`, 8-edge `dragResize`, minimize, maximize, rounded transparent surface), Win11 DWM rounded corners / dark titlebar, layered opacity (`--opacity`), click-through, system tray (`--tray`), global hotkeys (`--hotkey`), single-instance `WM_COPYDATA` forwarding (`--single-instance`), custom URI schemes (`--deep-link`), `HKCU` autostart, OS power/theme events, all 6 `show_embedder_control` handlers, `IFileOpenDialog` folder picker, capability-scoped drag-and-drop file bridge (`qv:file-drop`), rich clipboard (Text / `CF_HTML` / `CF_DIB`), DPAPI `safeStorage`, raster PDF / HTML / PNG export, structured `.crash.json` reports, and loopback Firefox DevTools RDP (`--devtools`).
-- **macOS & Linux Backends + Capability Introspection**: Implemented zero-extra-dependency Rust `std` backends in [`crates/quantumview-host/src/unix_platform.rs`](../crates/quantumview-host/src/unix_platform.rs) for native dialogs (`osascript` / `zenity` + `kdialog`), text & HTML clipboard (`pbcopy`/`pbpaste` / `wl-copy`/`xclip`/`xsel`), notifications (`osascript` / `notify-send`), autostart (`LaunchAgents` `.plist` / XDG `.desktop`), Unix advisory file locks and domain socket payload forwarding, system Light/Dark theme detection, and external URL opening (`open` / `xdg-open`), paired with runtime `PlatformCapabilities` (`QuantumView.window.getPlatform()`). See [docs/cross-platform.md](cross-platform.md).
+- **Windows (Verified)**: Frameless custom chrome (`drag`, 8-edge `dragResize`, minimize, maximize, rounded transparent surface), Win11 DWM rounded corners / dark titlebar, layered opacity (`--opacity`), click-through, system tray (`--tray`), global hotkeys (`--hotkey`), single-instance `WM_COPYDATA` forwarding (`--single-instance`), custom URI schemes (`--deep-link`), `HKCU` autostart, OS power/theme events, all 6 `show_embedder_control` handlers, `IFileOpenDialog` folder picker, capability-scoped drag-and-drop file bridge (`dn:file-drop`), rich clipboard (Text / `CF_HTML` / `CF_DIB`), DPAPI `safeStorage`, raster PDF / HTML / PNG export, structured `.crash.json` reports, and loopback Firefox DevTools RDP (`--devtools`).
+- **macOS & Linux Backends + Capability Introspection**: Implemented zero-extra-dependency Rust `std` backends in [`crates/draconium-host/src/unix_platform.rs`](../crates/draconium-host/src/unix_platform.rs) for native dialogs (`osascript` / `zenity` + `kdialog`), text & HTML clipboard (`pbcopy`/`pbpaste` / `wl-copy`/`xclip`/`xsel`), notifications (`osascript` / `notify-send`), autostart (`LaunchAgents` `.plist` / XDG `.desktop`), Unix advisory file locks and domain socket payload forwarding, system Light/Dark theme detection, and external URL opening (`open` / `xdg-open`), paired with runtime `PlatformCapabilities` (`Draconium.window.getPlatform()`). See [docs/cross-platform.md](cross-platform.md).
 
 ### Track A · Native desktop integration
 
@@ -43,8 +43,8 @@ Draconium (formerly developed under the codename QuantumView) aims to be a **lig
 Security and reliability hardening covers Unix clipboard process handling and read limits, file dialog path parsing, private IPC directories and crash-safe locks, XDG desktop entry escaping, window geometry validation, and staged Windows packaging. Media builds now check for GStreamer 1.20 or later.
 
 ### Public Showcase Applications & Benchmarks
-- **QuantumView Folio (`--workspace`)**: Local-first Markdown workspace showcasing custom frameless chrome, live split rendering, atomic `.md` persistence, drag-and-drop import, native export, OS theme sync, and an on-demand 60-frame Render Lab.
-- **QuantumView Starter (`--starter`)**: Minimal developer template for wiring new Rust + HTML/CSS/JS apps.
+- **Draconium Folio (`--workspace`)**: Local-first Markdown workspace showcasing custom frameless chrome, live split rendering, atomic `.md` persistence, drag-and-drop import, native export, OS theme sync, and an on-demand 60-frame Render Lab.
+- **Draconium Starter (`--starter`)**: Minimal developer template for wiring new Rust + HTML/CSS/JS apps.
 - **Servo 0.8.0 vs WebView2 Benchmarks**: Recorded reproducible resource, startup, and binary size measurements in [measurements/README.md](../measurements/README.md).
 
 ### Optional Media & CI Wiring

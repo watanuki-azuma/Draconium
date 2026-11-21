@@ -1,6 +1,6 @@
 # Optional Native Media (`media-gstreamer`)
 
-QuantumView follows Servo 0.8.0's media backend selection. The default build uses `DummyBackend`; opting into the `media-gstreamer` Cargo feature selects `GStreamerBackend` for native `<audio>` and `<video>` media. The default Windows executable remains about 112 MiB and self-contained, with zero GStreamer runtime DLLs. The feature adds a graph of 39 optional crates recorded in `probes/servo/Cargo.lock`; they are not compiled by default, so default `--frozen` builds are unchanged.
+Draconium follows Servo 0.8.0's media backend selection. The default build uses `DummyBackend`; opting into the `media-gstreamer` Cargo feature selects `GStreamerBackend` for native `<audio>` and `<video>` media. The default Windows executable remains about 112 MiB and self-contained, with zero GStreamer runtime DLLs. The feature adds a graph of 39 optional crates recorded in `probes/servo/Cargo.lock`; they are not compiled by default, so default `--frozen` builds are unchanged.
 
 ## Enable the feature
 
@@ -8,7 +8,7 @@ For an application that depends on the host library, enable the feature on that 
 
 ```toml
 [dependencies]
-quantumview-host = { path = "../QuantumView/crates/quantumview-host", features = ["media-gstreamer"] }
+draconium-host = { path = "../Draconium/crates/draconium-host", features = ["media-gstreamer"] }
 ```
 
 To build the Servo showcase binary with the checked-in lockfile:
@@ -24,7 +24,7 @@ The optional `media_gstreamer` input on the `Servo Release Build` workflow enabl
 The feature state is reported by the host at runtime:
 
 ```js
-const result = window.QuantumView.window.getPlatform();
+const result = window.Draconium.window.getPlatform();
 if (result.ok && result.data.mediaGstreamer) {
   // This executable was compiled with the media-gstreamer feature.
 }
@@ -33,7 +33,7 @@ if (result.ok && result.data.mediaGstreamer) {
 Rust callers can use the same compiled-feature flag:
 
 ```rust
-let media_enabled = quantumview_host::platform::platform_capabilities().media_gstreamer;
+let media_enabled = draconium_host::platform::platform_capabilities().media_gstreamer;
 ```
 
 The value indicates that the feature was compiled in. It does not guarantee that the runtime, plugins, or a particular codec are installed.
@@ -45,7 +45,7 @@ Use GStreamer **1.20 or later**. Servo 0.8.0's `servo-media-gstreamer` backend u
 ### Windows x64
 
 - Build with the GStreamer 1.20+ MSVC runtime and development installers, and make `pkg-config` available to Cargo. Set `GSTREAMER_1_0_ROOT_MSVC_X86_64` to the SDK root and prepend its `lib\pkgconfig` directory to `PKG_CONFIG_PATH`.
-- At runtime, place the GStreamer core runtime DLLs and Servo 0.8.0's 36 required plugin DLLs next to `quantumview-servo.exe`. The plugin filenames are `gst*.dll`.
+- At runtime, place the GStreamer core runtime DLLs and Servo 0.8.0's 36 required plugin DLLs next to `draconium.exe`. The plugin filenames are `gst*.dll`.
 - Package the files from an SDK install with:
 
   ```powershell

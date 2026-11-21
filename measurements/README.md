@@ -1,6 +1,8 @@
 # Benchmarks & Resource Measurements
 
-Reproducible idle resource, startup, and binary footprint measurements comparing **QuantumView (Servo 0.8.0)** against **Windows WebView2 (`wry 0.57.1`)** on the identical comparison UI (`ui/index.html`, 1000×720 logical pixels).
+Reproducible idle resource, startup, and binary footprint measurements comparing **Draconium (Servo 0.8.0)** against **Windows WebView2 (`wry 0.57.1`)** on the identical comparison UI (`ui/index.html`, 1000×720 logical pixels).
+
+The archived raw files retain the original `quantumview-*` binary names.
 
 ## 2026-11-20 — Servo 0.8.0 vs WebView2 (`wry 0.57.1`)
 
@@ -8,7 +10,7 @@ Reproducible idle resource, startup, and binary footprint measurements comparing
 
 | Runtime | Processes | Private Bytes (Median) | Working Set Total (Median) | Idle CPU (1-Core %) | GPU Dedicated | GPU Shared |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| **QuantumView (Servo 0.8.0)** | **1** | 261.27 MiB | **112.32 MiB** | **0.000%** | 123.39 MiB | 15.68 MiB |
+| **Draconium (Servo 0.8.0)** | **1** | 261.27 MiB | **112.32 MiB** | **0.000%** | 123.39 MiB | 15.68 MiB |
 | WebView2 (`wry 0.57.1`) | 7 | 142.56 MiB | 314.75 MiB | 0.411% | 24.74 MiB | 1.84 MiB |
 
 - Servo 0.8.0 runs inside a single process with lower total Working Set (`112.32` vs `314.75 MiB`) and `0.000%` idle CPU.
@@ -18,7 +20,7 @@ Reproducible idle resource, startup, and binary footprint measurements comparing
 
 | Runtime | Executable | Runtime Dependency |
 | --- | ---: | --- |
-| **QuantumView (Servo 0.8.0)** | 111.94 MiB (`117,377,024` B) | Self-contained, single process, no OS WebView required |
+| **Draconium (Servo 0.8.0)** | 111.94 MiB (`117,377,024` B) | Self-contained, single process, no OS WebView required |
 | WebView2 (`wry 0.57.1`) | 1.00 MiB (`1,044,480` B) | Requires OS EdgeWebView2 Runtime (tested with `157.0.4341.60`) |
 
 ### 3. Warm Startup & End-to-End Scroll Self-Test ([startup.csv](2026-11-20/startup.csv))

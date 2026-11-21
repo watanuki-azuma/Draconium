@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Windows real-machine E2E checks for quantumview-servo.
+"""Windows real-machine E2E checks for draconium.
 
 Covers custom-chrome transparent screenshots, starter screenshot, DevTools
 Firefox RDP handshake, tray/single-instance WM_COPYDATA forwarding, and live
@@ -26,22 +26,22 @@ PARENT_HTML = r"""<!doctype html>
 (async () => {
   const r = {};
   try {
-    const enc = window.QuantumView.safeStorage.encrypt("dpapi-live-日本語");
-    const dec = enc.ok ? window.QuantumView.safeStorage.decrypt(enc.data) : null;
-    const encA = await window.QuantumView.safeStorage.encryptAsync("dpapi-async");
-    const decA = encA.ok ? await window.QuantumView.safeStorage.decryptAsync(encA.data) : null;
+    const enc = window.Draconium.safeStorage.encrypt("dpapi-live-日本語");
+    const dec = enc.ok ? window.Draconium.safeStorage.decrypt(enc.data) : null;
+    const encA = await window.Draconium.safeStorage.encryptAsync("dpapi-async");
+    const decA = encA.ok ? await window.Draconium.safeStorage.decryptAsync(encA.data) : null;
     r.safeStorage = { encOk: enc.ok, decVal: dec && dec.data, asyncVal: decA && decA.data };
 
-    const cw = await window.QuantumView.clipboard.writeTextAsync("qv-live-clip-日本語");
-    const cr = await window.QuantumView.clipboard.readTextAsync();
-    const hw = window.QuantumView.clipboard.writeHtml("<b>Hi</b>");
-    const hr = window.QuantumView.clipboard.readHtml();
+    const cw = await window.Draconium.clipboard.writeTextAsync("dn-live-clip-日本語");
+    const cr = await window.Draconium.clipboard.readTextAsync();
+    const hw = window.Draconium.clipboard.writeHtml("<b>Hi</b>");
+    const hr = window.Draconium.clipboard.readHtml();
     const px = new Uint8Array([255,0,0,255, 0,255,0,255, 0,0,255,255, 255,255,255,255]);
     let b64 = "";
     for (let i = 0; i < px.length; i++) b64 += String.fromCharCode(px[i]);
-    const iw = window.QuantumView.clipboard.writeImage({ width: 2, height: 2, rgbaBase64: btoa(b64) });
-    const ir = window.QuantumView.clipboard.readImage();
-    const cc = window.QuantumView.clipboard.clear();
+    const iw = window.Draconium.clipboard.writeImage({ width: 2, height: 2, rgbaBase64: btoa(b64) });
+    const ir = window.Draconium.clipboard.readImage();
+    const cc = window.Draconium.clipboard.clear();
     r.clipboard = {
       cw: cw.ok, cr: cr.data,
       hw: hw.ok, hr: hr.data,
@@ -49,11 +49,11 @@ PARENT_HTML = r"""<!doctype html>
       cc: cc.ok
     };
 
-    try { localStorage.setItem("qv_session_probe", "1"); } catch (e) { r.lsErr = String(e); }
-    const sd1 = await window.QuantumView.session.listSiteDataAsync();
-    const ccCache = await window.QuantumView.session.clearCacheAsync();
-    const ccCookies = await window.QuantumView.session.clearCookiesAsync({ sessionOnly: false });
-    const ccSite = await window.QuantumView.session.clearSiteDataAsync();
+    try { localStorage.setItem("dn_session_probe", "1"); } catch (e) { r.lsErr = String(e); }
+    const sd1 = await window.Draconium.session.listSiteDataAsync();
+    const ccCache = await window.Draconium.session.clearCacheAsync();
+    const ccCookies = await window.Draconium.session.clearCookiesAsync({ sessionOnly: false });
+    const ccSite = await window.Draconium.session.clearSiteDataAsync();
     r.session = {
       sd1Ok: sd1.ok,
       sd1Count: Array.isArray(sd1.data) ? sd1.data.length : -1,
@@ -62,22 +62,22 @@ PARENT_HTML = r"""<!doctype html>
       clearSiteData: ccSite.ok
     };
 
-    const op1 = window.QuantumView.window.setOpacity(0.85);
-    const op2 = window.QuantumView.window.setOpacity(1.0);
-    const ct = window.QuantumView.window.setClickThrough(false);
+    const op1 = window.Draconium.window.setOpacity(0.85);
+    const op2 = window.Draconium.window.setOpacity(1.0);
+    const ct = window.Draconium.window.setClickThrough(false);
     r.opacity = { op1: op1.ok, op2: op2.ok, ct: ct.ok };
 
     r.printUsesExportPdf = String(window.print).includes("exportPdf");
     r.wasmValid = WebAssembly.validate(new Uint8Array([0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00]));
 
     const childUrl = location.origin + "/child.html";
-    const oc = window.QuantumView.window.openChild({ url: childUrl, title: "QVChildVerify", width: 320, height: 240 });
+    const oc = window.Draconium.window.openChild({ url: childUrl, title: "DraconiumChildVerify", width: 320, height: 240 });
     r.openChild = oc;
 
-    const badChild = window.QuantumView.window.openChild({ url: "https://example.com" });
+    const badChild = window.Draconium.window.openChild({ url: "https://example.com" });
     r.badChildRejected = !badChild.ok;
 
-    const n = window.QuantumView.notify({ title: "QV", body: "VerifyNotice" });
+    const n = window.Draconium.notify({ title: "DN", body: "VerifyNotice" });
     r.notify = n;
   } catch (err) {
     r.fatal = String(err && (err.stack || err));
@@ -92,13 +92,13 @@ CHILD_HTML = r"""<!doctype html>
 (async () => {
   const c = {};
   try {
-    c.hasBridge = Boolean(window.QuantumView && Object.isFrozen(window.QuantumView));
-    c.deniedSafe = !window.QuantumView.safeStorage.encrypt("nope").ok;
-    c.deniedApp = !window.QuantumView.invoke("list_notes", "{}").ok;
-    c.deniedClip = !window.QuantumView.clipboard.readText().ok;
-    c.deniedSite = !window.QuantumView.session.listSiteData().ok;
-    c.deniedChild = !window.QuantumView.window.openChild({ url: "about:blank" }).ok;
-    c.themeOk = window.QuantumView.window.getTheme().ok;
+    c.hasBridge = Boolean(window.Draconium && Object.isFrozen(window.Draconium));
+    c.deniedSafe = !window.Draconium.safeStorage.encrypt("nope").ok;
+    c.deniedApp = !window.Draconium.invoke("list_notes", "{}").ok;
+    c.deniedClip = !window.Draconium.clipboard.readText().ok;
+    c.deniedSite = !window.Draconium.session.listSiteData().ok;
+    c.deniedChild = !window.Draconium.window.openChild({ url: "about:blank" }).ok;
+    c.themeOk = window.Draconium.window.getTheme().ok;
   } catch (err) {
     c.fatal = String(err && (err.stack || err));
   }
@@ -213,7 +213,7 @@ def test_screenshots(exe: str, work_dir: str) -> None:
     os.makedirs(ws_dir, exist_ok=True)
     ws_png = os.path.join(work_dir, "workspace.png")
     ws_out = run_checked(
-        [exe, "--workspace", "--qv-assets", "--workspace-dir", ws_dir, "--screenshot", ws_png]
+        [exe, "--workspace", "--dn-assets", "--workspace-dir", ws_dir, "--screenshot", ws_png]
     )
     assert "non_blank=true" in ws_out, f"workspace screenshot unexpected output: {ws_out}"
     ws_info = inspect_png(ws_png)
@@ -226,7 +226,7 @@ def test_screenshots(exe: str, work_dir: str) -> None:
     print(f"[PASS] workspace custom-chrome screenshot: {ws_info['width']}x{ws_info['height']} min_alpha={ws_info['min_alpha']}")
 
     starter_png = os.path.join(work_dir, "starter.png")
-    st_out = run_checked([exe, "--starter", "--qv-assets", "--screenshot", starter_png])
+    st_out = run_checked([exe, "--starter", "--dn-assets", "--screenshot", starter_png])
     assert "non_blank=true" in st_out, f"starter screenshot unexpected output: {st_out}"
     st_info = inspect_png(starter_png)
     assert st_info["width"] == 760 and st_info["height"] == 560, (
@@ -266,7 +266,7 @@ def test_devtools_rdp(exe: str) -> None:
     port = pick_free_port()
     addr = f"127.0.0.1:{port}"
     proc = subprocess.Popen(
-        [exe, "--starter", "--qv-assets", "--devtools", "--devtools-addr", addr],
+        [exe, "--starter", "--dn-assets", "--devtools", "--devtools-addr", addr],
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
@@ -316,7 +316,7 @@ def test_tray_single_instance(exe: str, work_dir: str) -> None:
         [
             exe,
             "--workspace",
-            "--qv-assets",
+            "--dn-assets",
             "--tray",
             "--single-instance",
             "--hotkey",
@@ -331,18 +331,18 @@ def test_tray_single_instance(exe: str, work_dir: str) -> None:
         errors="replace",
     )
     try:
-        win_name = "QuantumViewOsEventWindow.LocalQuantumViewServoWorkspace"
+        win_name = "Draconium.TrayWindow.LocalDraconiumWorkspace"
         hwnd = wait_for_os_event_window(win_name, timeout=12.0)
         assert hwnd != 0, f"Primary OS event window {win_name} did not appear"
         out2 = run_checked(
             [
                 exe,
                 "--workspace",
-                "--qv-assets",
+                "--dn-assets",
                 "--tray",
                 "--single-instance",
                 "--deep-link",
-                "quantumview://open/verify-ping",
+                "draconium://open/verify-ping",
             ],
             timeout=15.0,
         )
@@ -448,7 +448,7 @@ def test_live_http(exe: str, work_dir: str) -> None:
     }, f"safeStorage mismatch: {p}"
     assert p.get("clipboard") == {
         "cw": True,
-        "cr": "qv-live-clip-日本語",
+        "cr": "dn-live-clip-日本語",
         "hw": True,
         "hr": "<b>Hi</b>",
         "iw": True,

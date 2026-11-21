@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Cross-platform static checks and standalone Rust verification for QuantumView."""
+"""Cross-platform static checks and standalone Rust verification for Draconium."""
 
 from __future__ import annotations
 
@@ -202,51 +202,57 @@ def phase_static(verification: Verification) -> None:
     root = verification.root
     commands = [
         (
-            "cargo fmt --check (quantumview-host)",
+            "cargo fmt --check (draconium-host)",
             [
                 "cargo",
                 "fmt",
                 "--check",
                 "--manifest-path",
-                "crates/quantumview-host/Cargo.toml",
+                "crates/draconium-host/Cargo.toml",
             ],
         ),
         (
-            "cargo fmt --check (Servo probe)",
+            "cargo fmt --check (draconium)",
             ["cargo", "fmt", "--check", "--manifest-path", "probes/servo/Cargo.toml"],
+        ),
+        (
+            "cargo fmt --check (draconium-webview2)",
+            ["cargo", "fmt", "--check", "--manifest-path", "probes/webview2/Cargo.toml"],
         ),
         (
             "rustfmt --check (win32 live probe)",
             ["rustfmt", "--edition", "2024", "--check", "scripts/win32_live_probe.rs"],
         ),
-        (
-            "cargo metadata --locked (Servo probe)",
+    ]
+    for label, command in commands:
+        verification.command(label, command, cwd=root)
+
+    for probe in ("servo", "webview2"):
+        verification.command(
+            f"cargo metadata --locked --offline ({probe})",
             [
                 "cargo",
                 "metadata",
                 "--format-version",
                 "1",
                 "--locked",
+                "--offline",
                 "--no-deps",
                 "--manifest-path",
-                "probes/servo/Cargo.toml",
+                f"probes/{probe}/Cargo.toml",
             ],
-        ),
-    ]
-    for label, command in commands:
-        verification.command(label, command, cwd=root)
+            cwd=root,
+        )
 
-    js_dir = root / "probes" / "servo" / "ui"
-    js_files = sorted(js_dir.glob("*.js")) if js_dir.is_dir() else []
-    if not js_dir.is_dir():
-        verification.check("Node syntax checks (probes/servo/ui)", [f"missing directory: {js_dir}"])
-    elif not js_files:
-        verification.check("Node syntax checks (probes/servo/ui)", ["no *.js files found"])
-    else:
+    for directory in ("probes/servo/ui", "ui"):
+        js_files = sorted((root / directory).glob("*.js"))
+        if not js_files:
+            verification.check(f"Node syntax checks ({directory})", ["no *.js files found"])
         for js_file in js_files:
+            relative_path = js_file.relative_to(root).as_posix()
             verification.command(
-                f"node --check {js_file.relative_to(root).as_posix()}",
-                ["node", "--check", js_file.relative_to(root).as_posix()],
+                f"node --check {relative_path}",
+                ["node", "--check", relative_path],
                 cwd=root,
             )
 
@@ -260,11 +266,11 @@ def executable_path(directory: Path, name: str) -> Path:
 def phase_standalone_tests(verification: Verification) -> None:
     print("\n== Phase 2: Standalone Rust unit tests ==")
     sources = [
-        "crates/quantumview-host/src/unix_platform.rs",
-        "crates/quantumview-host/src/window_state.rs",
-        "crates/quantumview-host/src/bridge.rs",
-        "crates/quantumview-host/src/protocol.rs",
-        "crates/quantumview-host/src/policy.rs",
+        "crates/draconium-host/src/unix_platform.rs",
+        "crates/draconium-host/src/window_state.rs",
+        "crates/draconium-host/src/bridge.rs",
+        "crates/draconium-host/src/protocol.rs",
+        "crates/draconium-host/src/policy.rs",
         "probes/servo/src/workspace.rs",
         "probes/servo/src/starter.rs",
         "probes/servo/vendor/servo-paint/wheel_scroll.rs",
@@ -298,10 +304,10 @@ def rust_path_literal(path: Path) -> str:
 
 def platform_harness_source(root: Path) -> str:
     sources = {
-        "embedder_ui": rust_path_literal(root / "crates/quantumview-host/src/embedder_ui.rs"),
-        "tray": rust_path_literal(root / "crates/quantumview-host/src/tray.rs"),
-        "unix_platform": rust_path_literal(root / "crates/quantumview-host/src/unix_platform.rs"),
-        "win_platform": rust_path_literal(root / "crates/quantumview-host/src/win_platform.rs"),
+        "embedder_ui": rust_path_literal(root / "crates/draconium-host/src/embedder_ui.rs"),
+        "tray": rust_path_literal(root / "crates/draconium-host/src/tray.rs"),
+        "unix_platform": rust_path_literal(root / "crates/draconium-host/src/unix_platform.rs"),
+        "win_platform": rust_path_literal(root / "crates/draconium-host/src/win_platform.rs"),
     }
     return f'''
 
@@ -413,7 +419,7 @@ mod ci_integration_tests {{
             .duration_since(UNIX_EPOCH)
             .expect("system clock before UNIX_EPOCH")
             .as_nanos();
-        let tag = format!("qv-ci-{{}}-{{nonce}}", std::process::id());
+        let tag = format!("dn-ci-{{}}-{{nonce}}", std::process::id());
         let lock_path = unix_platform::unix_instance_lock_path(&tag).expect("lock path");
         let socket_path = unix_platform::unix_instance_socket_path(&tag).expect("IPC path");
         assert_eq!(lock_path.extension().unwrap(), "lock");
@@ -439,7 +445,7 @@ mod ci_integration_tests {{
             let (action_tx, action_rx) = mpsc::channel();
             let tray = tray::TrayHandle::start(
                 tray::TrayConfig {{
-                    tooltip: "QuantumView CI".to_owned(),
+                    tooltip: "Draconium CI".to_owned(),
                     presentations: false,
                     show_tray_icon: false,
                     hotkey: None,
@@ -560,7 +566,7 @@ def main() -> int:
     )
     args = parser.parse_args()
 
-    with tempfile.TemporaryDirectory(prefix="quantumview-verify-ci-") as temp_name:
+    with tempfile.TemporaryDirectory(prefix="draconium-verify-ci-") as temp_name:
         verification = Verification(ROOT, Path(temp_name))
         phase_static(verification)
         phase_standalone_tests(verification)
