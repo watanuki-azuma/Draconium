@@ -1,6 +1,6 @@
 //! Windows OS integration & engine-gap host primitives.
 //!
-//! Bridges capabilities that Servo 0.7.0 / winit 0.30 do not provide directly:
+//! Bridges capabilities that Servo 0.8.0 / winit 0.30 do not provide directly:
 //! - Win11 DWM rounded corners & dark titlebar (`DwmSetWindowAttribute`)
 //! - Layered window opacity & click-through (`SetLayeredWindowAttributes`, `WS_EX_TRANSPARENT`)
 //! - Windows system theme detection (`AppsUseLightTheme` via `RegGetValueW`)

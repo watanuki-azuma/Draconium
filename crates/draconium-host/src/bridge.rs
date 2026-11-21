@@ -9,7 +9,7 @@
 //! `dn-tok:<nonce>:dn-window-async:<id>:<cmd>`).
 //!
 //! Beyond the IPC bridge, [`PRELOAD_SCRIPT`] also injects lightweight shims
-//! for web/Electron capabilities missing in Servo 0.7.0:
+//! for web/Electron capabilities missing in Servo 0.8.0:
 //! - HTML Popover API (`[popover]`, `showPopover`/`hidePopover`/`togglePopover`,
 //!   `popovertarget`, light-dismiss), paired with [`POPOVER_POLYFILL_CSS`]
 //!   injected at `Origin::User` via `UserStyleSheet` so strict `style-src 'self'`
@@ -1042,7 +1042,7 @@ pub const PRELOAD_SCRIPT: &str = r#"
     enumerable: true,
   });
 
-  // Fallback for window.print() (unsupported in Servo 0.7.0) -> raster PDF export dialog.
+  // Fallback for window.print() (unsupported in Servo 0.8.0) -> raster PDF export dialog.
   try {
     window.print = () => {
       const title = (typeof document !== "undefined" && document.title) ? document.title : "page";
@@ -1050,7 +1050,7 @@ pub const PRELOAD_SCRIPT: &str = r#"
     };
   } catch (_) {}
 
-  // --- Engine-gap shim 1: HTML Popover API polyfill (missing in Servo 0.7.0) ---
+  // --- Engine-gap shim 1: HTML Popover API polyfill (missing in Servo 0.8.0) ---
   // Note: Popover CSS rules are injected at Origin::User via UserStyleSheet
   // (POPOVER_POLYFILL_CSS) so strict author `style-src 'self'` CSP is preserved.
   if (typeof HTMLElement !== "undefined" && !("popover" in HTMLElement.prototype)) {

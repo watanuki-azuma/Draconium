@@ -101,6 +101,7 @@ Additional builders:
 - `.with_deep_link(Option<String>)` / `.with_raw_args(Vec<String>)`: custom URI scheme startup and single-instance forwarding
 - `.with_dev_origin(Option<DevOrigin>)`: loopback dev server origin allowed by `--dev-url`
 - `.with_wasm_csp(bool)`: appends `'wasm-unsafe-eval'` to `script-src` in `dn://app/` CSP headers
+- `.with_reload_shortcuts(bool)`: enables or disables host interception of `F5`, `Ctrl+R`, `Ctrl+F5`, and `Ctrl+Shift+R` reload shortcuts (default `true`; set `false` to forward them to page JS)
 
 ### 2.4 `HostHandler` Trait
 
