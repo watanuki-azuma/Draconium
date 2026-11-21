@@ -6,7 +6,7 @@
 //!
 //! The routing rules live in the dependency-free `protocol` module; this
 //! file translates between Servo's fetch types and that resolver,
-//! following the response-construction pattern of Servo 0.7.0's own
+//! following the response-construction pattern of Servo 0.8.0's own
 //! `net/protocols/data.rs`.
 //!
 //! Features:

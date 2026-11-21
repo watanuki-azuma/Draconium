@@ -50,6 +50,8 @@ use crate::window_state;
 const SELF_TEST_TIMEOUT: Duration = Duration::from_secs(10);
 const SCREENSHOT_TIMEOUT: Duration = Duration::from_secs(15);
 const BACKGROUND_POLL_INTERVAL: Duration = Duration::from_secs(1);
+const CLOSE_POLL_INTERVAL: Duration = Duration::from_millis(25);
+const CLOSE_TIMEOUT: Duration = Duration::from_millis(500);
 /// Ignore `WindowEvent::Moved` shortly after startup or programmatic moves so
 /// OS placement events do not clobber the user's saved position.
 const PROGRAMMATIC_MOVE_GRACE: Duration = Duration::from_millis(300);
@@ -102,6 +104,8 @@ pub struct HostConfig {
     pub allow_wasm_csp: bool,
     /// Enables Servo's CSS backdrop filters.
     pub backdrop_filter: bool,
+    /// Enables built-in reload shortcuts (`F5`, `Ctrl+R`, `Ctrl+F5`, `Ctrl+Shift+R`).
+    pub allow_reload_shortcuts: bool,
 }
 
 impl HostConfig {
@@ -127,6 +131,7 @@ impl HostConfig {
             dev_origin: None,
             allow_wasm_csp: false,
             backdrop_filter: true,
+            allow_reload_shortcuts: true,
         }
     }
 
@@ -211,6 +216,11 @@ impl HostConfig {
 
     pub fn with_backdrop_filter(mut self, enabled: bool) -> Self {
         self.backdrop_filter = enabled;
+        self
+    }
+
+    pub fn with_reload_shortcuts(mut self, enabled: bool) -> Self {
+        self.allow_reload_shortcuts = enabled;
         self
     }
 }
@@ -627,6 +637,7 @@ struct Delegate {
     tray_active: bool,
     close_to_tray: bool,
     non_interactive: bool,
+    allow_reload_shortcuts: bool,
     dark_theme: Cell<bool>,
     window_visible: Cell<bool>,
     input_method: Cell<Option<EmbedderControlId>>,
@@ -634,6 +645,7 @@ struct Delegate {
     load_complete: Cell<bool>,
     has_painted: Cell<bool>,
     close_in_progress: Cell<bool>,
+    close_started_at: Cell<Option<Instant>>,
     should_exit: Cell<bool>,
     exit_requested: Cell<bool>,
     reload_in_progress: Cell<bool>,
@@ -1694,6 +1706,8 @@ impl WebViewDelegate for Delegate {
     }
 
     fn notify_closed(&self, _: WebView) {
+        self.close_in_progress.set(false);
+        self.close_started_at.set(None);
         self.should_exit.set(true);
         self.waker.wake();
     }
@@ -1991,12 +2005,53 @@ impl WebViewDelegate for Delegate {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReloadShortcut {
+    None,
+    Reload,
+    HardReload,
+}
+
+fn classify_reload_shortcut(
+    allow_reload_shortcuts: bool,
+    composing: bool,
+    modifiers: ModifiersState,
+    logical_key: &WinitKey,
+) -> ReloadShortcut {
+    if !allow_reload_shortcuts || composing || modifiers.alt_key() || modifiers.super_key() {
+        return ReloadShortcut::None;
+    }
+    let is_f5 = matches!(logical_key, WinitKey::Named(WinitNamedKey::F5));
+    let is_r = matches!(
+        logical_key,
+        WinitKey::Character(text) if text.eq_ignore_ascii_case("r")
+    );
+    if (is_f5 && modifiers.control_key())
+        || (modifiers.control_key() && modifiers.shift_key() && is_r)
+    {
+        ReloadShortcut::HardReload
+    } else if (is_f5 && !modifiers.control_key()) || (modifiers.control_key() && is_r) {
+        ReloadShortcut::Reload
+    } else {
+        ReloadShortcut::None
+    }
+}
+
+fn close_timed_out(started: Instant, now: Instant) -> bool {
+    now.saturating_duration_since(started) > CLOSE_TIMEOUT
+}
+
+fn close_poll_deadline(now: Instant) -> Instant {
+    now + CLOSE_POLL_INTERVAL
+}
+
 fn request_close(webview: &WebView, delegate: &Rc<Delegate>) {
     if delegate.close_in_progress.get() || delegate.should_exit.get() {
         return;
     }
     delegate.flush_pending_move(true);
     delegate.close_in_progress.set(true);
+    delegate.close_started_at.set(Some(Instant::now()));
     let delegate_cb = delegate.clone();
     webview.evaluate_javascript(
         "typeof window.__draconiumBeforeClose === 'function' ? Boolean(window.__draconiumBeforeClose()) : true",
@@ -2004,8 +2059,11 @@ fn request_close(webview: &WebView, delegate: &Rc<Delegate>) {
             match result {
                 Ok(JSValue::Boolean(false)) => {
                     delegate_cb.close_in_progress.set(false);
+                    delegate_cb.close_started_at.set(None);
                 }
                 _ => {
+                    delegate_cb.close_in_progress.set(false);
+                    delegate_cb.close_started_at.set(None);
                     delegate_cb.should_exit.set(true);
                 }
             }
@@ -2136,6 +2194,7 @@ fn spawn_child_window(
         tray_active: false,
         close_to_tray: false,
         non_interactive: state.delegate.non_interactive,
+        allow_reload_shortcuts: state.delegate.allow_reload_shortcuts,
         dark_theme: Cell::new(dark),
         window_visible: Cell::new(true),
         input_method: Cell::new(None),
@@ -2143,6 +2202,7 @@ fn spawn_child_window(
         load_complete: Cell::new(false),
         has_painted: Cell::new(false),
         close_in_progress: Cell::new(false),
+        close_started_at: Cell::new(None),
         should_exit: Cell::new(false),
         exit_requested: Cell::new(false),
         reload_in_progress: Cell::new(false),
@@ -2444,6 +2504,7 @@ impl ApplicationHandler<HostEvent> for App {
             tray_active,
             close_to_tray: config.window.close_to_tray && tray_active,
             non_interactive,
+            allow_reload_shortcuts: config.allow_reload_shortcuts,
             dark_theme: Cell::new(initial_dark),
             window_visible: Cell::new(!config.window.start_hidden),
             input_method: Cell::new(None),
@@ -2451,6 +2512,7 @@ impl ApplicationHandler<HostEvent> for App {
             load_complete: Cell::new(false),
             has_painted: Cell::new(false),
             close_in_progress: Cell::new(false),
+            close_started_at: Cell::new(None),
             should_exit: Cell::new(false),
             exit_requested: Cell::new(false),
             reload_in_progress: Cell::new(false),
@@ -2993,6 +3055,23 @@ impl ApplicationHandler<HostEvent> for App {
         if let Some(state) = &self.state {
             state.delegate.flush_pending_move(false);
         }
+        // Drive Servo while waiting for the JS before-close hook and exit if it stalls.
+        if let Some(state) = &self.state
+            && state.delegate.close_in_progress.get()
+        {
+            state.servo.spin_event_loop();
+            if !state.delegate.should_exit.get()
+                && state
+                    .delegate
+                    .close_started_at
+                    .get()
+                    .is_some_and(|started| close_timed_out(started, Instant::now()))
+            {
+                state.delegate.should_exit.set(true);
+                state.delegate.close_in_progress.set(false);
+                state.delegate.close_started_at.set(None);
+            }
+        }
         if self
             .state
             .as_ref()
@@ -3031,6 +3110,12 @@ impl ApplicationHandler<HostEvent> for App {
         {
             let due = moved_at + MOVE_SAVE_QUIET;
             deadline = Some(deadline.map_or(due, |d| d.min(due)));
+        }
+        if let Some(state) = &self.state
+            && state.delegate.close_in_progress.get()
+        {
+            let close_wake = close_poll_deadline(Instant::now());
+            deadline = Some(deadline.map_or(close_wake, |d| d.min(close_wake)));
         }
         if let Some(runner) = &self.self_test {
             let test_wake = runner
@@ -3338,25 +3423,17 @@ impl ApplicationHandler<HostEvent> for App {
                 ) {
                     return;
                 }
-                // Host shortcuts: F5 / Ctrl+R reload
-                // through the guarded flow; Ctrl+Shift+R / Ctrl+F5 clear cache
-                // and reload; Ctrl+= / Ctrl+- / Ctrl+0 adjust page zoom.
+                // Host shortcuts: F5 / Ctrl+R reload through the guarded flow
+                // (when enabled); Ctrl+Shift+R / Ctrl+F5 clear cache and reload;
+                // Ctrl+= / Ctrl+- / Ctrl+0 adjust page zoom.
                 // Ignored during IME composition or when Alt/Super are held.
-                let no_alt_super = !state.modifiers.alt_key() && !state.modifiers.super_key();
-                let is_f5 = matches!(event.logical_key, WinitKey::Named(WinitNamedKey::F5));
-                let is_r = matches!(
+                let reload_shortcut = classify_reload_shortcut(
+                    state.delegate.allow_reload_shortcuts,
+                    state.composing,
+                    state.modifiers,
                     &event.logical_key,
-                    WinitKey::Character(text) if text.eq_ignore_ascii_case("r")
                 );
-                let is_hard_reload_key = !state.composing
-                    && no_alt_super
-                    && ((is_f5 && state.modifiers.control_key())
-                        || (state.modifiers.control_key() && state.modifiers.shift_key() && is_r));
-                let is_reload_key = !state.composing
-                    && no_alt_super
-                    && !is_hard_reload_key
-                    && ((is_f5 && !state.modifiers.control_key())
-                        || (state.modifiers.control_key() && is_r));
+                let no_alt_super = !state.modifiers.alt_key() && !state.modifiers.super_key();
                 let zoom_action = if !state.composing
                     && no_alt_super
                     && state.modifiers.control_key()
@@ -3370,30 +3447,34 @@ impl ApplicationHandler<HostEvent> for App {
                 } else {
                     None
                 };
-                if is_hard_reload_key {
-                    if event.state == ElementState::Pressed && !event.repeat {
-                        state.servo.network_manager().clear_cache();
-                        request_reload(webview, &state.delegate);
+                match reload_shortcut {
+                    ReloadShortcut::HardReload => {
+                        if event.state == ElementState::Pressed && !event.repeat {
+                            state.servo.network_manager().clear_cache();
+                            request_reload(webview, &state.delegate);
+                        }
                     }
-                } else if is_reload_key {
-                    if event.state == ElementState::Pressed && !event.repeat {
-                        request_reload(webview, &state.delegate);
+                    ReloadShortcut::Reload => {
+                        if event.state == ElementState::Pressed && !event.repeat {
+                            request_reload(webview, &state.delegate);
+                        }
                     }
-                } else if let Some(delta) = zoom_action {
-                    if event.state == ElementState::Pressed {
-                        let next = if delta == 0 {
-                            1.0
+                    ReloadShortcut::None => {
+                        if let Some(delta) = zoom_action {
+                            if event.state == ElementState::Pressed {
+                                let next = if delta == 0 {
+                                    1.0
+                                } else {
+                                    window_state::step_zoom(webview.page_zoom(), delta)
+                                };
+                                webview.set_page_zoom(next);
+                            }
                         } else {
-                            window_state::step_zoom(webview.page_zoom(), delta)
-                        };
-                        webview.set_page_zoom(next);
+                            webview.notify_input_event(InputEvent::Keyboard(
+                                input::keyboard_event(&event, state.modifiers, state.composing),
+                            ));
+                        }
                     }
-                } else {
-                    webview.notify_input_event(InputEvent::Keyboard(input::keyboard_event(
-                        &event,
-                        state.modifiers,
-                        state.composing,
-                    )));
                 }
             }
             WindowEvent::Ime(ime) => {
@@ -4026,5 +4107,105 @@ impl SelfTestRunner {
             }
             _ => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn host_config_reload_shortcuts_defaults_true_and_can_disable() {
+        let url = Url::parse("dn://app/index.html").expect("valid URL");
+        let default_cfg = HostConfig::new("App", url.clone());
+        assert!(default_cfg.allow_reload_shortcuts);
+
+        let disabled_cfg = HostConfig::new("App", url).with_reload_shortcuts(false);
+        assert!(!disabled_cfg.allow_reload_shortcuts);
+        assert!(
+            disabled_cfg
+                .with_reload_shortcuts(true)
+                .allow_reload_shortcuts
+        );
+    }
+
+    #[test]
+    fn reload_shortcut_classification_respects_flag_modifiers_and_ime() {
+        let f5 = WinitKey::Named(WinitNamedKey::F5);
+        let r = WinitKey::Character("r".into());
+        let upper_r = WinitKey::Character("R".into());
+        let f2 = WinitKey::Named(WinitNamedKey::F2);
+
+        assert_eq!(
+            classify_reload_shortcut(true, false, ModifiersState::empty(), &f5),
+            ReloadShortcut::Reload
+        );
+        assert_eq!(
+            classify_reload_shortcut(true, false, ModifiersState::CONTROL, &r),
+            ReloadShortcut::Reload
+        );
+        assert_eq!(
+            classify_reload_shortcut(true, false, ModifiersState::CONTROL, &f5),
+            ReloadShortcut::HardReload
+        );
+        assert_eq!(
+            classify_reload_shortcut(
+                true,
+                false,
+                ModifiersState::CONTROL | ModifiersState::SHIFT,
+                &upper_r,
+            ),
+            ReloadShortcut::HardReload
+        );
+        assert_eq!(
+            classify_reload_shortcut(true, false, ModifiersState::empty(), &f2),
+            ReloadShortcut::None
+        );
+        assert_eq!(
+            classify_reload_shortcut(true, true, ModifiersState::empty(), &f5),
+            ReloadShortcut::None
+        );
+        assert_eq!(
+            classify_reload_shortcut(true, false, ModifiersState::ALT, &f5),
+            ReloadShortcut::None
+        );
+        assert_eq!(
+            classify_reload_shortcut(true, false, ModifiersState::SUPER, &r),
+            ReloadShortcut::None
+        );
+
+        assert_eq!(
+            classify_reload_shortcut(false, false, ModifiersState::empty(), &f5),
+            ReloadShortcut::None
+        );
+        assert_eq!(
+            classify_reload_shortcut(false, false, ModifiersState::CONTROL, &r),
+            ReloadShortcut::None
+        );
+        assert_eq!(
+            classify_reload_shortcut(false, false, ModifiersState::CONTROL, &f5),
+            ReloadShortcut::None
+        );
+        assert_eq!(
+            classify_reload_shortcut(
+                false,
+                false,
+                ModifiersState::CONTROL | ModifiersState::SHIFT,
+                &r,
+            ),
+            ReloadShortcut::None
+        );
+    }
+
+    #[test]
+    fn close_timeout_and_poll_deadline_behave_as_configured() {
+        let start = Instant::now();
+        assert!(!close_timed_out(start, start));
+        assert!(!close_timed_out(start, start + Duration::from_millis(500)));
+        assert!(close_timed_out(start, start + Duration::from_millis(501)));
+        assert_eq!(
+            close_poll_deadline(start).duration_since(start),
+            Duration::from_millis(25)
+        );
     }
 }
