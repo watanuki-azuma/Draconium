@@ -8,7 +8,7 @@
 
 **A lightweight, self-contained Rust desktop WebView host powered by Servo 0.8.0 — no Chromium or OS WebView runtime required.**
 
-[日本語 README](README.ja.md) · [Host API](docs/host-api.md) · [Cross-Platform](docs/cross-platform.md) · [Native Media](docs/media-gstreamer.md) · [Electron Feature Mapping](docs/electron-mapping.md) · [Benchmarks](measurements/README.md) · [Roadmap](docs/roadmap.md)
+[日本語 README](README.ja.md) · [Releases](https://github.com/watanuki-azuma/Draconium/releases) · [Host API](docs/host-api.md) · [Cross-Platform](docs/cross-platform.md) · [Native Media](docs/media-gstreamer.md) · [Electron Feature Mapping](docs/electron-mapping.md) · [Benchmarks](measurements/README.md) · [Roadmap](docs/roadmap.md)
 
 Draconium embeds [Servo 0.8.0](https://servo.org/) (Stylo, WebRender, SpiderMonkey) inside a single native Rust process so you can build desktop applications with standard HTML, CSS, and JavaScript without bundling Chromium or depending on platform WebView runtimes.
 

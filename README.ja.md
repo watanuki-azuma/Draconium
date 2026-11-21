@@ -8,7 +8,7 @@
 
 **Chromium や OS 標準 WebView に依存しない、Servo 0.8.0 ベースの軽量 Rust デスクトップ WebView ホスト**
 
-[English README](README.md) · [ホスト API 仕様](docs/host-api.md) · [クロスプラットフォーム対応](docs/cross-platform.md) · [ネイティブメディア](docs/media-gstreamer.md) · [Electron 機能対応表](docs/electron-mapping.md) · [ベンチマーク結果](measurements/README.md) · [ロードマップ](docs/roadmap.md)
+[English README](README.md) · [リリース一覧](https://github.com/watanuki-azuma/Draconium/releases) · [ホスト API 仕様](docs/host-api.md) · [クロスプラットフォーム対応](docs/cross-platform.md) · [ネイティブメディア](docs/media-gstreamer.md) · [Electron 機能対応表](docs/electron-mapping.md) · [ベンチマーク結果](measurements/README.md) · [ロードマップ](docs/roadmap.md)
 
 Draconium は、[Servo 0.8.0](https://servo.org/)（Stylo / WebRender / SpiderMonkey）を単一プロセスの Rust ホストへ組み込み、標準の HTML / CSS / JavaScript で軽量なデスクトップアプリを構築するための基盤です。
 
