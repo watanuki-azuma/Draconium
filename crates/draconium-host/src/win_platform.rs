@@ -16,7 +16,6 @@
 //! All pure-logic helpers live outside `#[cfg(target_os = "windows")]` so they
 //! are unit-tested on any OS via `rustc --edition 2024 --test`.
 
-use std::collections::hash_map::RandomState;
 use std::collections::{HashMap, VecDeque};
 use std::hash::{BuildHasher, Hasher};
 use std::path::{Path, PathBuf};
@@ -292,11 +291,6 @@ pub fn base64_decode(input: &str, max_bytes: usize) -> Result<Vec<u8>, String> {
     Ok(out)
 }
 
-/// Capability-scoped registry mapping opaque tokens to OS-approved file paths
-/// (from winit `DroppedFile` or Win32 `GetOpenFileNameW`).
-///
-/// The page NEVER passes an arbitrary filesystem path to the host; it only
-/// receives opaque tokens for files the user explicitly dropped or picked.
 /// Fill `bytes` from the operating system's cryptographic entropy source
 /// (`/dev/urandom` on Unix, `BCryptGenRandom` on Windows).
 ///
@@ -351,23 +345,33 @@ fn fill_os_random(bytes: &mut [u8]) -> bool {
     false
 }
 
-/// A 64-bit random value for capability tokens: OS entropy when available,
-/// otherwise a `RandomState`/clock/PID mix (weaker, never fails outright).
+/// A 64-bit random value for capability tokens, drawn from the OS entropy
+/// source.
+///
+/// # Panics
+/// Panics when the OS entropy source is unavailable. Falling back to a
+/// guessable generator (clock/PID/hash mixing) would let an attacker who
+/// sees one token predict the others, so issuance is deliberately
+/// fail-closed.
 fn random_u64() -> u64 {
     let mut bytes = [0u8; 8];
-    if fill_os_random(&mut bytes) {
-        return u64::from_le_bytes(bytes);
-    }
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let mut hasher = RandomState::new().build_hasher();
-    hasher.write_u128(nanos);
-    hasher.write_u32(std::process::id());
-    hasher.finish()
+    assert!(
+        fill_os_random(&mut bytes),
+        "OS entropy source unavailable; refusing to issue a guessable file token"
+    );
+    u64::from_le_bytes(bytes)
 }
 
+/// Format a capability token from its sequential id and random component.
+fn file_token(id: u64, random: u64) -> String {
+    format!("dnfile-{random:016x}-{id}")
+}
+
+/// Capability-scoped registry mapping opaque tokens to OS-approved file paths
+/// (from winit `DroppedFile` or Win32 `GetOpenFileNameW`).
+///
+/// The page NEVER passes an arbitrary filesystem path to the host; it only
+/// receives opaque tokens for files the user explicitly dropped or picked.
 pub struct FileAccessRegistry {
     next_id: u64,
     order: VecDeque<String>,
@@ -398,9 +402,9 @@ impl FileAccessRegistry {
     pub fn register(&mut self, path: PathBuf) -> String {
         let id = self.next_id;
         self.next_id = self.next_id.wrapping_add(1);
-        let mut token = format!("dnfile-{:016x}-{id}", random_u64());
+        let mut token = file_token(id, random_u64());
         while self.entries.contains_key(&token) {
-            token = format!("dnfile-{:016x}-{id}", random_u64());
+            token = file_token(id, random_u64());
         }
         if self.entries.len() >= MAX_CAPABILITY_TOKENS
             && let Some(oldest) = self.order.pop_front()
@@ -2674,7 +2678,14 @@ mod tests {
         if forged != first {
             assert!(reg.resolve_path(&forged).is_err());
         }
-        assert_eq!(reg.resolve_path(&first).unwrap(), PathBuf::from("/tmp/a.txt"));
+        assert_eq!(
+            reg.resolve_path(&first).unwrap(),
+            PathBuf::from("/tmp/a.txt")
+        );
+        assert_eq!(
+            file_token(7, 0x0123_4567_89ab_cdef),
+            "dnfile-0123456789abcdef-7"
+        );
     }
 
     #[test]
