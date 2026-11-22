@@ -297,8 +297,78 @@ pub fn base64_decode(input: &str, max_bytes: usize) -> Result<Vec<u8>, String> {
 ///
 /// The page NEVER passes an arbitrary filesystem path to the host; it only
 /// receives opaque tokens for files the user explicitly dropped or picked.
+/// Fill `bytes` from the operating system's cryptographic entropy source
+/// (`/dev/urandom` on Unix, `BCryptGenRandom` on Windows).
+///
+/// This mirrors `bridge::fill_os_random`; the two modules are compiled in
+/// separate standalone CI harnesses that cannot share code, so the small
+/// implementation is deliberately duplicated — keep them in sync.
+#[cfg(unix)]
+fn fill_os_random(bytes: &mut [u8]) -> bool {
+    use std::io::Read;
+    let Ok(mut source) = std::fs::File::open("/dev/urandom") else {
+        return false;
+    };
+    source.read_exact(bytes).is_ok()
+}
+
+/// Fill `bytes` from the operating system's cryptographic entropy source
+/// (`BCryptGenRandom` with the system-preferred RNG).
+#[cfg(windows)]
+fn fill_os_random(bytes: &mut [u8]) -> bool {
+    #[link(name = "bcrypt")]
+    unsafe extern "system" {
+        fn BCryptGenRandom(
+            h_algorithm: *mut std::ffi::c_void,
+            pb_buffer: *mut u8,
+            cb_buffer: u32,
+            dw_flags: u32,
+        ) -> i32;
+    }
+    /// `BCRYPT_USE_SYSTEM_PREFERRED_RNG`: use the system-preferred RNG
+    /// without opening an algorithm handle first.
+    const BCRYPT_USE_SYSTEM_PREFERRED_RNG: u32 = 0x0000_0002;
+    let Ok(len) = u32::try_from(bytes.len()) else {
+        return false;
+    };
+    // SAFETY: `bytes` is a valid writable buffer of `len` bytes and the
+    // system-preferred RNG needs no algorithm handle.
+    let status = unsafe {
+        BCryptGenRandom(
+            std::ptr::null_mut(),
+            bytes.as_mut_ptr(),
+            len,
+            BCRYPT_USE_SYSTEM_PREFERRED_RNG,
+        )
+    };
+    status == 0
+}
+
+/// No OS entropy source is implemented on this platform.
+#[cfg(not(any(unix, windows)))]
+fn fill_os_random(bytes: &mut [u8]) -> bool {
+    let _ = bytes;
+    false
+}
+
+/// A 64-bit random value for capability tokens: OS entropy when available,
+/// otherwise a `RandomState`/clock/PID mix (weaker, never fails outright).
+fn random_u64() -> u64 {
+    let mut bytes = [0u8; 8];
+    if fill_os_random(&mut bytes) {
+        return u64::from_le_bytes(bytes);
+    }
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let mut hasher = RandomState::new().build_hasher();
+    hasher.write_u128(nanos);
+    hasher.write_u32(std::process::id());
+    hasher.finish()
+}
+
 pub struct FileAccessRegistry {
-    salt: u64,
     next_id: u64,
     order: VecDeque<String>,
     entries: HashMap<String, PathBuf>,
@@ -312,15 +382,7 @@ impl Default for FileAccessRegistry {
 
 impl FileAccessRegistry {
     pub fn new() -> Self {
-        let mut hasher = RandomState::new().build_hasher();
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
-        hasher.write_u128(nanos);
-        hasher.write_u32(std::process::id());
         Self {
-            salt: hasher.finish(),
             next_id: 1,
             order: VecDeque::new(),
             entries: HashMap::new(),
@@ -328,10 +390,18 @@ impl FileAccessRegistry {
     }
 
     /// Register a user-approved file path and return its capability token.
+    ///
+    /// The token carries a fresh 64-bit random component per registration
+    /// (`dnfile-<random>-<id>`), so knowing one valid token reveals nothing
+    /// about any other token in the same registry: the sequential `id` alone
+    /// is not enough to forge one.
     pub fn register(&mut self, path: PathBuf) -> String {
         let id = self.next_id;
         self.next_id = self.next_id.wrapping_add(1);
-        let token = format!("dnfile-{:016x}-{id}", self.salt ^ id.rotate_left(17));
+        let mut token = format!("dnfile-{:016x}-{id}", random_u64());
+        while self.entries.contains_key(&token) {
+            token = format!("dnfile-{:016x}-{id}", random_u64());
+        }
         if self.entries.len() >= MAX_CAPABILITY_TOKENS
             && let Some(oldest) = self.order.pop_front()
         {
@@ -2587,6 +2657,24 @@ mod tests {
 
         let _ = std::fs::remove_file(&file);
         let _ = std::fs::remove_dir(&dir);
+    }
+
+    #[test]
+    fn capability_file_tokens_have_unique_random_components() {
+        let mut reg = FileAccessRegistry::new();
+        let first = reg.register(PathBuf::from("/tmp/a.txt"));
+        let second = reg.register(PathBuf::from("/tmp/b.txt"));
+        let first_random = first.split('-').nth(1).unwrap_or("");
+        let second_random = second.split('-').nth(1).unwrap_or("");
+        assert_eq!(first_random.len(), 16);
+        assert_ne!(first_random, second_random);
+        // A forged token that reuses a known id with a guessed random part
+        // must not resolve.
+        let forged = format!("dnfile-{:016x}-{}", 0u64, 1);
+        if forged != first {
+            assert!(reg.resolve_path(&forged).is_err());
+        }
+        assert_eq!(reg.resolve_path(&first).unwrap(), PathBuf::from("/tmp/a.txt"));
     }
 
     #[test]
