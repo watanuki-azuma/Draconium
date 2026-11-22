@@ -392,10 +392,79 @@ pub enum BridgeCommand<'a> {
     App(&'a str),
 }
 
+/// Fill `bytes` from the operating system's cryptographic entropy source
+/// (`/dev/urandom` on Unix, `BCryptGenRandom` on Windows).
+///
+/// Returns `false` on platforms without an implemented source, or when the
+/// OS source fails, so callers can fall back explicitly instead of silently
+/// trusting a weaker generator.
+#[cfg(unix)]
+pub fn fill_os_random(bytes: &mut [u8]) -> bool {
+    use std::io::Read;
+    let Ok(mut source) = std::fs::File::open("/dev/urandom") else {
+        return false;
+    };
+    source.read_exact(bytes).is_ok()
+}
+
+/// Fill `bytes` from the operating system's cryptographic entropy source
+/// (`BCryptGenRandom` with the system-preferred RNG).
+#[cfg(windows)]
+pub fn fill_os_random(bytes: &mut [u8]) -> bool {
+    #[link(name = "bcrypt")]
+    unsafe extern "system" {
+        fn BCryptGenRandom(
+            h_algorithm: *mut std::ffi::c_void,
+            pb_buffer: *mut u8,
+            cb_buffer: u32,
+            dw_flags: u32,
+        ) -> i32;
+    }
+    /// `BCRYPT_USE_SYSTEM_PREFERRED_RNG`: use the system-preferred RNG
+    /// without opening an algorithm handle first.
+    const BCRYPT_USE_SYSTEM_PREFERRED_RNG: u32 = 0x0000_0002;
+    let Ok(len) = u32::try_from(bytes.len()) else {
+        return false;
+    };
+    // SAFETY: `bytes` is a valid writable buffer of `len` bytes and the
+    // system-preferred RNG needs no algorithm handle.
+    let status = unsafe {
+        BCryptGenRandom(
+            std::ptr::null_mut(),
+            bytes.as_mut_ptr(),
+            len,
+            BCRYPT_USE_SYSTEM_PREFERRED_RNG,
+        )
+    };
+    status == 0
+}
+
+/// No OS entropy source is implemented on this platform.
+#[cfg(not(any(unix, windows)))]
+pub fn fill_os_random(bytes: &mut [u8]) -> bool {
+    let _ = bytes;
+    false
+}
+
 /// Generate a per-launch 128-bit hex session token for same-realm preload
 /// hardening (defense-in-depth against raw `window.prompt("dn-window:...")`
 /// spoofing; not a substitute for an isolated JS compartment).
+///
+/// The 16 bytes come from the OS cryptographic entropy source
+/// ([`fill_os_random`]) so the token actually carries 128 bits of entropy,
+/// not just 128 bits of length. Only when the OS source is unavailable does
+/// this fall back to mixing the clock, the PID, and `RandomState` hashes —
+/// that fallback is *not* a CSPRNG and is kept solely so token generation
+/// can never fail outright.
 pub fn generate_session_token() -> String {
+    let mut bytes = [0u8; 16];
+    if fill_os_random(&mut bytes) {
+        let mut token = String::with_capacity(32);
+        for byte in bytes {
+            token.push_str(&format!("{byte:02x}"));
+        }
+        return token;
+    }
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos())
@@ -1426,6 +1495,15 @@ mod tests {
             sanitize_window_title(&unicode_boundary, "Fallback"),
             unicode_boundary
         );
+    }
+
+    #[test]
+    fn session_tokens_are_32_lower_hex_and_unique() {
+        let first = generate_session_token();
+        let second = generate_session_token();
+        assert_eq!(first.len(), 32);
+        assert!(first.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+        assert_ne!(first, second);
     }
 
     #[test]
