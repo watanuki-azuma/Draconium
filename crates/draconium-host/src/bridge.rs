@@ -22,9 +22,6 @@
 //! All items in this module are dependency-free pure Rust so they can be
 //! unit-tested on any OS with `rustc --edition 2024 --test`.
 
-use std::collections::hash_map::RandomState;
-use std::hash::{BuildHasher, Hasher};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Prefix marking a bridge command as a host window command rather than an
 /// application command.
@@ -396,10 +393,10 @@ pub enum BridgeCommand<'a> {
 /// (`/dev/urandom` on Unix, `BCryptGenRandom` on Windows).
 ///
 /// Returns `false` on platforms without an implemented source, or when the
-/// OS source fails, so callers can fall back explicitly instead of silently
-/// trusting a weaker generator.
+/// OS source fails; callers treat that as fatal rather than falling back to
+/// a weaker generator (see [`generate_session_token`]).
 #[cfg(unix)]
-pub fn fill_os_random(bytes: &mut [u8]) -> bool {
+fn fill_os_random(bytes: &mut [u8]) -> bool {
     use std::io::Read;
     let Ok(mut source) = std::fs::File::open("/dev/urandom") else {
         return false;
@@ -410,7 +407,7 @@ pub fn fill_os_random(bytes: &mut [u8]) -> bool {
 /// Fill `bytes` from the operating system's cryptographic entropy source
 /// (`BCryptGenRandom` with the system-preferred RNG).
 #[cfg(windows)]
-pub fn fill_os_random(bytes: &mut [u8]) -> bool {
+fn fill_os_random(bytes: &mut [u8]) -> bool {
     #[link(name = "bcrypt")]
     unsafe extern "system" {
         fn BCryptGenRandom(
@@ -441,7 +438,7 @@ pub fn fill_os_random(bytes: &mut [u8]) -> bool {
 
 /// No OS entropy source is implemented on this platform.
 #[cfg(not(any(unix, windows)))]
-pub fn fill_os_random(bytes: &mut [u8]) -> bool {
+fn fill_os_random(bytes: &mut [u8]) -> bool {
     let _ = bytes;
     false
 }
@@ -452,31 +449,30 @@ pub fn fill_os_random(bytes: &mut [u8]) -> bool {
 ///
 /// The 16 bytes come from the OS cryptographic entropy source
 /// ([`fill_os_random`]) so the token actually carries 128 bits of entropy,
-/// not just 128 bits of length. Only when the OS source is unavailable does
-/// this fall back to mixing the clock, the PID, and `RandomState` hashes —
-/// that fallback is *not* a CSPRNG and is kept solely so token generation
-/// can never fail outright.
+/// not just 128 bits of length.
+///
+/// # Panics
+/// Panics when the OS entropy source is unavailable. Issuing a token from a
+/// weaker, guessable generator (clock/PID/hash mixing) would silently
+/// downgrade the only authentication on privileged bridge commands, so
+/// token generation is deliberately fail-closed: the host must not start
+/// its privileged IPC with a token an attacker could predict.
 pub fn generate_session_token() -> String {
     let mut bytes = [0u8; 16];
-    if fill_os_random(&mut bytes) {
-        let mut token = String::with_capacity(32);
-        for byte in bytes {
-            token.push_str(&format!("{byte:02x}"));
-        }
-        return token;
+    assert!(
+        fill_os_random(&mut bytes),
+        "OS entropy source unavailable; refusing to issue a guessable session token"
+    );
+    session_token_from_bytes(&bytes)
+}
+
+/// Hex-encode 16 entropy bytes as the 32-character session token.
+fn session_token_from_bytes(bytes: &[u8; 16]) -> String {
+    let mut token = String::with_capacity(32);
+    for byte in bytes {
+        token.push_str(&format!("{byte:02x}"));
     }
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let pid = std::process::id();
-    let mut h1 = RandomState::new().build_hasher();
-    h1.write_u128(nanos);
-    h1.write_u32(pid);
-    let mut h2 = RandomState::new().build_hasher();
-    h2.write_u64(h1.finish());
-    h2.write_u128(nanos.rotate_left(37));
-    format!("{:016x}{:016x}", h1.finish(), h2.finish())
+    token
 }
 
 /// Constant-time equality check for ASCII session tokens.
@@ -1502,8 +1498,17 @@ mod tests {
         let first = generate_session_token();
         let second = generate_session_token();
         assert_eq!(first.len(), 32);
-        assert!(first.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+        assert!(
+            first
+                .chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+        );
         assert_ne!(first, second);
+        let known: [u8; 16] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
+        assert_eq!(
+            session_token_from_bytes(&known),
+            "000102030405060708090a0b0c0d0e0f"
+        );
     }
 
     #[test]
