@@ -21,12 +21,12 @@ Windows WebView2（`wry`）実装は比較基準として `probes/webview2/` に
 - **独立レンダリングエンジン**: Servo 0.8.0（Stylo 0.23 / WebRender 0.70 / SpiderMonkey）を単一ポータブル実行ファイル（約 `112 MiB`）へ統合。`HostConfig::with_backdrop_filter` による GPU CSS `backdrop-filter` にも対応。
 - **再利用可能な Rust ホストライブラリクレート**: 独立クレート [`crates/draconium-host`](crates/draconium-host/Cargo.toml) に `HostConfig` / `WindowConfig` / `HostHandler` / `Capabilities` / `EmbeddedAsset` / `run` を集約（詳細は [docs/host-api.md](docs/host-api.md)・最小サンプル [`examples/hello.rs`](crates/draconium-host/examples/hello.rs)）。
 - **任意のネイティブメディア**: Servo 0.8.0 の `media-gstreamer` Cargo feature で GStreamer の音声／動画バックエンドを有効化できます。既定の `DummyBackend` は GStreamer DLL を含みません。詳細は [docs/media-gstreamer.md](docs/media-gstreamer.md)。
-- **クロスプラットフォーム CI**: push / pull request ごとに Ubuntu・macOS・Windows で検証します。macOS / Linux の GUI 描画はデスクトップでの実行検証が今後必要です。
+- **クロスプラットフォーム CI**: push / pull request ごとに Ubuntu・macOS・Windows で `scripts/verify-ci.py`（rustfmt・cargo metadata・JS 構文・Markdown リンク・純 Rust 単体テスト・OS 統合ハーネス `-D warnings`）を実行します。`host.rs` / `input.rs` を含む Servo フルコンパイルは手動 `servo-build.yml` と Windows ローカル検証（`scripts/verify-windows.ps1 -Build`）で行います。macOS / Linux の GUI 描画はデスクトップでの実行検証が今後必要です。
 - **多層セキュリティ境界**:
-  - `dn://app/` カスタムスキーム（ディレクトリトラバーサル防止、アプリ側供給の `EmbeddedAsset` 単一バイナリ埋め込みフォールバック、厳格 `Content-Security-Policy` ヘッダ付与、`--csp-wasm` 対応）。
-  - アプリ毎の宣言的 [`Capabilities`](crates/draconium-host/src/policy.rs) ACL と、子ウィンドウ（`openChild` / `window.open`）への自動権限減衰。
-  - 起動毎 128-bit セッショントークン認証と、再帰的に `Object.freeze` された `window.Draconium` プリロードブリッジ。
-  - 外部遷移ガード（`dn://app/`・ローカル `file://`［UNC 拒否］・`about:blank`・明示指定 `--dev-url` ループバックのみ許可）。
+  - `dn://app/` カスタムスキーム（ディレクトリトラバーサル防止、アプリ側供給の `EmbeddedAsset` 単一バイナリ埋め込みフォールバック、HTML / SVG / XML への厳格 `Content-Security-Policy` ヘッダ付与、`--csp-wasm` 対応）。
+  - 初期オリジンに紐付く宣言的 [`Capabilities`](crates/draconium-host/src/policy.rs) ACL と、子ウィンドウ（`openChild` / `window.open`）への自動権限減衰。
+  - 起動毎 128-bit セッショントークン認証と、初期オリジン限定で注入される再帰的 `Object.freeze` 済み `window.Draconium` プリロードブリッジ。
+  - 外部遷移ガード（`dn://app/`・初期ディレクトリ配下のローカル `file://`［`dn://` 起動時や UNC / 上位・兄弟ディレクトリは拒否］・`about:blank`・明示指定 `--dev-url` ループバックのみ許可）。
 - **ネイティブデスクトップ統合（Windows 実機検証済み・macOS / Linux `std` バックエンド実装済み）**:
   - 枠なしカスタムクローム（`drag`・8 方向 `dragResize`・最小化／最大化・フルスクリーン / F11・透過角丸シェル）、システムトレイ（`--tray`・Windows）、グローバルホットキー（`--hotkey`・Windows）、単一インスタンス引数転送（Windows `WM_COPYDATA` / macOS・Linux Unix ドメインソケット）。
   - ネイティブファイル／フォルダ選択・保存ダイアログ、ケーパビリティトークン付きファイル D&D（`dn:file-drop`）、リッチクリップボード（Text / HTML は全 OS、`CF_DIB` 画像は Windows、PNG 画像は macOS/Linux）、カスタム URI スキーム登録（Windows / Linux）、DPAPI `safeStorage`（Windows）、デスクトップ通知、自動起動（`HKCU` / `LaunchAgents` / XDG `.desktop`）、OS ライト／ダークテーマ追随、実行時プラットフォーム機能照会（`Draconium.window.getPlatform()`・詳細は [docs/cross-platform.md](docs/cross-platform.md)）。

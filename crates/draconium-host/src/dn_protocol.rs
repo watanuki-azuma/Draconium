@@ -13,10 +13,10 @@
 //! - Serves safe nested paths under `asset_root` (`dn://app/assets/...`),
 //!   verifying canonical path confinement inside `root_canon` to prevent
 //!   symlink or junction escapes.
-//! - Falls back to compiled-in [`protocol::EMBEDDED_ASSETS`] when `asset_root`
-//!   is `None` or a core sample file is not overridden on disk.
+//! - Falls back to caller-supplied `embedded_assets` ([`protocol::EmbeddedAsset`])
+//!   when `asset_root` is `None` or a file is not overridden on disk.
 //! - Injects `X-Content-Type-Options: nosniff` on all responses and the default
-//!   `Content-Security-Policy` header on HTML documents.
+//!   `Content-Security-Policy` header on HTML, SVG, and XML documents.
 
 use std::future::Future;
 use std::path::PathBuf;
@@ -89,7 +89,12 @@ impl DnAssetHandler {
         if let Ok(nosniff) = "nosniff".parse() {
             response.headers.insert("x-content-type-options", nosniff);
         }
-        if mime.starts_with("text/html")
+        let needs_csp = mime.starts_with("text/html")
+            || mime.starts_with("image/svg+xml")
+            || mime.starts_with("application/xhtml+xml")
+            || mime.starts_with("text/xml")
+            || mime.starts_with("application/xml");
+        if needs_csp
             && let Some(csp) = &self.csp_header
             && let Ok(csp_val) = csp.parse()
         {

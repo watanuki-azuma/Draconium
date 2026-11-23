@@ -415,12 +415,13 @@ impl FileAccessRegistry {
         token
     }
 
-    /// Register a batch of paths and return a JSON array of
-    /// `{"token":"...","name":"...","size":123}` descriptors (basename only,
-    /// no directory path disclosure).
+    /// Register a batch of paths (at most `MAX_CAPABILITY_TOKENS` entries so no
+    /// returned token is immediately evicted before the caller receives the batch)
+    /// and return a JSON array of `{"token":"...","name":"...","size":123}`
+    /// descriptors (basename only, no directory path disclosure).
     pub fn register_batch_json(&mut self, paths: &[PathBuf]) -> String {
-        let mut items = Vec::with_capacity(paths.len());
-        for path in paths {
+        let mut items = Vec::with_capacity(paths.len().min(MAX_CAPABILITY_TOKENS));
+        for path in paths.iter().take(MAX_CAPABILITY_TOKENS) {
             let token = self.register(path.clone());
             let name = path
                 .file_name()
@@ -2660,6 +2661,22 @@ mod tests {
 
         let _ = std::fs::remove_file(&file);
         let _ = std::fs::remove_dir(&dir);
+
+        // A batch larger than MAX_CAPABILITY_TOKENS is capped at MAX_CAPABILITY_TOKENS
+        // so that every returned token remains valid at the moment of return.
+        let mut batch_reg = FileAccessRegistry::new();
+        let many: Vec<PathBuf> = (0..(MAX_CAPABILITY_TOKENS + 6))
+            .map(|i| PathBuf::from(format!("/tmp/batch-{i}.txt")))
+            .collect();
+        let batch_json = batch_reg.register_batch_json(&many);
+        assert_eq!(batch_reg.order.len(), MAX_CAPABILITY_TOKENS);
+        assert!(batch_json.contains("\"batch-0.txt\""));
+        assert!(!batch_json.contains(&format!("\"batch-{MAX_CAPABILITY_TOKENS}.txt\"")));
+        let tokens: Vec<String> = batch_reg.order.iter().cloned().collect();
+        assert_eq!(tokens.len(), MAX_CAPABILITY_TOKENS);
+        for tok in tokens {
+            assert!(batch_reg.resolve_path(&tok).is_ok());
+        }
     }
 
     #[test]

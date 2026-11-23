@@ -37,7 +37,7 @@ Folio is a local-first Markdown workspace running on **Draconium** — a lightwe
 ```rust\n\
 let config = HostConfig::new(\"Draconium Folio\", url)\n\
     .with_window(WindowConfig::custom_chrome(1240, 800))\n\
-    .with_capabilities(Capabilities::workspace_defaults());\n\
+    .with_capabilities(Capabilities::standard_desktop());\n\
 host::run(config, WorkspaceApp::new(data_dir), None)?;\n\
 ```\n",
     ),
@@ -638,24 +638,45 @@ fn atomic_write(
     fs::create_dir_all(dir)?;
     let tmp = dir.join(tmp_name);
     fs::write(&tmp, content.as_bytes())?;
-    match fs::rename(&tmp, dst) {
-        Ok(()) => Ok(()),
-        Err(first_err) => {
-            if dst.is_file() {
-                let _ = fs::remove_file(dst);
-                match fs::rename(&tmp, dst) {
-                    Ok(()) => Ok(()),
-                    Err(second_err) => {
-                        let _ = fs::remove_file(&tmp);
-                        Err(second_err)
-                    }
-                }
+    let replace_res = {
+        #[cfg(windows)]
+        {
+            use std::os::windows::ffi::OsStrExt;
+            #[link(name = "kernel32")]
+            unsafe extern "system" {
+                fn MoveFileExW(
+                    lp_existing_file_name: *const u16,
+                    lp_new_file_name: *const u16,
+                    dw_flags: u32,
+                ) -> i32;
+            }
+            const MOVEFILE_REPLACE_EXISTING: u32 = 0x0000_0001;
+            const MOVEFILE_WRITE_THROUGH: u32 = 0x0000_0008;
+            let src_w: Vec<u16> = tmp.as_os_str().encode_wide().chain([0]).collect();
+            let dst_w: Vec<u16> = dst.as_os_str().encode_wide().chain([0]).collect();
+            let ok = unsafe {
+                MoveFileExW(
+                    src_w.as_ptr(),
+                    dst_w.as_ptr(),
+                    MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+                )
+            };
+            if ok != 0 {
+                Ok(())
             } else {
-                let _ = fs::remove_file(&tmp);
-                Err(first_err)
+                Err(std::io::Error::last_os_error())
             }
         }
+        #[cfg(not(windows))]
+        {
+            fs::rename(&tmp, dst)
+        }
+    };
+    if let Err(err) = replace_res {
+        let _ = fs::remove_file(&tmp);
+        return Err(err);
     }
+    Ok(())
 }
 
 fn json_escape(input: &str) -> String {

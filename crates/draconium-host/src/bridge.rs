@@ -704,6 +704,372 @@ pub fn allows_navigation_with_dev(url: &str, dev_origin: Option<&DevOrigin>) -> 
     dev_origin.is_some_and(|dev| dev.matches_url(url))
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum InitialOrigin {
+    DnApp,
+    Http {
+        scheme: &'static str,
+        host_lower: String,
+        port: u16,
+    },
+    File {
+        segments: Vec<String>,
+        base_dir_len: usize,
+        windows_drive: bool,
+    },
+}
+
+fn decode_percent_segment_strict(raw: &str) -> Option<String> {
+    if raw.contains('\\') || raw.contains('\0') {
+        return None;
+    }
+    let bytes = raw.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            let hi = bytes.get(i + 1).copied()?;
+            let lo = bytes.get(i + 2).copied()?;
+            let hex = [hi, lo];
+            let hex_str = std::str::from_utf8(&hex).ok()?;
+            let decoded = u8::from_str_radix(hex_str, 16).ok()?;
+            if matches!(decoded, 0 | b'/' | b'\\') {
+                return None;
+            }
+            out.push(decoded);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8(out).ok()
+}
+
+fn parse_file_url_parts(url: &str) -> Option<(Vec<String>, bool, bool)> {
+    if url.is_empty() || url.chars().any(|ch| ch.is_control() || ch == '\\') {
+        return None;
+    }
+    let (scheme, rest) = url.split_once(':')?;
+    if !scheme.eq_ignore_ascii_case("file") {
+        return None;
+    }
+    let after_slashes = rest.strip_prefix("//")?;
+    let before_qf = after_slashes.split(['?', '#']).next().unwrap_or("");
+    let slash_idx = before_qf.find('/')?;
+    let authority = &before_qf[..slash_idx];
+    if !authority.is_empty() && !authority.eq_ignore_ascii_case("localhost") {
+        return None;
+    }
+    let path_part = &before_qf[slash_idx..];
+    let trailing_slash = path_part.ends_with('/');
+    let mut segments = Vec::new();
+    for raw_seg in path_part.split('/') {
+        if raw_seg.is_empty() {
+            continue;
+        }
+        let decoded = decode_percent_segment_strict(raw_seg)?;
+        if decoded.is_empty()
+            || decoded == "."
+            || decoded == ".."
+            || decoded.contains('/')
+            || decoded.contains('\\')
+            || decoded.contains('\0')
+        {
+            return None;
+        }
+        segments.push(decoded);
+    }
+    if segments.is_empty() {
+        return None;
+    }
+    let windows_drive = segments.first().is_some_and(|first| {
+        first.len() == 2 && first.as_bytes()[0].is_ascii_alphabetic() && first.as_bytes()[1] == b':'
+    });
+    Some((segments, trailing_slash, windows_drive))
+}
+
+fn parse_http_origin(url: &str) -> Option<(&'static str, String, u16)> {
+    if url.is_empty()
+        || url
+            .chars()
+            .any(|ch| ch.is_control() || ch.is_whitespace() || ch == '\\' || ch == '@')
+    {
+        return None;
+    }
+    let (scheme_raw, rest) = url.split_once("://")?;
+    let (scheme, default_port) = if scheme_raw.eq_ignore_ascii_case("http") {
+        ("http", 80u16)
+    } else if scheme_raw.eq_ignore_ascii_case("https") {
+        ("https", 443u16)
+    } else {
+        return None;
+    };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    if authority.is_empty() {
+        return None;
+    }
+    let (host_raw, port) = if let Some(bracket_end) = authority.find(']') {
+        if !authority.starts_with('[') {
+            return None;
+        }
+        let host_slice = &authority[..=bracket_end];
+        let tail = &authority[bracket_end + 1..];
+        let port = if tail.is_empty() {
+            default_port
+        } else if let Some(port_str) = tail.strip_prefix(':') {
+            let parsed = port_str.parse::<u16>().ok()?;
+            if parsed == 0 {
+                return None;
+            }
+            parsed
+        } else {
+            return None;
+        };
+        (host_slice, port)
+    } else if let Some((h, p)) = authority.rsplit_once(':') {
+        let parsed = p.parse::<u16>().ok()?;
+        if parsed == 0 || h.is_empty() {
+            return None;
+        }
+        (h, parsed)
+    } else {
+        (authority, default_port)
+    };
+    Some((scheme, host_raw.to_ascii_lowercase(), port))
+}
+
+fn parse_initial_origin(url: &str) -> Option<InitialOrigin> {
+    let (scheme, rest) = url.split_once(':')?;
+    if scheme.eq_ignore_ascii_case("dn") {
+        let after_slashes = rest.strip_prefix("//")?;
+        let authority = after_slashes.split(['/', '?', '#']).next().unwrap_or("");
+        return authority
+            .eq_ignore_ascii_case("app")
+            .then_some(InitialOrigin::DnApp);
+    }
+    if scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https") {
+        let (scheme_norm, host_lower, port) = parse_http_origin(url)?;
+        return Some(InitialOrigin::Http {
+            scheme: scheme_norm,
+            host_lower,
+            port,
+        });
+    }
+    if scheme.eq_ignore_ascii_case("file") {
+        let (segments, trailing_slash, windows_drive) = parse_file_url_parts(url)?;
+        let base_dir_len = if trailing_slash {
+            segments.len()
+        } else {
+            segments.len().saturating_sub(1)
+        };
+        return Some(InitialOrigin::File {
+            segments,
+            base_dir_len,
+            windows_drive,
+        });
+    }
+    None
+}
+
+fn file_segments_eq(a: &[String], b: &[String], case_insensitive: bool) -> bool {
+    a.len() == b.len()
+        && a.iter().zip(b.iter()).all(|(left, right)| {
+            if case_insensitive {
+                left.eq_ignore_ascii_case(right)
+            } else {
+                left == right
+            }
+        })
+}
+
+/// Return `true` when `current_url` belongs to the same trust origin as
+/// `initial_url`:
+/// - `dn://app/...` matches only `dn://app/...`
+/// - `http(s)://host:port/...` matches exact `(scheme, host, port)`
+/// - `file://...` matches only local `file://` URLs confined under
+///   `initial_url`'s parent directory without traversal segments.
+pub fn url_matches_initial_origin(current_url: &str, initial_url: &str) -> bool {
+    let Some(expected) = parse_initial_origin(initial_url) else {
+        return false;
+    };
+    match expected {
+        InitialOrigin::DnApp => matches!(
+            parse_initial_origin(current_url),
+            Some(InitialOrigin::DnApp)
+        ),
+        InitialOrigin::Http {
+            scheme,
+            host_lower,
+            port,
+        } => {
+            matches!(
+                parse_http_origin(current_url),
+                Some((cur_scheme, cur_host, cur_port))
+                    if cur_scheme == scheme && cur_host == host_lower && cur_port == port
+            )
+        }
+        InitialOrigin::File {
+            segments: init_segs,
+            base_dir_len,
+            windows_drive,
+        } => {
+            let Some((cur_segs, _trailing, cur_win_drive)) = parse_file_url_parts(current_url)
+            else {
+                return false;
+            };
+            if windows_drive != cur_win_drive {
+                return false;
+            }
+            if file_segments_eq(&cur_segs, &init_segs, windows_drive) {
+                return true;
+            }
+            if base_dir_len == 0 || cur_segs.len() <= base_dir_len {
+                return false;
+            }
+            file_segments_eq(
+                &cur_segs[..base_dir_len],
+                &init_segs[..base_dir_len],
+                windows_drive,
+            )
+        }
+    }
+}
+
+/// Origin-bound navigation policy:
+/// - rejects non-local / invalid URLs via [`allows_navigation_with_dev`]
+/// - confines `file://` targets to `initial_url`'s directory (when
+///   `initial_url` itself uses `file://`; `dn://app/` apps cannot navigate to
+///   arbitrary local `file://` documents)
+/// - permits `dn://app/`, `about:blank`, and the active loopback `--dev-url`.
+pub fn allows_navigation_for_origin(
+    target_url: &str,
+    initial_url: &str,
+    dev_origin: Option<&DevOrigin>,
+) -> bool {
+    if !allows_navigation_with_dev(target_url, dev_origin) {
+        return false;
+    }
+    if let Some((scheme, _)) = target_url.split_once(':')
+        && scheme.eq_ignore_ascii_case("file")
+    {
+        return matches!(
+            parse_initial_origin(initial_url),
+            Some(InitialOrigin::File { .. })
+        ) && url_matches_initial_origin(target_url, initial_url);
+    }
+    true
+}
+
+/// Render [`PRELOAD_SCRIPT`] wrapped in an origin guard matching `initial_url`,
+/// preventing navigated foreign-origin documents from receiving
+/// `window.Draconium` or the launch session token.
+pub fn render_preload_script_for_origin(session_token: &str, initial_url: &str) -> String {
+    let Some(expected) = parse_initial_origin(initial_url) else {
+        return "(() => {})();".to_owned();
+    };
+    let guard_expr = match expected {
+        InitialOrigin::DnApp => concat!(
+            "(() => {",
+            " if (typeof window === \"undefined\" || window.top !== window) return false;",
+            " const href = String((window.location && window.location.href) || \"\");",
+            " return /^dn:\\/\\/app(?:\\/|$|\\?|#)/i.test(href);",
+            " })()"
+        )
+        .to_owned(),
+        InitialOrigin::Http {
+            scheme,
+            host_lower,
+            port,
+        } => {
+            let proto = format!("{scheme}:");
+            let unbracketed = host_lower
+                .strip_prefix('[')
+                .and_then(|s| s.strip_suffix(']'))
+                .unwrap_or(&host_lower)
+                .to_owned();
+            let default_port = if scheme == "https" { "443" } else { "80" };
+            let port_str = port.to_string();
+            format!(
+                concat!(
+                    "(() => {{",
+                    " if (typeof window === \"undefined\" || window.top !== window) return false;",
+                    " const loc = window.location;",
+                    " if (!loc || String(loc.protocol || \"\").toLowerCase() !== {proto}) return false;",
+                    " const host = String(loc.hostname || \"\").toLowerCase();",
+                    " if (host !== {host_lit} && host !== {unbracketed_lit}) return false;",
+                    " const port = String(loc.port || {default_port});",
+                    " return port === {port_lit};",
+                    " }})()"
+                ),
+                proto = js_string_literal(&proto),
+                host_lit = js_string_literal(&host_lower),
+                unbracketed_lit = js_string_literal(&unbracketed),
+                default_port = js_string_literal(default_port),
+                port_lit = js_string_literal(&port_str),
+            )
+        }
+        InitialOrigin::File {
+            segments,
+            base_dir_len,
+            windows_drive,
+        } => {
+            let format_path = |count: usize, trailing_slash: bool| -> String {
+                let mut s = String::from("/");
+                for (idx, seg) in segments.iter().take(count).enumerate() {
+                    if idx > 0 {
+                        s.push('/');
+                    }
+                    if windows_drive {
+                        s.push_str(&seg.to_ascii_lowercase());
+                    } else {
+                        s.push_str(seg);
+                    }
+                }
+                if trailing_slash && count > 0 {
+                    s.push('/');
+                }
+                s
+            };
+            let exact_file = format_path(segments.len(), false);
+            let dir_prefix = if base_dir_len > 0 {
+                format_path(base_dir_len, true)
+            } else {
+                String::new()
+            };
+            format!(
+                concat!(
+                    "(() => {{",
+                    " if (typeof window === \"undefined\" || window.top !== window) return false;",
+                    " const loc = window.location;",
+                    " if (!loc || String(loc.protocol || \"\").toLowerCase() !== \"file:\") return false;",
+                    " const host = String(loc.hostname || \"\").toLowerCase();",
+                    " if (host !== \"\" && host !== \"localhost\") return false;",
+                    " try {{",
+                    " const rawPath = String(loc.pathname || \"\");",
+                    " if (/%2f|%5c|%00|\\\\/i.test(rawPath)) return false;",
+                    " const decoded = decodeURIComponent(rawPath);",
+                    " if (decoded.indexOf(\"\\\\\") !== -1 || decoded.indexOf(\"\\0\") !== -1) return false;",
+                    " const segs = decoded.split(\"/\").filter((s) => s.length > 0);",
+                    " if (segs.some((s) => s === \".\" || s === \"..\")) return false;",
+                    " const normRaw = \"/\" + segs.join(\"/\");",
+                    " const norm = {win_drive} ? normRaw.toLowerCase() : normRaw;",
+                    " if (norm === {exact_file}) return true;",
+                    " const dirPrefix = {dir_prefix};",
+                    " return dirPrefix.length > 0 && norm.startsWith(dirPrefix) && norm.length > dirPrefix.length;",
+                    " }} catch (_) {{ return false; }}",
+                    " }})()"
+                ),
+                win_drive = if windows_drive { "true" } else { "false" },
+                exact_file = js_string_literal(&exact_file),
+                dir_prefix = js_string_literal(&dir_prefix),
+            )
+        }
+    };
+    let inner = render_preload_script(session_token);
+    format!("(() => {{\n  if (!({guard_expr})) return;\n{inner}\n}})();")
+}
+
 /// Render [`PRELOAD_SCRIPT`] with the per-launch session token injected into
 /// its private closure.
 pub fn render_preload_script(session_token: &str) -> String {
@@ -1681,5 +2047,134 @@ mod tests {
         let async_script = resolve_async_script(9, true, "{\"ok\":1}", true);
         assert!(async_script.starts_with("window.__draconiumResolveAsync"));
         assert!(async_script.contains("9, true,"));
+    }
+
+    #[test]
+    fn origin_matching_navigation_and_preload_guard() {
+        // 1. dn://app/
+        assert!(url_matches_initial_origin(
+            "dn://app/other.html?v=1#top",
+            "dn://app/workspace.html"
+        ));
+        assert!(!url_matches_initial_origin(
+            "file:///C:/app/ui/workspace.html",
+            "dn://app/workspace.html"
+        ));
+        assert!(!url_matches_initial_origin(
+            "about:blank",
+            "dn://app/workspace.html"
+        ));
+        assert!(allows_navigation_for_origin(
+            "dn://app/other.html",
+            "dn://app/workspace.html",
+            None
+        ));
+        assert!(!allows_navigation_for_origin(
+            "file:///C:/Users/Public/evil.html",
+            "dn://app/workspace.html",
+            None
+        ));
+
+        // 2. http(s):// dev origin (exact port normalization and boundary check)
+        let dev = DevOrigin::parse("http://127.0.0.1:5173").unwrap();
+        assert!(url_matches_initial_origin(
+            "http://127.0.0.1:5173/sub/page.html",
+            "http://127.0.0.1:5173/index.html"
+        ));
+        assert!(!url_matches_initial_origin(
+            "http://127.0.0.1:51730/index.html",
+            "http://127.0.0.1:5173/index.html"
+        ));
+        assert!(!url_matches_initial_origin(
+            "http://localhost:5173/index.html",
+            "http://127.0.0.1:5173/index.html"
+        ));
+        assert!(!url_matches_initial_origin(
+            "file:///C:/app/ui/index.html",
+            "http://127.0.0.1:5173/index.html"
+        ));
+        assert!(allows_navigation_for_origin(
+            "http://127.0.0.1:5173/app.html",
+            "http://127.0.0.1:5173/index.html",
+            Some(&dev)
+        ));
+        assert!(!allows_navigation_for_origin(
+            "file:///C:/app/ui/index.html",
+            "http://127.0.0.1:5173/index.html",
+            Some(&dev)
+        ));
+
+        // 3. file:// directory confinement (sibling, traversal, UNC, root safety)
+        let win_init = "file:///C:/app/ui/workspace.html";
+        assert!(url_matches_initial_origin(
+            "file:///c:/App/UI/other.html#frag",
+            win_init
+        ));
+        assert!(url_matches_initial_origin(
+            "file://localhost/C:/app/ui/sub/panel.html",
+            win_init
+        ));
+        assert!(!url_matches_initial_origin(
+            "file:///C:/app/ui-evil/evil.html",
+            win_init
+        ));
+        assert!(!url_matches_initial_origin(
+            "file:///C:/app/secret.html",
+            win_init
+        ));
+        assert!(!url_matches_initial_origin(
+            "file:///C:/app/ui/%2e%2e/secret.html",
+            win_init
+        ));
+        assert!(!url_matches_initial_origin(
+            "file:///C:/app/ui/a%2f..%2fsecret.html",
+            win_init
+        ));
+        assert!(!url_matches_initial_origin(
+            "file://attacker/share/workspace.html",
+            win_init
+        ));
+        assert!(!url_matches_initial_origin(
+            "dn://app/workspace.html",
+            win_init
+        ));
+        assert!(allows_navigation_for_origin(
+            "file:///C:/app/ui/other.html",
+            win_init,
+            None
+        ));
+        assert!(!allows_navigation_for_origin(
+            "file:///C:/Users/Downloads/evil.html",
+            win_init,
+            None
+        ));
+
+        let unix_init = "file:///home/alice/app/ui/index.html";
+        assert!(url_matches_initial_origin(
+            "file:///home/alice/app/ui/panel.html",
+            unix_init
+        ));
+        assert!(!url_matches_initial_origin(
+            "file:///home/alice/app/UI/panel.html",
+            unix_init
+        ));
+
+        // 4. Preload script guards
+        let dn_preload = render_preload_script_for_origin("tok123", "dn://app/workspace.html");
+        assert!(dn_preload.contains("window.top !== window"));
+        assert!(dn_preload.contains("dn:\\/\\/app"));
+        assert!(dn_preload.contains("\"tok123\""));
+
+        let file_preload = render_preload_script_for_origin("tok456", win_init);
+        assert!(file_preload.contains("\"/c:/app/ui/\""));
+        assert!(file_preload.contains("\"tok456\""));
+
+        let http_preload =
+            render_preload_script_for_origin("tok789", "http://127.0.0.1:5173/index.html");
+        assert!(http_preload.contains("\"5173\""));
+        assert!(http_preload.contains("\"tok789\""));
+
+        let blank_preload = render_preload_script_for_origin("secret_tok", "about:blank");
+        assert!(!blank_preload.contains("secret_tok"));
     }
 }

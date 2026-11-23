@@ -70,7 +70,7 @@ pub use url::Url;
 pub use crate::bridge::DevOrigin;
 pub use crate::host::{
     HostConfig, HostHandler, WindowConfig, resolve_app_url, resolve_app_url_from, resolve_ui_path,
-    resolve_ui_path_from, run,
+    resolve_ui_path_from, run, try_resolve_app_url_from,
 };
 pub use crate::policy::{AllowedAppCommands, Capabilities, Capability};
 pub use crate::protocol::{APP_AUTHORITY, DEFAULT_CSP, EmbeddedAsset, SCHEME, asset_url};

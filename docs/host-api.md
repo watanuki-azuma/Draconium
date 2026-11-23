@@ -32,8 +32,8 @@ Native GStreamer media is opt-in: add `features = ["media-gstreamer"]` to the `d
 | `Capabilities` | Declarative per-app security ACL (`Capabilities::restricted()`, `Capabilities::standard_desktop()`, fluent `with_*` builders, `attenuate_for_child()`). |
 | `EmbeddedAsset` | `{ path: &'static str, bytes: &'static [u8] }` entry supplied via `HostConfig::with_embedded_assets(...)` for single-binary `dn://app/` fallback. |
 | `resolve_ui_path_from(base_dir, exe_rel, manifest_rel)` | Resolves UI files relative to the executable first (portable distributions), then current working directory, then `base_dir` (typically `Path::new(env!("CARGO_MANIFEST_DIR"))`). |
-| `resolve_app_url_from(base_dir, dn_assets, dev_url, file_name, exe_rel, manifest_rel)` | Resolves `--dev-url`, `dn://app/<file>` (with compiled-in fallback), or local `file://` startup URL and optional `asset_root`. |
-| `run(config, handler, self_test)` | Starts the winit event loop and embedded Servo 0.8.0 runtime. |
+| `resolve_app_url_from(...)` / `try_resolve_app_url_from(...)` | Resolves `--dev-url` (validating a loopback `http://` `DevOrigin`), `dn://app/<file>` (with compiled-in fallback), or local `file://` startup URL and optional `asset_root`. Use `try_resolve_app_url_from` when handling untrusted URL input without panicking. |
+| `run(config, handler, self_test)` | Validates configuration (including loopback enforcement on `devtools_addr`) and starts the winit event loop and embedded Servo 0.8.0 runtime. |
 | `platform::*` | Runtime capability introspection (`PlatformCapabilities`, `platform_capabilities`) and validation/parsing helpers (`parse_hotkey`, `opacity_to_alpha`, `validate_custom_uri_scheme`, `validate_devtools_addr`). See [docs/cross-platform.md](cross-platform.md). |
 | Window geometry types | `LogicalSize`, `LogicalPosition`, `Presentation`, `SavedWindowState`, `DEFAULT_WINDOW_SIZE`, `CHIPS_SIZE`, `FLYOUT_SIZE`. |
 
@@ -96,7 +96,7 @@ run(config, MyHandler::new(data_dir), None)?;
 ```
 
 Additional builders:
-- `.with_devtools(Option<String>)`: loopback-only Firefox DevTools RDP (`127.0.0.1:<port>`)
+- `.with_devtools(Option<String>)`: loopback-only Firefox DevTools RDP (`127.0.0.1:<port>`, `localhost:<port>`, or `[::1]:<port>` — validated in `run()` for library callers too)
 - `.with_screenshot(Option<PathBuf>)`: automated first-paint PNG capture and non-blank analysis
 - `.with_deep_link(Option<String>)` / `.with_raw_args(Vec<String>)`: custom URI scheme startup and single-instance forwarding
 - `.with_dev_origin(Option<DevOrigin>)`: loopback dev server origin allowed by `--dev-url`
@@ -137,12 +137,15 @@ pub trait HostHandler {
 
 ## 3. Security Boundaries & `Capabilities` ACL
 
-All privileged operations are gated by [`crates/draconium-host/src/policy.rs`](../crates/draconium-host/src/policy.rs) and a per-launch 128-bit session token:
+All privileged operations are gated by [`crates/draconium-host/src/policy.rs`](../crates/draconium-host/src/policy.rs), OS CSPRNG-backed 128-bit per-launch session-token authentication, and initial-origin binding:
 
-- **Application command allowlist**: Only command names listed in `Capabilities.allowed_app_commands` reach `HostHandler::handle_request`.
-- **Child window attenuation**: Secondary windows created via `window.open` or `Draconium.window.openChild` (up to 4 windows, restricted to local `dn://app/` or `file://`) automatically receive `Capabilities::attenuate_for_child()`, stripping file access, clipboard, DPAPI, autostart, session control, and application commands.
-- **Navigation & permissions**: `request_navigation` allows only `dn://app/`, local `file://` (UNC paths rejected), `about:blank`, and an explicitly configured loopback `--dev-url`. `request_permission` denies all requests by default.
-- **`dn://app/` serving & strict CSP**: [`crates/draconium-host/src/protocol.rs`](../crates/draconium-host/src/protocol.rs) and [`crates/draconium-host/src/dn_protocol.rs`](../crates/draconium-host/src/dn_protocol.rs) reject directory traversal/dotfiles, confine disk lookups via `canonicalize()`, fall back to caller-supplied `EmbeddedAsset` bytes, and attach `Content-Security-Policy` (`default-src 'self' dn://app; script-src 'self' dn://app; style-src 'self' dn://app; ...; object-src 'none'`) plus `X-Content-Type-Options: nosniff`.
+- **Origin-bound capabilities & preload**: `window.Draconium` preload injection (`bridge::render_preload_script_for_origin`) and host `prompt()` handling (`bridge::url_matches_initial_origin`) are bound to the window's initial launch origin (`dn://app/`, the configured loopback `--dev-url`, or the initial `file://` directory). Documents outside that origin (including `about:blank` or foreign local files) receive no preload bridge and cannot invoke window or application bridge commands.
+- **`window.prompt()` bridge semantics**: Draconium intercepts all `window.prompt()` calls in hosted WebViews (standard browser text prompts are not used). The per-launch session token (`dn-tok:<nonce>:`) authenticates `dn-window:*`, `dn-window-async:*`, and `dn-app-async:*` calls from the frozen preload, while synchronous `Draconium.invoke` app commands are further constrained to `Capabilities.allowed_app_commands` on initial-origin top-level pages.
+- **File access tokens**: `Draconium.files.readText*` / `readBase64*` are permitted when **either** `Capabilities.allow_file_drop` **or** `Capabilities.allow_file_dialogs` is enabled, and only read OS-issued `dnfile-<rand64>-<id>` tokens (per-token 64-bit OS random component; drop/dialog batches are capped at 64 entries per batch so all returned tokens remain live).
+- **Child window attenuation & close behavior**: Secondary windows created via `window.open` or `Draconium.window.openChild` (up to 4 windows, restricted by origin policy and routed async replies strictly by target `WindowId`) automatically receive `Capabilities::attenuate_for_child()`, stripping file access, clipboard, DPAPI, autostart, session control, and application commands. Child windows close immediately on OS close or `dn-window:close` without invoking `__draconiumBeforeClose` (reserved for the primary window).
+- **Navigation & permissions**: `request_navigation` allows only `dn://app/`, `about:blank`, an explicitly configured loopback `--dev-url`, and local `file://` URLs under `initial_url`'s directory when launched in `file://` mode (UNC paths and cross-directory `file://` escapes are rejected). `request_permission` denies all requests by default.
+- **`dn://app/` serving & CSP**: [`crates/draconium-host/src/protocol.rs`](../crates/draconium-host/src/protocol.rs) and [`crates/draconium-host/src/dn_protocol.rs`](../crates/draconium-host/src/dn_protocol.rs) reject directory traversal/dotfiles, confine disk lookups via `canonicalize()`, fall back to caller-supplied `EmbeddedAsset` bytes, attach `X-Content-Type-Options: nosniff`, and attach strict `Content-Security-Policy` headers on HTML, SVG, and XML documents (`default-src 'self' dn://app; script-src 'self' dn://app; style-src 'self' dn://app; ...; object-src 'none'`). Note that `file://` mode does not inject HTTP CSP headers — prefer `dn://app/` for packaged apps.
+- **Single-instance forwarding trust boundary**: Unix single-instance IPC uses `0700` user directories, `0600` sockets/locks, and UID checks (`unix_platform.rs`). Windows `WM_COPYDATA` second-instance/deep-link forwarding does not authenticate sender identity beyond the desktop session, so apps should treat forwarded arguments and deep links as untrusted local input.
 
 ---
 
@@ -181,6 +184,7 @@ Injected automatically before page scripts via `UserContentManager` and recursiv
 - `setTitle(title)` sets an explicit per-window title that survives page title changes. An empty or whitespace-only title clears the override and restores that window's configured title. When there is no override, page title notifications can update the native title.
 - `focus()` and `setAlwaysOnTop(enabled)` are best effort on Wayland. The compositor can ignore activation or stacking requests.
 - `isFullscreen()` reports the observed fullscreen state as "true" or "false". Subscribe to `fullscreen-changed` for observed changes and query `isFullscreen()` on page load to initialize custom chrome.
+- `Draconium.session.listSiteData()` returns the cached snapshot synchronously while queuing a background refresh; use `Draconium.session.listSiteDataAsync()` when you need an up-to-date listing directly from Servo's `SiteDataManager`.
 
 ### 4.3 Custom Frameless Window Chrome
 

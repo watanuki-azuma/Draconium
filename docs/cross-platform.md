@@ -78,9 +78,9 @@ No additional Rust crates are required for the OS utility backends on macOS or L
   - External URLs: `xdg-open` (`xdg-utils`)
   - URI scheme registration: XDG applications `.desktop` entries, with best-effort `xdg-mime` and `update-desktop-database` refreshes
   - System theme: `gsettings` (falling back to `GTK_THEME`)
-- **Single-instance Unix sockets**:
-  - Uses two separate local domain sockets (`0o600` permissions) under an absolute `$XDG_RUNTIME_DIR` (or user-scoped `$TMPDIR` / `/tmp` fallback): `dn-<id>.lock.sock` for atomic single-instance exclusion and `dn-<id>.sock` for second-instance JSON payload forwarding (up to 64 KiB, with brief startup connect retries).
-  - Long identifiers are deterministically hash-shortened so paths always remain strictly below macOS's 104-byte `sun_path` limit, and stale sockets from crashed processes are cleaned up only when `connect()` returns `ConnectionRefused`.
+- **Single-instance Unix locks & IPC sockets**:
+  - Uses `0o600` advisory file locks (`File::try_lock()`) alongside a local domain socket (`0o600`) inside a private `0o700` user directory (`$XDG_RUNTIME_DIR` when absolute and within path limits, otherwise `/tmp/dn-<uid>`): `dn-<id>.lock` for single-instance exclusion, an `.ipc.lock` lockfile guarding socket binding/recovery, and `dn-<id>.sock` for second-instance JSON payload forwarding (up to 64 KiB, with brief startup connect retries).
+  - Long identifiers are deterministically hash-shortened so generated socket paths remain at most 96 bytes (fitting POSIX/macOS `sun_path` bounds), and stale sockets from crashed processes are cleaned up only when `AddrInUse` probes return `ConnectionRefused` while holding `.ipc.lock`.
 
 ---
 

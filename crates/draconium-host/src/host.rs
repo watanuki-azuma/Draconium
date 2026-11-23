@@ -158,6 +158,9 @@ impl HostConfig {
         self
     }
 
+    /// Configures the local Firefox DevTools RDP server listen address
+    /// (`127.0.0.1:<port>`, `localhost:<port>`, or `[::1]:<port>`).
+    /// Non-loopback addresses are rejected by [`run`].
     pub fn with_devtools(mut self, devtools_addr: Option<String>) -> Self {
         self.devtools_addr = devtools_addr;
         self
@@ -415,6 +418,38 @@ pub fn resolve_ui_path(exe_relative: &str, manifest_relative: &str) -> PathBuf {
     resolve_ui_path_from(Path::new("."), exe_relative, manifest_relative)
 }
 
+/// Fallible counterpart of [`resolve_app_url_from`] that validates `dev_url`
+/// (requiring a loopback `http://` origin) instead of panicking on invalid input.
+pub fn try_resolve_app_url_from(
+    base_dir: &Path,
+    dn_assets: bool,
+    dev_url: Option<&str>,
+    file_name: &'static str,
+    exe_relative: &str,
+    manifest_relative: &str,
+) -> Result<(Url, Option<PathBuf>), String> {
+    let resolved = resolve_ui_path_from(base_dir, exe_relative, manifest_relative);
+    let canonical = resolved.canonicalize().ok();
+    let root = canonical
+        .as_ref()
+        .and_then(|p| p.parent().map(Path::to_path_buf));
+    if let Some(raw_dev) = dev_url {
+        let origin = DevOrigin::parse(raw_dev)?;
+        let url = Url::parse(&origin.initial_url)
+            .map_err(|err| format!("--dev-url is not a valid URL: {err}"))?;
+        return Ok((url, root));
+    }
+    if dn_assets || canonical.is_none() {
+        let url = Url::parse(&crate::protocol::asset_url(file_name))
+            .map_err(|err| format!("invalid dn:// asset URL: {err}"))?;
+        Ok((url, root))
+    } else {
+        let url = Url::from_file_path(canonical.unwrap())
+            .map_err(|()| "Invalid UI file path".to_owned())?;
+        Ok((url, root))
+    }
+}
+
 /// Resolves an app's startup URL and optional `dn://app/` asset root directory
 /// using the caller crate's `base_dir` (typically `Path::new(env!("CARGO_MANIFEST_DIR"))`):
 /// - `dev_url` (`http://127.0.0.1:<port>/...`) when provided,
@@ -429,23 +464,15 @@ pub fn resolve_app_url_from(
     exe_relative: &str,
     manifest_relative: &str,
 ) -> (Url, Option<PathBuf>) {
-    let resolved = resolve_ui_path_from(base_dir, exe_relative, manifest_relative);
-    let canonical = resolved.canonicalize().ok();
-    let root = canonical
-        .as_ref()
-        .and_then(|p| p.parent().map(Path::to_path_buf));
-    if let Some(raw_dev) = dev_url {
-        let url = Url::parse(raw_dev).expect("validated --dev-url parses");
-        return (url, root);
-    }
-    if dn_assets || canonical.is_none() {
-        let url = Url::parse(&crate::protocol::asset_url(file_name))
-            .expect("static dn:// asset URL parses");
-        (url, root)
-    } else {
-        let url = Url::from_file_path(canonical.unwrap()).expect("Invalid UI file path");
-        (url, root)
-    }
+    try_resolve_app_url_from(
+        base_dir,
+        dn_assets,
+        dev_url,
+        file_name,
+        exe_relative,
+        manifest_relative,
+    )
+    .expect("validated --dev-url or local UI asset resolves")
 }
 
 /// Resolves an app's startup URL and optional `dn://app/` asset root directory
@@ -469,13 +496,14 @@ pub fn resolve_app_url(
 
 /// Starts the single-window Servo host with the given UI configuration and request handler.
 pub fn run(
-    config: HostConfig,
+    mut config: HostConfig,
     handler: impl HostHandler + 'static,
     self_test: Option<String>,
 ) -> Result<(), Box<dyn Error>> {
-    rustls::crypto::aws_lc_rs::default_provider()
-        .install_default()
-        .expect("Failed to install crypto provider");
+    if let Some(raw_addr) = config.devtools_addr.take() {
+        config.devtools_addr = Some(win_platform::validate_devtools_addr(&raw_addr)?);
+    }
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
     let crash_dir_for_panic = config.crash_dir.clone();
     let app_title_for_panic = config.title;
@@ -559,6 +587,7 @@ enum PendingSessionOp {
 
 enum PendingChildWindow {
     FromBridge {
+        origin_window: WindowId,
         url: Url,
         title: String,
         width: u32,
@@ -628,6 +657,7 @@ struct Delegate {
     session_token: String,
     capabilities: Capabilities,
     dev_origin: Option<DevOrigin>,
+    initial_url: Url,
     autostart_app_name: &'static str,
     autostart_args: Vec<&'static str>,
     crash_dir: PathBuf,
@@ -850,6 +880,7 @@ impl Delegate {
         if self.non_interactive {
             if let Some(cid) = call_id {
                 let _ = self.waker.0.send_event(HostEvent::AsyncIpcReply {
+                    target_window: self.window.id(),
                     call_id: cid,
                     ok: true,
                     payload: "dry-run".to_owned(),
@@ -1451,7 +1482,11 @@ impl Delegate {
             WindowCommand::OpenChildWindow => {
                 let url_str = win_platform::json_get_string(payload, "url")
                     .unwrap_or_else(|| "about:blank".to_owned());
-                if !bridge::allows_navigation_with_dev(&url_str, self.dev_origin.as_ref()) {
+                if !bridge::allows_navigation_for_origin(
+                    &url_str,
+                    self.initial_url.as_str(),
+                    self.dev_origin.as_ref(),
+                ) {
                     return Err(format!(
                         "子ウィンドウで許可されていない URL です: {url_str}"
                     ));
@@ -1470,6 +1505,7 @@ impl Delegate {
                 self.pending_child_windows
                     .borrow_mut()
                     .push_back(PendingChildWindow::FromBridge {
+                        origin_window: self.window.id(),
                         url,
                         title,
                         width,
@@ -1510,6 +1546,7 @@ impl Delegate {
                     payload.trim().to_owned()
                 };
                 let hwnd = hwnd_of(&self.window);
+                let target_window = self.window.id();
                 let non_interactive = self.non_interactive;
                 let proxy = self.waker.0.clone();
                 std::thread::spawn(move || {
@@ -1520,6 +1557,7 @@ impl Delegate {
                             None => (false, "cancelled".to_owned()),
                         };
                     let _ = proxy.send_event(HostEvent::AsyncIpcReply {
+                        target_window,
                         call_id,
                         ok,
                         payload: out,
@@ -1533,6 +1571,7 @@ impl Delegate {
                     return Err("暗号化データが大きすぎます".to_owned());
                 }
                 let text = payload.to_owned();
+                let target_window = self.window.id();
                 let proxy = self.waker.0.clone();
                 std::thread::spawn(move || {
                     let res = win_platform::dpapi_encrypt(text.as_bytes())
@@ -1542,6 +1581,7 @@ impl Delegate {
                         Err(e) => (false, e),
                     };
                     let _ = proxy.send_event(HostEvent::AsyncIpcReply {
+                        target_window,
                         call_id,
                         ok,
                         payload: out,
@@ -1552,6 +1592,7 @@ impl Delegate {
             }
             WindowCommand::SafeStorageDecrypt => {
                 let b64 = payload.to_owned();
+                let target_window = self.window.id();
                 let proxy = self.waker.0.clone();
                 std::thread::spawn(move || {
                     let res = win_platform::base64_decode(&b64, MAX_CAPABILITY_FILE_BYTES)
@@ -1565,6 +1606,7 @@ impl Delegate {
                         Err(e) => (false, e),
                     };
                     let _ = proxy.send_event(HostEvent::AsyncIpcReply {
+                        target_window,
                         call_id,
                         ok,
                         payload: out,
@@ -1727,10 +1769,15 @@ impl WebViewDelegate for Delegate {
     }
 
     /// Navigation guard (Milestone B + Stage 1 `--dev-url` loopback origin):
-    /// Draconium apps are local, so only local/app-internal schemes (plus an
-    /// explicit loopback dev server when configured) may navigate.
+    /// Draconium apps are local, so only same-origin `file://` documents,
+    /// `dn://app/`, `about:blank`, and the configured loopback dev server may
+    /// navigate.
     fn request_navigation(&self, _: WebView, request: NavigationRequest) {
-        if bridge::allows_navigation_with_dev(request.url.as_str(), self.dev_origin.as_ref()) {
+        if bridge::allows_navigation_for_origin(
+            request.url.as_str(),
+            self.initial_url.as_str(),
+            self.dev_origin.as_ref(),
+        ) {
             request.allow();
         } else {
             request.deny();
@@ -1803,42 +1850,53 @@ impl WebViewDelegate for Delegate {
             EmbedderControl::SimpleDialog(SimpleDialog::Prompt(mut prompt)) => {
                 // Privileged `dn-window:` and async commands require the per-launch
                 // session token closed inside the frozen preload bridge, and are
-                // checked against the app's declarative `Capabilities` ACL.
-                let reply = match bridge::classify_command(prompt.message(), &self.session_token) {
-                    BridgeCommand::Window(command) => {
-                        self.handle_window_command(command, prompt.current_value(), None, &webview)
-                    }
-                    BridgeCommand::WindowAsync { call_id, command } => self
-                        .handle_window_command_async(
-                            call_id,
+                // checked against both the initial origin and the declarative
+                // `Capabilities` ACL.
+                let same_origin = webview.url().is_some_and(|current| {
+                    bridge::url_matches_initial_origin(current.as_str(), self.initial_url.as_str())
+                });
+                let reply = if !same_origin {
+                    Err("このオリジンではネイティブブリッジを利用できません".to_owned())
+                } else {
+                    match bridge::classify_command(prompt.message(), &self.session_token) {
+                        BridgeCommand::Window(command) => self.handle_window_command(
                             command,
                             prompt.current_value(),
+                            None,
                             &webview,
                         ),
-                    BridgeCommand::AppAsync { call_id, command } => {
-                        match self.capabilities.check_app_command(command) {
-                            Ok(()) => {
-                                self.pending_async_tasks.borrow_mut().push_back(
-                                    PendingAsyncTask::App {
-                                        call_id,
-                                        command: command.to_owned(),
-                                        payload: prompt.current_value().to_owned(),
-                                    },
-                                );
-                                self.waker.wake();
-                                Ok("queued".to_owned())
+                        BridgeCommand::WindowAsync { call_id, command } => self
+                            .handle_window_command_async(
+                                call_id,
+                                command,
+                                prompt.current_value(),
+                                &webview,
+                            ),
+                        BridgeCommand::AppAsync { call_id, command } => {
+                            match self.capabilities.check_app_command(command) {
+                                Ok(()) => {
+                                    self.pending_async_tasks.borrow_mut().push_back(
+                                        PendingAsyncTask::App {
+                                            call_id,
+                                            command: command.to_owned(),
+                                            payload: prompt.current_value().to_owned(),
+                                        },
+                                    );
+                                    self.waker.wake();
+                                    Ok("queued".to_owned())
+                                }
+                                Err(err) => Err(err),
                             }
-                            Err(err) => Err(err),
                         }
+                        BridgeCommand::Rejected(err) => Err(err),
+                        BridgeCommand::App(cmd) => match self.capabilities.check_app_command(cmd) {
+                            Ok(()) => self
+                                .handler
+                                .borrow_mut()
+                                .handle_request(cmd, prompt.current_value()),
+                            Err(err) => Err(err),
+                        },
                     }
-                    BridgeCommand::Rejected(err) => Err(err),
-                    BridgeCommand::App(cmd) => match self.capabilities.check_app_command(cmd) {
-                        Ok(()) => self
-                            .handler
-                            .borrow_mut()
-                            .handle_request(cmd, prompt.current_value()),
-                        Err(err) => Err(err),
-                    },
                 };
                 let encoded = match reply {
                     Ok(data) => format!("ok:{data}"),
@@ -2101,57 +2159,102 @@ fn request_reload(webview: &WebView, delegate: &Rc<Delegate>) {
     );
 }
 
+fn target_webview(state: &State, target: WindowId) -> Option<&WebView> {
+    if state.delegate.window.id() == target {
+        Some(&state.webview)
+    } else {
+        state
+            .child_windows
+            .iter()
+            .find(|child| child.window_id == target)
+            .map(|child| &child.webview)
+    }
+}
+
+fn send_async_reply(
+    waker: &Waker,
+    target_window: WindowId,
+    call_id: u64,
+    ok: bool,
+    payload: String,
+    is_json: bool,
+) {
+    let _ = waker.0.send_event(HostEvent::AsyncIpcReply {
+        target_window,
+        call_id,
+        ok,
+        payload,
+        is_json,
+    });
+}
+
 fn spawn_child_window(
     event_loop: &ActiveEventLoop,
     state: &mut State,
     pending: PendingChildWindow,
 ) {
-    let mut call_id_to_resolve = None;
     if state.child_windows.len() >= MAX_CHILD_WINDOWS {
         if let PendingChildWindow::FromBridge {
-            call_id: Some(cid), ..
+            origin_window,
+            call_id: Some(cid),
+            ..
         } = pending
         {
-            let _ = state.delegate.waker.0.send_event(HostEvent::AsyncIpcReply {
-                call_id: cid,
-                ok: false,
-                payload: "子ウィンドウの上限数に達しています".to_owned(),
-                is_json: false,
-            });
+            send_async_reply(
+                &state.delegate.waker,
+                origin_window,
+                cid,
+                false,
+                "子ウィンドウの上限数に達しています".to_owned(),
+                false,
+            );
         }
         return;
     }
 
-    let (title, width, height) = match &pending {
+    let (origin_and_call_id, title_owned, width, height, child_initial_url) = match &pending {
         PendingChildWindow::FromBridge {
+            origin_window,
+            url,
             title,
             width,
             height,
             call_id,
-            ..
-        } => {
-            call_id_to_resolve = *call_id;
-            (title.as_str(), *width, *height)
-        }
-        PendingChildWindow::FromServoRequest(_) => {
-            (state.delegate.default_title.as_str(), 800, 600)
+        } => (
+            call_id.map(|cid| (*origin_window, cid)),
+            title.clone(),
+            *width,
+            *height,
+            url.clone(),
+        ),
+        PendingChildWindow::FromServoRequest(_) => (
+            None,
+            state.delegate.default_title.clone(),
+            800,
+            600,
+            state.delegate.initial_url.clone(),
+        ),
+    };
+    let send_open_err = |reason: &str| {
+        if let Some((origin_window, cid)) = origin_and_call_id {
+            send_async_reply(
+                &state.delegate.waker,
+                origin_window,
+                cid,
+                false,
+                reason.to_owned(),
+                false,
+            );
         }
     };
 
     let attributes = Window::default_attributes()
-        .with_title(title)
+        .with_title(&title_owned)
         .with_inner_size(LogicalSize::new(f64::from(width), f64::from(height)))
         .with_decorations(true)
         .with_visible(true);
     let Ok(window) = event_loop.create_window(attributes) else {
-        if let Some(cid) = call_id_to_resolve {
-            let _ = state.delegate.waker.0.send_event(HostEvent::AsyncIpcReply {
-                call_id: cid,
-                ok: false,
-                payload: "子ウィンドウの作成に失敗しました".to_owned(),
-                is_json: false,
-            });
-        }
+        send_open_err("子ウィンドウの作成に失敗しました");
         return;
     };
     let window = Rc::new(window);
@@ -2160,20 +2263,23 @@ fn spawn_child_window(
     win_platform::apply_dwm_dark_mode(hwnd_of(&window), dark);
 
     let Ok(display_handle) = event_loop.display_handle() else {
+        send_open_err("ディスプレイハンドルの取得に失敗しました");
         return;
     };
     let Ok(win_handle) = window.window_handle() else {
+        send_open_err("ウィンドウハンドルの取得に失敗しました");
         return;
     };
     let Ok(rc) = WindowRenderingContext::new(display_handle, win_handle, window.inner_size())
     else {
+        send_open_err("レンダリングコンテキストの作成に失敗しました");
         return;
     };
     let child_rc = Rc::new(rc);
     let _ = child_rc.make_current();
 
     let child_delegate = Rc::new(Delegate {
-        default_title: title.to_owned(),
+        default_title: title_owned,
         explicit_title: RefCell::new(None),
         last_observed_fullscreen: Cell::new(window.fullscreen().is_some()),
         consumed_f11: Cell::new(None),
@@ -2185,6 +2291,7 @@ fn spawn_child_window(
         session_token: state.delegate.session_token.clone(),
         capabilities: state.delegate.capabilities.attenuate_for_child(),
         dev_origin: state.delegate.dev_origin.clone(),
+        initial_url: child_initial_url,
         autostart_app_name: state.delegate.autostart_app_name,
         autostart_args: state.delegate.autostart_args.clone(),
         crash_dir: state.delegate.crash_dir.clone(),
@@ -2249,13 +2356,15 @@ fn spawn_child_window(
         composing: false,
     });
 
-    if let Some(cid) = call_id_to_resolve {
-        let _ = state.delegate.waker.0.send_event(HostEvent::AsyncIpcReply {
-            call_id: cid,
-            ok: true,
-            payload: "opened".to_owned(),
-            is_json: false,
-        });
+    if let Some((origin_window, cid)) = origin_and_call_id {
+        send_async_reply(
+            &state.delegate.waker,
+            origin_window,
+            cid,
+            true,
+            "opened".to_owned(),
+            false,
+        );
     }
 }
 
@@ -2473,7 +2582,7 @@ impl ApplicationHandler<HostEvent> for App {
             )));
         }
         user_content_manager.add_script(Rc::new(UserScript::new(
-            bridge::render_preload_script(&session_token),
+            bridge::render_preload_script_for_origin(&session_token, config.url.as_str()),
             None,
         )));
 
@@ -2482,6 +2591,7 @@ impl ApplicationHandler<HostEvent> for App {
             initial_deep_links.push_back(uri);
         }
 
+        let initial_url = config.url.clone();
         let delegate = Rc::new(Delegate {
             default_title: config.title.to_owned(),
             explicit_title: RefCell::new(None),
@@ -2495,6 +2605,7 @@ impl ApplicationHandler<HostEvent> for App {
             session_token,
             capabilities: config.capabilities,
             dev_origin: config.dev_origin,
+            initial_url,
             autostart_app_name: config.autostart_app_name,
             autostart_args: config.autostart_args,
             crash_dir: config.crash_dir,
@@ -2567,33 +2678,36 @@ impl ApplicationHandler<HostEvent> for App {
         match event {
             HostEvent::Wake => {}
             HostEvent::AsyncIpcReply {
+                target_window,
                 call_id,
                 ok,
                 payload,
                 is_json,
             } => {
-                let script = bridge::resolve_async_script(call_id, ok, &payload, is_json);
-                state.webview.evaluate_javascript(script.clone(), |_| {});
-                for child in &state.child_windows {
-                    child.webview.evaluate_javascript(script.clone(), |_| {});
+                if let Some(webview) = target_webview(state, target_window) {
+                    let script = bridge::resolve_async_script(call_id, ok, &payload, is_json);
+                    webview.evaluate_javascript(script, |_| {});
                 }
             }
             HostEvent::CaptureFinished {
+                target_window,
                 call_id,
                 event_json,
                 reply_result,
             } => {
-                state.webview.evaluate_javascript(
-                    bridge::dispatch_script("capture-saved", &event_json),
-                    |_| {},
-                );
-                if let Some(cid) = call_id {
-                    let (ok, msg) = match reply_result {
-                        Ok(name) => (true, name),
-                        Err(err) => (false, err),
-                    };
-                    let script = bridge::resolve_async_script(cid, ok, &msg, false);
-                    state.webview.evaluate_javascript(script, |_| {});
+                if let Some(webview) = target_webview(state, target_window) {
+                    webview.evaluate_javascript(
+                        bridge::dispatch_script("capture-saved", &event_json),
+                        |_| {},
+                    );
+                    if let Some(cid) = call_id {
+                        let (ok, msg) = match reply_result {
+                            Ok(name) => (true, name),
+                            Err(err) => (false, err),
+                        };
+                        let script = bridge::resolve_async_script(cid, ok, &msg, false);
+                        webview.evaluate_javascript(script, |_| {});
+                    }
                 }
             }
             HostEvent::Tray(action) => match action {
@@ -2765,167 +2879,190 @@ impl ApplicationHandler<HostEvent> for App {
             }
         }
         // Interactive PNG or PDF capture queued by `Draconium.window.{capturePng,exportPdf}` or `window.print()`.
-        if let Some(state) = &self.state
-            && let Some(pending) = state.delegate.pending_captures.borrow_mut().pop_front()
-        {
-            let hwnd = hwnd_of(&state.delegate.window);
-            let ext = match pending.format {
-                CaptureFormat::Png => "png",
-                CaptureFormat::Pdf => "pdf",
-            };
-            if let Some(dest) = embedder_ui::show_save_file_dialog(
-                hwnd,
-                &pending.suggested,
-                &[ext.to_owned()],
-                state.delegate.non_interactive,
-            ) {
-                let proxy = state.delegate.waker.0.clone();
-                let format = pending.format;
-                let call_id = pending.call_id;
-                let fallback_name = pending.suggested.clone();
-                state
-                    .webview
-                    .take_screenshot(None, move |capture| match capture {
-                        Ok(image) => {
-                            let proxy_worker = proxy.clone();
-                            std::thread::spawn(move || {
-                                let save_res: Result<(), String> = match format {
-                                    CaptureFormat::Png => {
-                                        image.save(&dest).map_err(|e| format!("PNG 保存失敗: {e}"))
-                                    }
-                                    CaptureFormat::Pdf => win_platform::encode_rgba_as_raster_pdf(
-                                        image.width(),
-                                        image.height(),
-                                        image.as_raw(),
-                                    )
-                                    .and_then(|pdf| {
-                                        std::fs::write(&dest, &pdf)
-                                            .map_err(|e| format!("PDF 保存失敗: {e}"))
-                                    }),
-                                };
-                                let (event_json, reply_result) = match save_res {
-                                    Ok(()) => {
-                                        let name = dest
-                                            .file_name()
-                                            .map(|n| n.to_string_lossy().into_owned())
-                                            .unwrap_or(fallback_name);
-                                        let ev = format!(
-                                            "{{\"ok\":true,\"name\":{}}}",
-                                            win_platform::json_string(&name)
-                                        );
-                                        (ev, Ok(name))
-                                    }
-                                    Err(err) => {
-                                        let ev = format!(
-                                            "{{\"ok\":false,\"error\":{}}}",
-                                            win_platform::json_string(&err)
-                                        );
-                                        (ev, Err(err))
-                                    }
-                                };
-                                let _ = proxy_worker.send_event(HostEvent::CaptureFinished {
-                                    call_id,
-                                    event_json,
-                                    reply_result,
-                                });
-                            });
-                        }
-                        Err(err) => {
-                            let msg = format!("キャプチャ失敗: {err:?}");
-                            let event_json = format!(
-                                "{{\"ok\":false,\"error\":{}}}",
-                                win_platform::json_string(&msg)
-                            );
-                            let _ = proxy.send_event(HostEvent::CaptureFinished {
-                                call_id,
-                                event_json,
-                                reply_result: Err(msg),
-                            });
-                        }
-                    });
-                state.servo.spin_event_loop();
-            } else {
-                let _ = state
-                    .delegate
-                    .waker
-                    .0
-                    .send_event(HostEvent::CaptureFinished {
-                        call_id: pending.call_id,
-                        event_json: "{\"ok\":false,\"error\":\"cancelled\"}".to_owned(),
-                        reply_result: Err("cancelled".to_owned()),
-                    });
-            }
-        }
         // Session & storage management operations (`SiteDataManager` / `NetworkManager`).
         if let Some(state) = &self.state {
+            let mut targets: Vec<(Rc<Delegate>, WebView)> =
+                Vec::with_capacity(1 + state.child_windows.len());
+            targets.push((state.delegate.clone(), state.webview.clone()));
+            for child in &state.child_windows {
+                targets.push((child.delegate.clone(), child.webview.clone()));
+            }
+            let mut ran_capture = false;
+            for (delegate, webview) in &targets {
+                let target_window = delegate.window.id();
+                while let Some(pending) = delegate.pending_captures.borrow_mut().pop_front() {
+                    let hwnd = hwnd_of(&delegate.window);
+                    let ext = match pending.format {
+                        CaptureFormat::Png => "png",
+                        CaptureFormat::Pdf => "pdf",
+                    };
+                    if let Some(dest) = embedder_ui::show_save_file_dialog(
+                        hwnd,
+                        &pending.suggested,
+                        &[ext.to_owned()],
+                        delegate.non_interactive,
+                    ) {
+                        let proxy = delegate.waker.0.clone();
+                        let format = pending.format;
+                        let call_id = pending.call_id;
+                        let fallback_name = pending.suggested.clone();
+                        webview.take_screenshot(None, move |capture| match capture {
+                            Ok(image) => {
+                                let proxy_worker = proxy.clone();
+                                std::thread::spawn(move || {
+                                    let save_res: Result<(), String> =
+                                        match format {
+                                            CaptureFormat::Png => image
+                                                .save(&dest)
+                                                .map_err(|e| format!("PNG 保存失敗: {e}")),
+                                            CaptureFormat::Pdf => {
+                                                win_platform::encode_rgba_as_raster_pdf(
+                                                    image.width(),
+                                                    image.height(),
+                                                    image.as_raw(),
+                                                )
+                                                .and_then(|pdf| {
+                                                    std::fs::write(&dest, &pdf)
+                                                        .map_err(|e| format!("PDF 保存失敗: {e}"))
+                                                })
+                                            }
+                                        };
+                                    let (event_json, reply_result) = match save_res {
+                                        Ok(()) => {
+                                            let name = dest
+                                                .file_name()
+                                                .map(|n| n.to_string_lossy().into_owned())
+                                                .unwrap_or(fallback_name);
+                                            let ev = format!(
+                                                "{{\"ok\":true,\"name\":{}}}",
+                                                win_platform::json_string(&name)
+                                            );
+                                            (ev, Ok(name))
+                                        }
+                                        Err(err) => {
+                                            let ev = format!(
+                                                "{{\"ok\":false,\"error\":{}}}",
+                                                win_platform::json_string(&err)
+                                            );
+                                            (ev, Err(err))
+                                        }
+                                    };
+                                    let _ = proxy_worker.send_event(HostEvent::CaptureFinished {
+                                        target_window,
+                                        call_id,
+                                        event_json,
+                                        reply_result,
+                                    });
+                                });
+                            }
+                            Err(err) => {
+                                let msg = format!("キャプチャ失敗: {err:?}");
+                                let event_json = format!(
+                                    "{{\"ok\":false,\"error\":{}}}",
+                                    win_platform::json_string(&msg)
+                                );
+                                let _ = proxy.send_event(HostEvent::CaptureFinished {
+                                    target_window,
+                                    call_id,
+                                    event_json,
+                                    reply_result: Err(msg),
+                                });
+                            }
+                        });
+                        ran_capture = true;
+                    } else {
+                        let _ = delegate.waker.0.send_event(HostEvent::CaptureFinished {
+                            target_window,
+                            call_id: pending.call_id,
+                            event_json: "{\"ok\":false,\"error\":\"cancelled\"}".to_owned(),
+                            reply_result: Err("cancelled".to_owned()),
+                        });
+                    }
+                }
+            }
+            if ran_capture {
+                state.servo.spin_event_loop();
+            }
+
             let mut ran_session_op = false;
-            while let Some(op) = state.delegate.pending_session_ops.borrow_mut().pop_front() {
-                ran_session_op = true;
-                match op {
-                    PendingSessionOp::ListSiteData { call_id } => {
-                        let entries = state
-                            .servo
-                            .site_data_manager()
-                            .site_data(StorageType::all());
-                        let json = format_site_data_json(&entries);
-                        *state.delegate.cached_site_data_json.borrow_mut() = json.clone();
-                        if let Some(cid) = call_id {
-                            let _ = state.delegate.waker.0.send_event(HostEvent::AsyncIpcReply {
-                                call_id: cid,
-                                ok: true,
-                                payload: json,
-                                is_json: true,
-                            });
+            for (delegate, _) in &targets {
+                let target_window = delegate.window.id();
+                while let Some(op) = delegate.pending_session_ops.borrow_mut().pop_front() {
+                    ran_session_op = true;
+                    match op {
+                        PendingSessionOp::ListSiteData { call_id } => {
+                            let entries = state
+                                .servo
+                                .site_data_manager()
+                                .site_data(StorageType::all());
+                            let json = format_site_data_json(&entries);
+                            *delegate.cached_site_data_json.borrow_mut() = json.clone();
+                            if let Some(cid) = call_id {
+                                send_async_reply(
+                                    &delegate.waker,
+                                    target_window,
+                                    cid,
+                                    true,
+                                    json,
+                                    true,
+                                );
+                            }
                         }
-                    }
-                    PendingSessionOp::ClearSiteData { call_id } => {
-                        let entries = state
-                            .servo
-                            .site_data_manager()
-                            .site_data(StorageType::all());
-                        let names: Vec<String> = entries.iter().map(|e| e.name()).collect();
-                        let name_refs: Vec<&str> = names.iter().map(String::as_str).collect();
-                        state
-                            .servo
-                            .site_data_manager()
-                            .clear_site_data(&name_refs, StorageType::all());
-                        *state.delegate.cached_site_data_json.borrow_mut() = "[]".to_owned();
-                        if let Some(cid) = call_id {
-                            let _ = state.delegate.waker.0.send_event(HostEvent::AsyncIpcReply {
-                                call_id: cid,
-                                ok: true,
-                                payload: "cleared".to_owned(),
-                                is_json: false,
-                            });
+                        PendingSessionOp::ClearSiteData { call_id } => {
+                            let entries = state
+                                .servo
+                                .site_data_manager()
+                                .site_data(StorageType::all());
+                            let names: Vec<String> = entries.iter().map(|e| e.name()).collect();
+                            let name_refs: Vec<&str> = names.iter().map(String::as_str).collect();
+                            state
+                                .servo
+                                .site_data_manager()
+                                .clear_site_data(&name_refs, StorageType::all());
+                            *delegate.cached_site_data_json.borrow_mut() = "[]".to_owned();
+                            if let Some(cid) = call_id {
+                                send_async_reply(
+                                    &delegate.waker,
+                                    target_window,
+                                    cid,
+                                    true,
+                                    "cleared".to_owned(),
+                                    false,
+                                );
+                            }
                         }
-                    }
-                    PendingSessionOp::ClearCookies {
-                        session_only,
-                        call_id,
-                    } => {
-                        if session_only {
-                            state.servo.site_data_manager().clear_session_cookies(None);
-                        } else {
-                            state.servo.site_data_manager().clear_cookies(None);
+                        PendingSessionOp::ClearCookies {
+                            session_only,
+                            call_id,
+                        } => {
+                            if session_only {
+                                state.servo.site_data_manager().clear_session_cookies(None);
+                            } else {
+                                state.servo.site_data_manager().clear_cookies(None);
+                            }
+                            if let Some(cid) = call_id {
+                                send_async_reply(
+                                    &delegate.waker,
+                                    target_window,
+                                    cid,
+                                    true,
+                                    "cleared".to_owned(),
+                                    false,
+                                );
+                            }
                         }
-                        if let Some(cid) = call_id {
-                            let _ = state.delegate.waker.0.send_event(HostEvent::AsyncIpcReply {
-                                call_id: cid,
-                                ok: true,
-                                payload: "cleared".to_owned(),
-                                is_json: false,
-                            });
-                        }
-                    }
-                    PendingSessionOp::ClearCache { call_id } => {
-                        state.servo.network_manager().clear_cache();
-                        if let Some(cid) = call_id {
-                            let _ = state.delegate.waker.0.send_event(HostEvent::AsyncIpcReply {
-                                call_id: cid,
-                                ok: true,
-                                payload: "cleared".to_owned(),
-                                is_json: false,
-                            });
+                        PendingSessionOp::ClearCache { call_id } => {
+                            state.servo.network_manager().clear_cache();
+                            if let Some(cid) = call_id {
+                                send_async_reply(
+                                    &delegate.waker,
+                                    target_window,
+                                    cid,
+                                    true,
+                                    "cleared".to_owned(),
+                                    false,
+                                );
+                            }
                         }
                     }
                 }
@@ -2956,45 +3093,53 @@ impl ApplicationHandler<HostEvent> for App {
         }
         // Execute queued non-blocking async IPC tasks (`Draconium.invokeAsync` and `*Async`).
         if let Some(state) = &self.state {
+            let mut targets: Vec<(Rc<Delegate>, WebView)> =
+                Vec::with_capacity(1 + state.child_windows.len());
+            targets.push((state.delegate.clone(), state.webview.clone()));
+            for child in &state.child_windows {
+                targets.push((child.delegate.clone(), child.webview.clone()));
+            }
             let mut ran_async = false;
-            while let Some(task) = state.delegate.pending_async_tasks.borrow_mut().pop_front() {
-                ran_async = true;
-                match task {
-                    PendingAsyncTask::App {
-                        call_id,
-                        command,
-                        payload,
-                    } => {
-                        let res = state
-                            .delegate
-                            .handler
-                            .borrow_mut()
-                            .handle_request(&command, &payload);
-                        let (ok, out) = match res {
-                            Ok(s) => (true, s),
-                            Err(e) => (false, e),
-                        };
-                        let script = bridge::resolve_async_script(call_id, ok, &out, false);
-                        state.webview.evaluate_javascript(script, |_| {});
-                    }
-                    PendingAsyncTask::Window {
-                        call_id,
-                        command,
-                        payload,
-                        parse_json,
-                    } => {
-                        let res = state.delegate.handle_window_command(
+            for (delegate, webview) in &targets {
+                while let Some(task) = delegate.pending_async_tasks.borrow_mut().pop_front() {
+                    ran_async = true;
+                    match task {
+                        PendingAsyncTask::App {
+                            call_id,
                             command,
-                            &payload,
-                            Some(call_id),
-                            &state.webview,
-                        );
-                        let (ok, out) = match res {
-                            Ok(s) => (true, s),
-                            Err(e) => (false, e),
-                        };
-                        let script = bridge::resolve_async_script(call_id, ok, &out, parse_json);
-                        state.webview.evaluate_javascript(script, |_| {});
+                            payload,
+                        } => {
+                            let res = delegate
+                                .handler
+                                .borrow_mut()
+                                .handle_request(&command, &payload);
+                            let (ok, out) = match res {
+                                Ok(s) => (true, s),
+                                Err(e) => (false, e),
+                            };
+                            let script = bridge::resolve_async_script(call_id, ok, &out, false);
+                            webview.evaluate_javascript(script, |_| {});
+                        }
+                        PendingAsyncTask::Window {
+                            call_id,
+                            command,
+                            payload,
+                            parse_json,
+                        } => {
+                            let res = delegate.handle_window_command(
+                                command,
+                                &payload,
+                                Some(call_id),
+                                webview,
+                            );
+                            let (ok, out) = match res {
+                                Ok(s) => (true, s),
+                                Err(e) => (false, e),
+                            };
+                            let script =
+                                bridge::resolve_async_script(call_id, ok, &out, parse_json);
+                            webview.evaluate_javascript(script, |_| {});
+                        }
                     }
                 }
             }
@@ -3574,12 +3719,14 @@ enum HostEvent {
     Wake,
     Tray(TrayAction),
     AsyncIpcReply {
+        target_window: WindowId,
         call_id: u64,
         ok: bool,
         payload: String,
         is_json: bool,
     },
     CaptureFinished {
+        target_window: WindowId,
         call_id: Option<u64>,
         event_json: String,
         reply_result: Result<String, String>,
