@@ -22,7 +22,6 @@
 //! All items in this module are dependency-free pure Rust so they can be
 //! unit-tested on any OS with `rustc --edition 2024 --test`.
 
-
 /// Prefix marking a bridge command as a host window command rather than an
 /// application command.
 pub const WINDOW_COMMAND_PREFIX: &str = "dn-window:";

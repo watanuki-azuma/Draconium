@@ -17,7 +17,6 @@
 //! are unit-tested on any OS via `rustc --edition 2024 --test`.
 
 use std::collections::{HashMap, VecDeque};
-use std::hash::{BuildHasher, Hasher};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
