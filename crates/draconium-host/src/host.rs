@@ -429,22 +429,38 @@ pub fn try_resolve_app_url_from(
     manifest_relative: &str,
 ) -> Result<(Url, Option<PathBuf>), String> {
     let resolved = resolve_ui_path_from(base_dir, exe_relative, manifest_relative);
-    let canonical = resolved.canonicalize().ok();
-    let root = canonical
-        .as_ref()
-        .and_then(|p| p.parent().map(Path::to_path_buf));
+    let valid_local = if let Ok(canon) = resolved.canonicalize() {
+        let parent_canon = resolved
+            .parent()
+            .and_then(|parent| parent.canonicalize().ok());
+        match parent_canon {
+            Some(parent) if canon.starts_with(&parent) => Some((canon, parent)),
+            _ => {
+                if !dn_assets && dev_url.is_none() {
+                    return Err(
+                        "UI entry asset escapes its parent directory via symlink or junction"
+                            .to_owned(),
+                    );
+                }
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let root = valid_local.as_ref().map(|(_, parent)| parent.clone());
     if let Some(raw_dev) = dev_url {
         let origin = DevOrigin::parse(raw_dev)?;
         let url = Url::parse(&origin.initial_url)
             .map_err(|err| format!("--dev-url is not a valid URL: {err}"))?;
         return Ok((url, root));
     }
-    if dn_assets || canonical.is_none() {
+    if dn_assets || valid_local.is_none() {
         let url = Url::parse(&crate::protocol::asset_url(file_name))
             .map_err(|err| format!("invalid dn:// asset URL: {err}"))?;
         Ok((url, root))
     } else {
-        let url = Url::from_file_path(canonical.unwrap())
+        let url = Url::from_file_path(&valid_local.unwrap().0)
             .map_err(|()| "Invalid UI file path".to_owned())?;
         Ok((url, root))
     }
@@ -827,6 +843,20 @@ impl Delegate {
     /// Deliver the pending window position to the app handler. With
     /// `force`, save immediately (presentation switch / reload / close);
     /// otherwise save only once the move burst has been quiet for a while.
+    fn is_active_page_origin(&self, webview: &WebView) -> bool {
+        let trusted_launch_origin = bridge::has_supported_origin(self.initial_url.as_str())
+            && (!bridge::is_file_url(self.initial_url.as_str()) || self.initial_file_dir.is_some());
+        trusted_launch_origin
+            && webview.url().is_none_or(|current| {
+                bridge::allows_navigation_for_origin_with_fs(
+                    current.as_str(),
+                    self.initial_url.as_str(),
+                    self.initial_file_dir.as_deref(),
+                    self.dev_origin.as_ref(),
+                )
+            })
+    }
+
     fn flush_pending_move(&self, force: bool) {
         let Some((position, at)) = self.pending_move.get() else {
             return;
@@ -1855,18 +1885,7 @@ impl WebViewDelegate for Delegate {
                 // session token closed inside the frozen preload bridge, and are
                 // checked against the trusted initial origin (plus populated
                 // WebView history URL when available) and the `Capabilities` ACL.
-                let trusted_launch_origin = bridge::has_supported_origin(self.initial_url.as_str())
-                    && (!bridge::is_file_url(self.initial_url.as_str())
-                        || self.initial_file_dir.is_some());
-                let same_origin = trusted_launch_origin
-                    && webview.url().is_none_or(|current| {
-                        bridge::allows_navigation_for_origin_with_fs(
-                            current.as_str(),
-                            self.initial_url.as_str(),
-                            self.initial_file_dir.as_deref(),
-                            self.dev_origin.as_ref(),
-                        )
-                    });
+                let same_origin = self.is_active_page_origin(&webview);
                 let reply = if !same_origin {
                     Err("このオリジンではネイティブブリッジを利用できません".to_owned())
                 } else {
@@ -2171,15 +2190,40 @@ fn request_reload(webview: &WebView, delegate: &Rc<Delegate>) {
     );
 }
 
-fn target_webview(state: &State, target: WindowId) -> Option<&WebView> {
+fn target_delegate_and_webview(
+    state: &State,
+    target: WindowId,
+) -> Option<(&Rc<Delegate>, &WebView)> {
     if state.delegate.window.id() == target {
-        Some(&state.webview)
+        Some((&state.delegate, &state.webview))
     } else {
         state
             .child_windows
             .iter()
             .find(|child| child.window_id == target)
-            .map(|child| &child.webview)
+            .map(|child| (&child.delegate, &child.webview))
+    }
+}
+
+fn deliver_async_reply(
+    delegate: &Delegate,
+    webview: &WebView,
+    call_id: u64,
+    ok: bool,
+    payload: &str,
+    is_json: bool,
+) {
+    if !delegate.is_active_page_origin(webview) {
+        return;
+    }
+    if let Some(script) = bridge::resolve_async_script_for_origin(
+        delegate.initial_url.as_str(),
+        call_id,
+        ok,
+        payload,
+        is_json,
+    ) {
+        webview.evaluate_javascript(script, |_| {});
     }
 }
 
@@ -2714,9 +2758,9 @@ impl ApplicationHandler<HostEvent> for App {
                 payload,
                 is_json,
             } => {
-                if let Some(webview) = target_webview(state, target_window) {
-                    let script = bridge::resolve_async_script(call_id, ok, &payload, is_json);
-                    webview.evaluate_javascript(script, |_| {});
+                if let Some((delegate, webview)) = target_delegate_and_webview(state, target_window)
+                {
+                    deliver_async_reply(delegate, webview, call_id, ok, &payload, is_json);
                 }
             }
             HostEvent::CaptureFinished {
@@ -2725,18 +2769,22 @@ impl ApplicationHandler<HostEvent> for App {
                 event_json,
                 reply_result,
             } => {
-                if let Some(webview) = target_webview(state, target_window) {
-                    webview.evaluate_javascript(
-                        bridge::dispatch_script("capture-saved", &event_json),
-                        |_| {},
-                    );
+                if let Some((delegate, webview)) = target_delegate_and_webview(state, target_window)
+                    && delegate.is_active_page_origin(webview)
+                {
+                    if let Some(ev_script) = bridge::dispatch_script_for_origin(
+                        delegate.initial_url.as_str(),
+                        "capture-saved",
+                        &event_json,
+                    ) {
+                        webview.evaluate_javascript(ev_script, |_| {});
+                    }
                     if let Some(cid) = call_id {
                         let (ok, msg) = match reply_result {
                             Ok(name) => (true, name),
                             Err(err) => (false, err),
                         };
-                        let script = bridge::resolve_async_script(cid, ok, &msg, false);
-                        webview.evaluate_javascript(script, |_| {});
+                        deliver_async_reply(delegate, webview, cid, ok, &msg, false);
                     }
                 }
             }
@@ -3147,8 +3195,7 @@ impl ApplicationHandler<HostEvent> for App {
                                 Ok(s) => (true, s),
                                 Err(e) => (false, e),
                             };
-                            let script = bridge::resolve_async_script(call_id, ok, &out, false);
-                            webview.evaluate_javascript(script, |_| {});
+                            deliver_async_reply(delegate, webview, call_id, ok, &out, false);
                         }
                         PendingAsyncTask::Window {
                             call_id,
@@ -3166,9 +3213,7 @@ impl ApplicationHandler<HostEvent> for App {
                                 Ok(s) => (true, s),
                                 Err(e) => (false, e),
                             };
-                            let script =
-                                bridge::resolve_async_script(call_id, ok, &out, parse_json);
-                            webview.evaluate_javascript(script, |_| {});
+                            deliver_async_reply(delegate, webview, call_id, ok, &out, parse_json);
                         }
                     }
                 }

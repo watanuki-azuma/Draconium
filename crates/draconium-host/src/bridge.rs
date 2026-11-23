@@ -135,21 +135,27 @@ impl DevOrigin {
         if authority.is_empty() || authority.contains('@') || authority.contains('\\') {
             return false;
         }
-        let (host_raw, port_raw) = if let Some(after_bracket) = authority.strip_prefix("[::1]") {
-            let Some(port_str) = after_bracket.strip_prefix(':') else {
+        let (host_raw, port) = if let Some(after_bracket) = authority.strip_prefix("[::1]") {
+            let port = if after_bracket.is_empty() {
+                80u16
+            } else if let Some(port_str) = after_bracket.strip_prefix(':') {
+                let Ok(p) = port_str.parse::<u16>() else {
+                    return false;
+                };
+                p
+            } else {
                 return false;
             };
-            ("[::1]", port_str)
+            ("[::1]", port)
+        } else if let Some((h, p)) = authority.rsplit_once(':') {
+            let Ok(port) = p.parse::<u16>() else {
+                return false;
+            };
+            (h, port)
         } else {
-            let Some((h, p)) = authority.rsplit_once(':') else {
-                return false;
-            };
-            (h, p)
+            (authority, 80u16)
         };
-        let Ok(port) = port_raw.parse::<u16>() else {
-            return false;
-        };
-        port == self.port && host_raw.eq_ignore_ascii_case(&self.host)
+        port != 0 && port == self.port && host_raw.eq_ignore_ascii_case(&self.host)
     }
 }
 
@@ -708,6 +714,13 @@ pub fn allows_navigation_with_dev(url: &str, dev_origin: Option<&DevOrigin>) -> 
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+struct FileSegment {
+    bytes: Vec<u8>,
+    text: Option<String>,
+    pct_canon: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum InitialOrigin {
     DnApp,
     Http {
@@ -716,40 +729,64 @@ enum InitialOrigin {
         port: u16,
     },
     File {
-        segments: Vec<String>,
+        segments: Vec<FileSegment>,
         base_dir_len: usize,
         windows_drive: bool,
     },
 }
 
-fn decode_percent_segment_strict(raw: &str) -> Option<String> {
+fn encode_pct_segment(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut out = String::with_capacity(bytes.len());
+    for &b in bytes {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') {
+            out.push(b as char);
+        } else {
+            out.push('%');
+            out.push(HEX[(b >> 4) as usize] as char);
+            out.push(HEX[(b & 0x0F) as usize] as char);
+        }
+    }
+    out
+}
+
+fn decode_percent_segment_bytes(raw: &str) -> Option<FileSegment> {
     if raw.contains('\\') || raw.contains('\0') {
         return None;
     }
-    let bytes = raw.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
+    let raw_bytes = raw.as_bytes();
+    let mut bytes = Vec::with_capacity(raw_bytes.len());
     let mut i = 0usize;
-    while i < bytes.len() {
-        if bytes[i] == b'%' {
-            let hi = bytes.get(i + 1).copied()?;
-            let lo = bytes.get(i + 2).copied()?;
+    while i < raw_bytes.len() {
+        if raw_bytes[i] == b'%' {
+            let hi = raw_bytes.get(i + 1).copied()?;
+            let lo = raw_bytes.get(i + 2).copied()?;
             let hex = [hi, lo];
             let hex_str = std::str::from_utf8(&hex).ok()?;
             let decoded = u8::from_str_radix(hex_str, 16).ok()?;
             if matches!(decoded, 0 | b'/' | b'\\') {
                 return None;
             }
-            out.push(decoded);
+            bytes.push(decoded);
             i += 3;
         } else {
-            out.push(bytes[i]);
+            bytes.push(raw_bytes[i]);
             i += 1;
         }
     }
-    String::from_utf8(out).ok()
+    if bytes.is_empty() || bytes == b"." || bytes == b".." {
+        return None;
+    }
+    let text = String::from_utf8(bytes.clone()).ok();
+    let pct_canon = encode_pct_segment(&bytes);
+    Some(FileSegment {
+        bytes,
+        text,
+        pct_canon,
+    })
 }
 
-fn parse_file_url_parts(url: &str) -> Option<(Vec<String>, bool, bool)> {
+fn parse_file_url_parts(url: &str) -> Option<(Vec<FileSegment>, bool, bool)> {
     if url.is_empty() || url.chars().any(|ch| ch.is_control() || ch == '\\') {
         return None;
     }
@@ -771,23 +808,13 @@ fn parse_file_url_parts(url: &str) -> Option<(Vec<String>, bool, bool)> {
         if raw_seg.is_empty() {
             continue;
         }
-        let decoded = decode_percent_segment_strict(raw_seg)?;
-        if decoded.is_empty()
-            || decoded == "."
-            || decoded == ".."
-            || decoded.contains('/')
-            || decoded.contains('\\')
-            || decoded.contains('\0')
-        {
-            return None;
-        }
-        segments.push(decoded);
+        segments.push(decode_percent_segment_bytes(raw_seg)?);
     }
     if segments.is_empty() {
         return None;
     }
     let windows_drive = segments.first().is_some_and(|first| {
-        first.len() == 2 && first.as_bytes()[0].is_ascii_alphabetic() && first.as_bytes()[1] == b':'
+        first.bytes.len() == 2 && first.bytes[0].is_ascii_alphabetic() && first.bytes[1] == b':'
     });
     Some((segments, trailing_slash, windows_drive))
 }
@@ -871,25 +898,32 @@ fn parse_initial_origin(url: &str) -> Option<InitialOrigin> {
     None
 }
 
-fn file_segments_eq(a: &[String], b: &[String], case_insensitive: bool) -> bool {
+fn file_segments_eq(a: &[FileSegment], b: &[FileSegment], case_insensitive: bool) -> bool {
     a.len() == b.len()
         && a.iter().zip(b.iter()).all(|(left, right)| {
             if case_insensitive {
-                left.to_lowercase() == right.to_lowercase()
+                match (&left.text, &right.text) {
+                    (Some(l), Some(r)) => l.to_lowercase() == r.to_lowercase(),
+                    _ => left.bytes == right.bytes,
+                }
             } else {
-                left == right
+                left.bytes == right.bytes
             }
         })
 }
 
-fn file_segments_to_path(segments: &[String], windows_drive: bool) -> Option<std::path::PathBuf> {
+fn file_segments_to_path(
+    segments: &[FileSegment],
+    windows_drive: bool,
+) -> Option<std::path::PathBuf> {
     if segments.is_empty() {
         return None;
     }
     if windows_drive {
-        let mut path = std::path::PathBuf::from(format!("{}\\", segments[0]));
+        let drive = segments[0].text.as_deref()?;
+        let mut path = std::path::PathBuf::from(format!("{drive}\\"));
         for seg in &segments[1..] {
-            path.push(seg);
+            path.push(seg.text.as_deref()?);
         }
         Some(path)
     } else {
@@ -898,7 +932,15 @@ fn file_segments_to_path(segments: &[String], windows_drive: bool) -> Option<std
         }
         let mut path = std::path::PathBuf::from("/");
         for seg in segments {
-            path.push(seg);
+            #[cfg(unix)]
+            {
+                use std::os::unix::ffi::OsStrExt;
+                path.push(std::ffi::OsStr::from_bytes(&seg.bytes));
+            }
+            #[cfg(not(unix))]
+            {
+                path.push(seg.text.as_deref()?);
+            }
         }
         Some(path)
     }
@@ -1061,13 +1103,8 @@ pub fn allows_child_window_url(
     true
 }
 
-/// Render [`PRELOAD_SCRIPT`] wrapped in an origin guard matching `initial_url`,
-/// preventing navigated foreign-origin documents from receiving
-/// `window.Draconium` or the launch session token.
-pub fn render_preload_script_for_origin(session_token: &str, initial_url: &str) -> String {
-    let Some(expected) = parse_initial_origin(initial_url) else {
-        return "(() => {})();".to_owned();
-    };
+fn origin_js_guard(initial_url: &str) -> Option<String> {
+    let expected = parse_initial_origin(initial_url)?;
     let guard_expr = match expected {
         InitialOrigin::DnApp => concat!(
             "(() => {",
@@ -1114,27 +1151,47 @@ pub fn render_preload_script_for_origin(session_token: &str, initial_url: &str) 
             base_dir_len,
             windows_drive,
         } => {
-            let format_path = |count: usize, trailing_slash: bool, lower: bool| -> String {
+            let format_pct = |count: usize, trailing_slash: bool| -> String {
                 let mut s = String::from("/");
                 for (idx, seg) in segments.iter().take(count).enumerate() {
                     if idx > 0 {
                         s.push('/');
                     }
-                    if lower {
-                        s.push_str(&seg.to_lowercase());
-                    } else {
-                        s.push_str(seg);
-                    }
+                    s.push_str(&seg.pct_canon);
                 }
                 if trailing_slash && count > 0 {
                     s.push('/');
                 }
                 s
             };
-            let exact_raw = format_path(segments.len(), false, false);
-            let exact_file = format_path(segments.len(), false, windows_drive);
+            let format_utf8 = |count: usize, trailing_slash: bool, lower: bool| -> Option<String> {
+                let mut s = String::from("/");
+                for (idx, seg) in segments.iter().take(count).enumerate() {
+                    if idx > 0 {
+                        s.push('/');
+                    }
+                    let txt = seg.text.as_deref()?;
+                    if lower {
+                        s.push_str(&txt.to_lowercase());
+                    } else {
+                        s.push_str(txt);
+                    }
+                }
+                if trailing_slash && count > 0 {
+                    s.push('/');
+                }
+                Some(s)
+            };
+            let pct_exact = format_pct(segments.len(), false);
+            let pct_dir = if base_dir_len > 0 {
+                format_pct(base_dir_len, true)
+            } else {
+                String::new()
+            };
+            let exact_raw = format_utf8(segments.len(), false, false).unwrap_or_default();
+            let exact_file = format_utf8(segments.len(), false, windows_drive).unwrap_or_default();
             let dir_prefix = if base_dir_len > 0 {
-                format_path(base_dir_len, true, windows_drive)
+                format_utf8(base_dir_len, true, windows_drive).unwrap_or_default()
             } else {
                 String::new()
             };
@@ -1146,28 +1203,48 @@ pub fn render_preload_script_for_origin(session_token: &str, initial_url: &str) 
                     " if (!loc || String(loc.protocol || \"\").toLowerCase() !== \"file:\") return false;",
                     " const host = String(loc.hostname || \"\").toLowerCase();",
                     " if (host !== \"\" && host !== \"localhost\") return false;",
-                    " try {{",
                     " const rawPath = String(loc.pathname || \"\");",
                     " if (/%2f|%5c|%00|\\\\/i.test(rawPath)) return false;",
+                    " const rawSegs = rawPath.split(\"/\").filter((s) => s.length > 0);",
+                    " if (rawSegs.length === 0 || rawSegs.some((s) => s === \".\" || s === \"..\" || /^(?:%2e)+$/i.test(s))) return false;",
+                    " const pctNorm = \"/\" + rawSegs.map((s) => s.replace(/%[0-9a-f]{{2}}/gi, (m) => m.toUpperCase())).join(\"/\");",
+                    " if (pctNorm === {pct_exact}) return true;",
+                    " const pctDir = {pct_dir};",
+                    " if (pctDir.length > 0 && pctNorm.startsWith(pctDir) && pctNorm.length > pctDir.length) return true;",
+                    " try {{",
                     " const decoded = decodeURIComponent(rawPath);",
                     " if (decoded.indexOf(\"\\\\\") !== -1 || decoded.indexOf(\"\\0\") !== -1) return false;",
                     " const segs = decoded.split(\"/\").filter((s) => s.length > 0);",
                     " if (segs.some((s) => s === \".\" || s === \"..\")) return false;",
                     " const normRaw = \"/\" + segs.join(\"/\");",
-                    " if (normRaw === {exact_raw}) return true;",
+                    " const exactRaw = {exact_raw};",
+                    " if (exactRaw.length > 0 && normRaw === exactRaw) return true;",
                     " const norm = {win_drive} ? normRaw.toLowerCase() : normRaw;",
-                    " if (norm === {exact_file}) return true;",
+                    " const exactFile = {exact_file};",
+                    " if (exactFile.length > 0 && norm === exactFile) return true;",
                     " const dirPrefix = {dir_prefix};",
                     " return dirPrefix.length > 0 && norm.startsWith(dirPrefix) && norm.length > dirPrefix.length;",
                     " }} catch (_) {{ return false; }}",
                     " }})()"
                 ),
                 win_drive = if windows_drive { "true" } else { "false" },
+                pct_exact = js_string_literal(&pct_exact),
+                pct_dir = js_string_literal(&pct_dir),
                 exact_raw = js_string_literal(&exact_raw),
                 exact_file = js_string_literal(&exact_file),
                 dir_prefix = js_string_literal(&dir_prefix),
             )
         }
+    };
+    Some(guard_expr)
+}
+
+/// Render [`PRELOAD_SCRIPT`] wrapped in an origin guard matching `initial_url`,
+/// preventing navigated foreign-origin documents from receiving
+/// `window.Draconium` or the launch session token.
+pub fn render_preload_script_for_origin(session_token: &str, initial_url: &str) -> String {
+    let Some(guard_expr) = origin_js_guard(initial_url) else {
+        return "(() => {})();".to_owned();
     };
     let inner = render_preload_script(session_token);
     format!("(() => {{\n  if (!({guard_expr})) return;\n{inner}\n}})();")
@@ -1787,6 +1864,36 @@ pub fn resolve_async_script(call_id: u64, ok: bool, payload: &str, is_json: bool
     )
 }
 
+/// Origin-guarded counterpart of [`resolve_async_script`]: verifies in the active
+/// page's JS context that `window.location` still matches `initial_url`'s origin
+/// before invoking the resolver callback with sensitive reply payloads.
+pub fn resolve_async_script_for_origin(
+    initial_url: &str,
+    call_id: u64,
+    ok: bool,
+    payload: &str,
+    is_json: bool,
+) -> Option<String> {
+    let guard_expr = origin_js_guard(initial_url)?;
+    let call = resolve_async_script(call_id, ok, payload, is_json);
+    Some(format!(
+        "(() => {{\n  if (!({guard_expr})) return;\n  {call}\n}})();"
+    ))
+}
+
+/// Origin-guarded counterpart of [`dispatch_script`].
+pub fn dispatch_script_for_origin(
+    initial_url: &str,
+    event: &str,
+    data_json: &str,
+) -> Option<String> {
+    let guard_expr = origin_js_guard(initial_url)?;
+    let call = dispatch_script(event, data_json);
+    Some(format!(
+        "(() => {{\n  if (!({guard_expr})) return;\n  {call}\n}})();"
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2312,6 +2419,37 @@ mod tests {
             win_init,
             None
         ));
+
+        // 8. Implicit default port :80 on dev-origin & non-UTF-8 Unix file paths & origin-guarded async reply
+        let dev80 = DevOrigin::parse("http://localhost:80/").unwrap();
+        assert!(dev80.matches_url("http://localhost/app.html"));
+        assert!(allows_navigation_for_origin(
+            "http://localhost/app.html",
+            "http://localhost:80/",
+            Some(&dev80)
+        ));
+        assert!(!dev80.matches_url("http://localhost:8080/app.html"));
+
+        let unix_non_utf8 = "file:///tmp/dir-%FF/index.html";
+        assert!(has_supported_origin(unix_non_utf8));
+        assert!(url_matches_initial_origin(
+            "file:///tmp/dir-%ff/sub.html",
+            unix_non_utf8
+        ));
+        let unix_preload = render_preload_script_for_origin("tokraw", unix_non_utf8);
+        assert!(unix_preload.contains("\"/tmp/dir-%FF/\""));
+        let async_guarded = resolve_async_script_for_origin(
+            "dn://app/workspace.html",
+            7,
+            true,
+            "{\"secret\":1}",
+            true,
+        )
+        .unwrap();
+        assert!(async_guarded.contains("__draconiumResolveAsync(7, true,"));
+        assert!(async_guarded.contains("dn:\\/\\/app"));
+        assert!(resolve_async_script_for_origin("about:blank", 7, true, "x", false).is_none());
+        assert!(dispatch_script_for_origin("about:blank", "capture-saved", "{}").is_none());
         assert!(allows_child_window_url(
             "dn://app/child.html",
             win_init,
