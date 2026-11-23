@@ -22,10 +22,6 @@
 //! All items in this module are dependency-free pure Rust so they can be
 //! unit-tested on any OS with `rustc --edition 2024 --test`.
 
-use std::collections::hash_map::RandomState;
-use std::hash::{BuildHasher, Hasher};
-use std::time::{SystemTime, UNIX_EPOCH};
-
 /// Prefix marking a bridge command as a host window command rather than an
 /// application command.
 pub const WINDOW_COMMAND_PREFIX: &str = "dn-window:";
@@ -392,22 +388,90 @@ pub enum BridgeCommand<'a> {
     App(&'a str),
 }
 
+/// Fill `bytes` from the operating system's cryptographic entropy source
+/// (`/dev/urandom` on Unix, `BCryptGenRandom` on Windows).
+///
+/// Returns `false` on platforms without an implemented source, or when the
+/// OS source fails; callers treat that as fatal rather than falling back to
+/// a weaker generator (see [`generate_session_token`]).
+#[cfg(unix)]
+fn fill_os_random(bytes: &mut [u8]) -> bool {
+    use std::io::Read;
+    let Ok(mut source) = std::fs::File::open("/dev/urandom") else {
+        return false;
+    };
+    source.read_exact(bytes).is_ok()
+}
+
+/// Fill `bytes` from the operating system's cryptographic entropy source
+/// (`BCryptGenRandom` with the system-preferred RNG).
+#[cfg(windows)]
+fn fill_os_random(bytes: &mut [u8]) -> bool {
+    #[link(name = "bcrypt")]
+    unsafe extern "system" {
+        fn BCryptGenRandom(
+            h_algorithm: *mut std::ffi::c_void,
+            pb_buffer: *mut u8,
+            cb_buffer: u32,
+            dw_flags: u32,
+        ) -> i32;
+    }
+    /// `BCRYPT_USE_SYSTEM_PREFERRED_RNG`: use the system-preferred RNG
+    /// without opening an algorithm handle first.
+    const BCRYPT_USE_SYSTEM_PREFERRED_RNG: u32 = 0x0000_0002;
+    let Ok(len) = u32::try_from(bytes.len()) else {
+        return false;
+    };
+    // SAFETY: `bytes` is a valid writable buffer of `len` bytes and the
+    // system-preferred RNG needs no algorithm handle.
+    let status = unsafe {
+        BCryptGenRandom(
+            std::ptr::null_mut(),
+            bytes.as_mut_ptr(),
+            len,
+            BCRYPT_USE_SYSTEM_PREFERRED_RNG,
+        )
+    };
+    status == 0
+}
+
+/// No OS entropy source is implemented on this platform.
+#[cfg(not(any(unix, windows)))]
+fn fill_os_random(bytes: &mut [u8]) -> bool {
+    let _ = bytes;
+    false
+}
+
 /// Generate a per-launch 128-bit hex session token for same-realm preload
 /// hardening (defense-in-depth against raw `window.prompt("dn-window:...")`
 /// spoofing; not a substitute for an isolated JS compartment).
+///
+/// The 16 bytes come from the OS cryptographic entropy source
+/// ([`fill_os_random`]) so the token actually carries 128 bits of entropy,
+/// not just 128 bits of length.
+///
+/// # Panics
+/// Panics when the OS entropy source is unavailable. Issuing a token from a
+/// weaker, guessable generator (clock/PID/hash mixing) would silently
+/// downgrade the only authentication on privileged bridge commands, so
+/// token generation is deliberately fail-closed: the host must not start
+/// its privileged IPC with a token an attacker could predict.
 pub fn generate_session_token() -> String {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let pid = std::process::id();
-    let mut h1 = RandomState::new().build_hasher();
-    h1.write_u128(nanos);
-    h1.write_u32(pid);
-    let mut h2 = RandomState::new().build_hasher();
-    h2.write_u64(h1.finish());
-    h2.write_u128(nanos.rotate_left(37));
-    format!("{:016x}{:016x}", h1.finish(), h2.finish())
+    let mut bytes = [0u8; 16];
+    assert!(
+        fill_os_random(&mut bytes),
+        "OS entropy source unavailable; refusing to issue a guessable session token"
+    );
+    session_token_from_bytes(&bytes)
+}
+
+/// Hex-encode 16 entropy bytes as the 32-character session token.
+fn session_token_from_bytes(bytes: &[u8; 16]) -> String {
+    let mut token = String::with_capacity(32);
+    for byte in bytes {
+        token.push_str(&format!("{byte:02x}"));
+    }
+    token
 }
 
 /// Constant-time equality check for ASCII session tokens.
@@ -1425,6 +1489,24 @@ mod tests {
         assert_eq!(
             sanitize_window_title(&unicode_boundary, "Fallback"),
             unicode_boundary
+        );
+    }
+
+    #[test]
+    fn session_tokens_are_32_lower_hex_and_unique() {
+        let first = generate_session_token();
+        let second = generate_session_token();
+        assert_eq!(first.len(), 32);
+        assert!(
+            first
+                .chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+        );
+        assert_ne!(first, second);
+        let known: [u8; 16] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
+        assert_eq!(
+            session_token_from_bytes(&known),
+            "000102030405060708090a0b0c0d0e0f"
         );
     }
 
