@@ -613,8 +613,9 @@ enum PendingAsyncTask {
 
 struct ChildWindowEntry {
     window_id: WindowId,
-    // Drop `webview` before `rendering_context` and `servo`.
+    // Drop `webview` before `_user_content_manager`, `rendering_context`, and `servo`.
     webview: WebView,
+    _user_content_manager: Rc<UserContentManager>,
     rendering_context: Rc<WindowRenderingContext>,
     delegate: Rc<Delegate>,
     mouse_position: DevicePoint,
@@ -623,10 +624,10 @@ struct ChildWindowEntry {
 }
 
 struct State {
-    // Drop all WebViews (primary and child) before the Servo instance that owns their Constellation channel.
+    // Drop all WebViews (primary and child) before `_user_content_manager`, rendering contexts, and Servo.
     webview: WebView,
     child_windows: Vec<ChildWindowEntry>,
-    user_content_manager: Rc<UserContentManager>,
+    _user_content_manager: Rc<UserContentManager>,
     servo: Servo,
     rendering_context: Rc<WindowRenderingContext>,
     delegate: Rc<Delegate>,
@@ -658,6 +659,7 @@ struct Delegate {
     capabilities: Capabilities,
     dev_origin: Option<DevOrigin>,
     initial_url: Url,
+    initial_file_dir: Option<PathBuf>,
     autostart_app_name: &'static str,
     autostart_args: Vec<&'static str>,
     crash_dir: PathBuf,
@@ -1482,9 +1484,10 @@ impl Delegate {
             WindowCommand::OpenChildWindow => {
                 let url_str = win_platform::json_get_string(payload, "url")
                     .unwrap_or_else(|| "about:blank".to_owned());
-                if !bridge::allows_navigation_for_origin(
+                if !bridge::allows_child_window_url(
                     &url_str,
                     self.initial_url.as_str(),
+                    self.initial_file_dir.as_deref(),
                     self.dev_origin.as_ref(),
                 ) {
                     return Err(format!(
@@ -1769,13 +1772,13 @@ impl WebViewDelegate for Delegate {
     }
 
     /// Navigation guard (Milestone B + Stage 1 `--dev-url` loopback origin):
-    /// Draconium apps are local, so only same-origin `file://` documents,
-    /// `dn://app/`, `about:blank`, and the configured loopback dev server may
-    /// navigate.
+    /// Draconium apps are confined strictly to their initial origin (and
+    /// canonicalized initial directory when launched from `file://`).
     fn request_navigation(&self, _: WebView, request: NavigationRequest) {
-        if bridge::allows_navigation_for_origin(
+        if bridge::allows_navigation_for_origin_with_fs(
             request.url.as_str(),
             self.initial_url.as_str(),
+            self.initial_file_dir.as_deref(),
             self.dev_origin.as_ref(),
         ) {
             request.allow();
@@ -1850,11 +1853,20 @@ impl WebViewDelegate for Delegate {
             EmbedderControl::SimpleDialog(SimpleDialog::Prompt(mut prompt)) => {
                 // Privileged `dn-window:` and async commands require the per-launch
                 // session token closed inside the frozen preload bridge, and are
-                // checked against both the initial origin and the declarative
-                // `Capabilities` ACL.
-                let same_origin = webview.url().is_some_and(|current| {
-                    bridge::url_matches_initial_origin(current.as_str(), self.initial_url.as_str())
-                });
+                // checked against the trusted initial origin (plus populated
+                // WebView history URL when available) and the `Capabilities` ACL.
+                let trusted_launch_origin = bridge::has_supported_origin(self.initial_url.as_str())
+                    && (!bridge::is_file_url(self.initial_url.as_str())
+                        || self.initial_file_dir.is_some());
+                let same_origin = trusted_launch_origin
+                    && webview.url().is_none_or(|current| {
+                        bridge::allows_navigation_for_origin_with_fs(
+                            current.as_str(),
+                            self.initial_url.as_str(),
+                            self.initial_file_dir.as_deref(),
+                            self.dev_origin.as_ref(),
+                        )
+                    });
                 let reply = if !same_origin {
                     Err("このオリジンではネイティブブリッジを利用できません".to_owned())
                 } else {
@@ -2278,6 +2290,20 @@ fn spawn_child_window(
     let child_rc = Rc::new(rc);
     let _ = child_rc.make_current();
 
+    let child_file_dir = bridge::resolve_initial_file_dir(child_initial_url.as_str());
+    let child_ucm = Rc::new(UserContentManager::new(&state.servo));
+    child_ucm.add_stylesheet(Rc::new(UserStyleSheet::new(
+        bridge::POPOVER_POLYFILL_CSS.to_owned(),
+        Url::parse("dn://app/dn-popover-polyfill.css").expect("valid static stylesheet URL"),
+    )));
+    child_ucm.add_script(Rc::new(UserScript::new(
+        bridge::render_preload_script_for_origin(
+            &state.delegate.session_token,
+            child_initial_url.as_str(),
+        ),
+        None,
+    )));
+
     let child_delegate = Rc::new(Delegate {
         default_title: title_owned,
         explicit_title: RefCell::new(None),
@@ -2292,6 +2318,7 @@ fn spawn_child_window(
         capabilities: state.delegate.capabilities.attenuate_for_child(),
         dev_origin: state.delegate.dev_origin.clone(),
         initial_url: child_initial_url,
+        initial_file_dir: child_file_dir,
         autostart_app_name: state.delegate.autostart_app_name,
         autostart_args: state.delegate.autostart_args.clone(),
         crash_dir: state.delegate.crash_dir.clone(),
@@ -2333,14 +2360,14 @@ fn spawn_child_window(
                 .url(url)
                 .hidpi_scale_factor(scale)
                 .delegate(child_delegate.clone())
-                .user_content_manager(state.user_content_manager.clone())
+                .user_content_manager(child_ucm.clone())
                 .build()
         }
         PendingChildWindow::FromServoRequest(request) => request
             .builder(child_rc.clone())
             .hidpi_scale_factor(scale)
             .delegate(child_delegate.clone())
-            .user_content_manager(state.user_content_manager.clone())
+            .user_content_manager(child_ucm.clone())
             .build(),
     };
     child_webview.notify_theme_change(if dark { Theme::Dark } else { Theme::Light });
@@ -2349,6 +2376,7 @@ fn spawn_child_window(
     state.child_windows.push(ChildWindowEntry {
         window_id,
         webview: child_webview,
+        _user_content_manager: child_ucm,
         rendering_context: child_rc,
         delegate: child_delegate,
         mouse_position: DevicePoint::zero(),
@@ -2592,6 +2620,7 @@ impl ApplicationHandler<HostEvent> for App {
         }
 
         let initial_url = config.url.clone();
+        let initial_file_dir = bridge::resolve_initial_file_dir(initial_url.as_str());
         let delegate = Rc::new(Delegate {
             default_title: config.title.to_owned(),
             explicit_title: RefCell::new(None),
@@ -2606,6 +2635,7 @@ impl ApplicationHandler<HostEvent> for App {
             capabilities: config.capabilities,
             dev_origin: config.dev_origin,
             initial_url,
+            initial_file_dir,
             autostart_app_name: config.autostart_app_name,
             autostart_args: config.autostart_args,
             crash_dir: config.crash_dir,
@@ -2654,7 +2684,7 @@ impl ApplicationHandler<HostEvent> for App {
         self.state = Some(State {
             webview,
             child_windows: Vec::new(),
-            user_content_manager,
+            _user_content_manager: user_content_manager,
             servo,
             rendering_context,
             delegate,

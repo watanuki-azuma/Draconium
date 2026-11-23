@@ -121,7 +121,7 @@ impl DevOrigin {
             || trimmed != url
             || trimmed
                 .chars()
-                .any(|ch| ch.is_control() || ch.is_whitespace() || ch == '\\' || ch == '@')
+                .any(|ch| ch.is_control() || ch.is_whitespace())
         {
             return false;
         }
@@ -132,6 +132,9 @@ impl DevOrigin {
             return false;
         }
         let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+        if authority.is_empty() || authority.contains('@') || authority.contains('\\') {
+            return false;
+        }
         let (host_raw, port_raw) = if let Some(after_bracket) = authority.strip_prefix("[::1]") {
             let Some(port_str) = after_bracket.strip_prefix(':') else {
                 return false;
@@ -790,11 +793,7 @@ fn parse_file_url_parts(url: &str) -> Option<(Vec<String>, bool, bool)> {
 }
 
 fn parse_http_origin(url: &str) -> Option<(&'static str, String, u16)> {
-    if url.is_empty()
-        || url
-            .chars()
-            .any(|ch| ch.is_control() || ch.is_whitespace() || ch == '\\' || ch == '@')
-    {
+    if url.is_empty() || url.chars().any(|ch| ch.is_control() || ch.is_whitespace()) {
         return None;
     }
     let (scheme_raw, rest) = url.split_once("://")?;
@@ -806,7 +805,7 @@ fn parse_http_origin(url: &str) -> Option<(&'static str, String, u16)> {
         return None;
     };
     let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
-    if authority.is_empty() {
+    if authority.is_empty() || authority.contains('@') || authority.contains('\\') {
         return None;
     }
     let (host_raw, port) = if let Some(bracket_end) = authority.find(']') {
@@ -876,11 +875,82 @@ fn file_segments_eq(a: &[String], b: &[String], case_insensitive: bool) -> bool 
     a.len() == b.len()
         && a.iter().zip(b.iter()).all(|(left, right)| {
             if case_insensitive {
-                left.eq_ignore_ascii_case(right)
+                left.to_lowercase() == right.to_lowercase()
             } else {
                 left == right
             }
         })
+}
+
+fn file_segments_to_path(segments: &[String], windows_drive: bool) -> Option<std::path::PathBuf> {
+    if segments.is_empty() {
+        return None;
+    }
+    if windows_drive {
+        let mut path = std::path::PathBuf::from(format!("{}\\", segments[0]));
+        for seg in &segments[1..] {
+            path.push(seg);
+        }
+        Some(path)
+    } else {
+        if cfg!(windows) {
+            return None;
+        }
+        let mut path = std::path::PathBuf::from("/");
+        for seg in segments {
+            path.push(seg);
+        }
+        Some(path)
+    }
+}
+
+/// Return `true` when `url` represents one of the origin-bound schemes capable
+/// of receiving host bridge privileges (`dn://app/`, `http(s)://...`, or local
+/// `file://...`). `about:blank` and other non-origin URLs return `false`.
+pub fn has_supported_origin(url: &str) -> bool {
+    parse_initial_origin(url).is_some()
+}
+
+/// Return `true` when `url` uses the `file://` scheme (case-insensitively).
+pub fn is_file_url(url: &str) -> bool {
+    url.split_once(':')
+        .is_some_and(|(scheme, _)| scheme.eq_ignore_ascii_case("file"))
+}
+
+/// Canonicalize the allowed base directory for a `file://` launch URL,
+/// failing closed if `initial_url` escapes its own parent directory via symlink
+/// or junction or cannot be resolved on disk.
+pub fn resolve_initial_file_dir(initial_url: &str) -> Option<std::path::PathBuf> {
+    let (segments, trailing_slash, windows_drive) = parse_file_url_parts(initial_url)?;
+    let path = file_segments_to_path(&segments, windows_drive)?;
+    let canon = std::fs::canonicalize(&path).ok()?;
+    if trailing_slash {
+        canon.is_dir().then_some(canon)
+    } else {
+        let parent = path.parent()?;
+        let parent_canon = std::fs::canonicalize(parent).ok()?;
+        if !canon.starts_with(&parent_canon) {
+            return None;
+        }
+        parent_canon.is_dir().then_some(parent_canon)
+    }
+}
+
+/// Verify on disk that a `file://` target URL resolves via `fs::canonicalize`
+/// to an existing path strictly contained inside `allowed_dir_canon` (preventing
+/// symlinks or Windows junctions under the app folder from reading/running
+/// documents outside it).
+pub fn file_url_is_contained(target_url: &str, allowed_dir_canon: &std::path::Path) -> bool {
+    let Some((segments, _trailing, windows_drive)) = parse_file_url_parts(target_url) else {
+        return false;
+    };
+    let Some(path) = file_segments_to_path(&segments, windows_drive) else {
+        return false;
+    };
+    let Ok(canon) = std::fs::canonicalize(&path) else {
+        return false;
+    };
+    canon != allowed_dir_canon && canon.starts_with(allowed_dir_canon)
 }
 
 /// Return `true` when `current_url` belongs to the same trust origin as
@@ -936,27 +1006,57 @@ pub fn url_matches_initial_origin(current_url: &str, initial_url: &str) -> bool 
     }
 }
 
-/// Origin-bound navigation policy:
-/// - rejects non-local / invalid URLs via [`allows_navigation_with_dev`]
-/// - confines `file://` targets to `initial_url`'s directory (when
-///   `initial_url` itself uses `file://`; `dn://app/` apps cannot navigate to
-///   arbitrary local `file://` documents)
-/// - permits `dn://app/`, `about:blank`, and the active loopback `--dev-url`.
+/// Strict same-origin navigation policy with optional filesystem canonical
+/// containment for `file://` URLs:
+/// - `dn://app/...` apps may navigate only within `dn://app/...`
+/// - `--dev-url` apps may navigate only within their matching loopback dev origin
+/// - `file://` apps may navigate only to existing `file://` targets inside
+///   `initial_file_dir` (and matching `initial_url`'s origin).
+pub fn allows_navigation_for_origin_with_fs(
+    target_url: &str,
+    initial_url: &str,
+    initial_file_dir: Option<&std::path::Path>,
+    dev_origin: Option<&DevOrigin>,
+) -> bool {
+    if !allows_navigation_for_origin(target_url, initial_url, dev_origin) {
+        return false;
+    }
+    if is_file_url(target_url) {
+        return initial_file_dir.is_some_and(|dir| file_url_is_contained(target_url, dir));
+    }
+    true
+}
+
+/// Origin-bound navigation policy (syntax-level counterpart of
+/// [`allows_navigation_for_origin_with_fs`] when no on-disk root is resolved):
+/// rejects cross-origin transitions such as `dn://app/` -> `file://` or
+/// foreign origins while keeping local intra-origin transitions working.
 pub fn allows_navigation_for_origin(
     target_url: &str,
     initial_url: &str,
     dev_origin: Option<&DevOrigin>,
 ) -> bool {
+    allows_navigation_with_dev(target_url, dev_origin)
+        && url_matches_initial_origin(target_url, initial_url)
+}
+
+/// Child-window creation allowlist for `Draconium.window.openChild`:
+/// allows `dn://app/`, `about:blank`, the configured `--dev-url` origin, and
+/// (when launched from `file://`) canonically contained same-directory
+/// `file://` URLs.
+pub fn allows_child_window_url(
+    target_url: &str,
+    initial_url: &str,
+    initial_file_dir: Option<&std::path::Path>,
+    dev_origin: Option<&DevOrigin>,
+) -> bool {
     if !allows_navigation_with_dev(target_url, dev_origin) {
         return false;
     }
-    if let Some((scheme, _)) = target_url.split_once(':')
-        && scheme.eq_ignore_ascii_case("file")
-    {
-        return matches!(
-            parse_initial_origin(initial_url),
-            Some(InitialOrigin::File { .. })
-        ) && url_matches_initial_origin(target_url, initial_url);
+    if is_file_url(target_url) {
+        return is_file_url(initial_url)
+            && url_matches_initial_origin(target_url, initial_url)
+            && initial_file_dir.is_some_and(|dir| file_url_is_contained(target_url, dir));
     }
     true
 }
@@ -1014,14 +1114,14 @@ pub fn render_preload_script_for_origin(session_token: &str, initial_url: &str) 
             base_dir_len,
             windows_drive,
         } => {
-            let format_path = |count: usize, trailing_slash: bool| -> String {
+            let format_path = |count: usize, trailing_slash: bool, lower: bool| -> String {
                 let mut s = String::from("/");
                 for (idx, seg) in segments.iter().take(count).enumerate() {
                     if idx > 0 {
                         s.push('/');
                     }
-                    if windows_drive {
-                        s.push_str(&seg.to_ascii_lowercase());
+                    if lower {
+                        s.push_str(&seg.to_lowercase());
                     } else {
                         s.push_str(seg);
                     }
@@ -1031,9 +1131,10 @@ pub fn render_preload_script_for_origin(session_token: &str, initial_url: &str) 
                 }
                 s
             };
-            let exact_file = format_path(segments.len(), false);
+            let exact_raw = format_path(segments.len(), false, false);
+            let exact_file = format_path(segments.len(), false, windows_drive);
             let dir_prefix = if base_dir_len > 0 {
-                format_path(base_dir_len, true)
+                format_path(base_dir_len, true, windows_drive)
             } else {
                 String::new()
             };
@@ -1053,6 +1154,7 @@ pub fn render_preload_script_for_origin(session_token: &str, initial_url: &str) 
                     " const segs = decoded.split(\"/\").filter((s) => s.length > 0);",
                     " if (segs.some((s) => s === \".\" || s === \"..\")) return false;",
                     " const normRaw = \"/\" + segs.join(\"/\");",
+                    " if (normRaw === {exact_raw}) return true;",
                     " const norm = {win_drive} ? normRaw.toLowerCase() : normRaw;",
                     " if (norm === {exact_file}) return true;",
                     " const dirPrefix = {dir_prefix};",
@@ -1061,6 +1163,7 @@ pub fn render_preload_script_for_origin(session_token: &str, initial_url: &str) 
                     " }})()"
                 ),
                 win_drive = if windows_drive { "true" } else { "false" },
+                exact_raw = js_string_literal(&exact_raw),
                 exact_file = js_string_literal(&exact_file),
                 dir_prefix = js_string_literal(&dir_prefix),
             )
@@ -2176,5 +2279,93 @@ mod tests {
 
         let blank_preload = render_preload_script_for_origin("secret_tok", "about:blank");
         assert!(!blank_preload.contains("secret_tok"));
+
+        // 5. HTTP URL suffixes containing '@' (query/fragment) stay within origin while userinfo is rejected
+        assert!(dev.matches_url("http://127.0.0.1:5173/notes?email=a@b.com#sec@1"));
+        assert!(url_matches_initial_origin(
+            "http://127.0.0.1:5173/notes?email=a@b.com#sec@1",
+            "http://127.0.0.1:5173/index.html"
+        ));
+        assert!(!dev.matches_url("http://user@127.0.0.1:5173/index.html"));
+        assert!(!url_matches_initial_origin(
+            "http://user@127.0.0.1:5173/index.html",
+            "http://127.0.0.1:5173/index.html"
+        ));
+
+        // 6. Non-ASCII Unicode case folding parity on Windows paths
+        let unicode_win = "file:///C:/Users/ÄÖÜ/Workspace/index.html";
+        assert!(url_matches_initial_origin(
+            "file:///c:/users/äöü/workspace/panel.html",
+            unicode_win
+        ));
+        let unicode_preload = render_preload_script_for_origin("toku", unicode_win);
+        assert!(unicode_preload.contains("\"/c:/users/äöü/workspace/\""));
+
+        // 7. Strict origin navigation blocks cross-origin jumps & canonical fs check verifies real paths
+        assert!(!allows_navigation_for_origin(
+            "about:blank",
+            "dn://app/workspace.html",
+            None
+        ));
+        assert!(!allows_navigation_for_origin(
+            "dn://app/workspace.html",
+            win_init,
+            None
+        ));
+        assert!(allows_child_window_url(
+            "dn://app/child.html",
+            win_init,
+            None,
+            None
+        ));
+        assert!(allows_child_window_url(
+            "about:blank",
+            "dn://app/workspace.html",
+            None,
+            None
+        ));
+
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let fs_root = std::env::temp_dir().join(format!("dn-origin-fs-{stamp}"));
+        let ui_dir = fs_root.join("ui");
+        let outside_dir = fs_root.join("outside");
+        std::fs::create_dir_all(&ui_dir).unwrap();
+        std::fs::create_dir_all(&outside_dir).unwrap();
+        let entry = ui_dir.join("app.html");
+        let sibling = ui_dir.join("panel.html");
+        let outside = outside_dir.join("secret.html");
+        std::fs::write(&entry, b"entry").unwrap();
+        std::fs::write(&sibling, b"sibling").unwrap();
+        std::fs::write(&outside, b"secret").unwrap();
+
+        let to_file_url = |p: &std::path::Path| -> String {
+            let norm = p.to_string_lossy().replace('\\', "/");
+            if norm.starts_with('/') {
+                format!("file://{norm}")
+            } else {
+                format!("file:///{norm}")
+            }
+        };
+        let entry_url = to_file_url(&entry);
+        let sibling_url = to_file_url(&sibling);
+        let outside_url = to_file_url(&outside);
+        let resolved_dir = resolve_initial_file_dir(&entry_url).expect("resolve ui_dir");
+        assert!(allows_navigation_for_origin_with_fs(
+            &sibling_url,
+            &entry_url,
+            Some(&resolved_dir),
+            None
+        ));
+        assert!(!allows_navigation_for_origin_with_fs(
+            &outside_url,
+            &entry_url,
+            Some(&resolved_dir),
+            None
+        ));
+        assert!(!file_url_is_contained(&to_file_url(&ui_dir), &resolved_dir));
+        let _ = std::fs::remove_dir_all(&fs_root);
     }
 }

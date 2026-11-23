@@ -26,7 +26,7 @@ Windows WebView2（`wry`）実装は比較基準として `probes/webview2/` に
   - `dn://app/` カスタムスキーム（ディレクトリトラバーサル防止、アプリ側供給の `EmbeddedAsset` 単一バイナリ埋め込みフォールバック、HTML / SVG / XML への厳格 `Content-Security-Policy` ヘッダ付与、`--csp-wasm` 対応）。
   - 初期オリジンに紐付く宣言的 [`Capabilities`](crates/draconium-host/src/policy.rs) ACL と、子ウィンドウ（`openChild` / `window.open`）への自動権限減衰。
   - 起動毎 128-bit セッショントークン認証と、初期オリジン限定で注入される再帰的 `Object.freeze` 済み `window.Draconium` プリロードブリッジ。
-  - 外部遷移ガード（`dn://app/`・初期ディレクトリ配下のローカル `file://`［`dn://` 起動時や UNC / 上位・兄弟ディレクトリは拒否］・`about:blank`・明示指定 `--dev-url` ループバックのみ許可）。
+  - 外部遷移ガード（WebView ごとに初期オリジンへ限定：`dn://app/`・初期ディレクトリ配下の正規化済みローカル `file://`・明示指定 `--dev-url` ループバックのみ許可し、異オリジン遷移や UNC／シンボリックリンク脱出を拒否）。
 - **ネイティブデスクトップ統合（Windows 実機検証済み・macOS / Linux `std` バックエンド実装済み）**:
   - 枠なしカスタムクローム（`drag`・8 方向 `dragResize`・最小化／最大化・フルスクリーン / F11・透過角丸シェル）、システムトレイ（`--tray`・Windows）、グローバルホットキー（`--hotkey`・Windows）、単一インスタンス引数転送（Windows `WM_COPYDATA` / macOS・Linux Unix ドメインソケット）。
   - ネイティブファイル／フォルダ選択・保存ダイアログ、ケーパビリティトークン付きファイル D&D（`dn:file-drop`）、リッチクリップボード（Text / HTML は全 OS、`CF_DIB` 画像は Windows、PNG 画像は macOS/Linux）、カスタム URI スキーム登録（Windows / Linux）、DPAPI `safeStorage`（Windows）、デスクトップ通知、自動起動（`HKCU` / `LaunchAgents` / XDG `.desktop`）、OS ライト／ダークテーマ追随、実行時プラットフォーム機能照会（`Draconium.window.getPlatform()`・詳細は [docs/cross-platform.md](docs/cross-platform.md)）。

@@ -638,41 +638,7 @@ fn atomic_write(
     fs::create_dir_all(dir)?;
     let tmp = dir.join(tmp_name);
     fs::write(&tmp, content.as_bytes())?;
-    let replace_res = {
-        #[cfg(windows)]
-        {
-            use std::os::windows::ffi::OsStrExt;
-            #[link(name = "kernel32")]
-            unsafe extern "system" {
-                fn MoveFileExW(
-                    lp_existing_file_name: *const u16,
-                    lp_new_file_name: *const u16,
-                    dw_flags: u32,
-                ) -> i32;
-            }
-            const MOVEFILE_REPLACE_EXISTING: u32 = 0x0000_0001;
-            const MOVEFILE_WRITE_THROUGH: u32 = 0x0000_0008;
-            let src_w: Vec<u16> = tmp.as_os_str().encode_wide().chain([0]).collect();
-            let dst_w: Vec<u16> = dst.as_os_str().encode_wide().chain([0]).collect();
-            let ok = unsafe {
-                MoveFileExW(
-                    src_w.as_ptr(),
-                    dst_w.as_ptr(),
-                    MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
-                )
-            };
-            if ok != 0 {
-                Ok(())
-            } else {
-                Err(std::io::Error::last_os_error())
-            }
-        }
-        #[cfg(not(windows))]
-        {
-            fs::rename(&tmp, dst)
-        }
-    };
-    if let Err(err) = replace_res {
+    if let Err(err) = fs::rename(&tmp, dst) {
         let _ = fs::remove_file(&tmp);
         return Err(err);
     }

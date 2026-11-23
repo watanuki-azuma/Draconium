@@ -64,6 +64,8 @@ pub fn content_type_for(file_name: &str) -> &'static str {
     let extension = base.rsplit_once('.').map(|(_, ext)| ext).unwrap_or("");
     match extension.to_ascii_lowercase().as_str() {
         "html" | "htm" => "text/html; charset=utf-8",
+        "xhtml" | "xht" => "application/xhtml+xml; charset=utf-8",
+        "xml" => "application/xml; charset=utf-8",
         "css" => "text/css; charset=utf-8",
         "js" | "mjs" => "text/javascript; charset=utf-8",
         "json" | "map" => "application/json",
@@ -209,6 +211,15 @@ mod tests {
             "text/html; charset=utf-8"
         );
         assert_eq!(content_type_for("x.CSS"), "text/css; charset=utf-8");
+        assert_eq!(
+            content_type_for("page.xhtml"),
+            "application/xhtml+xml; charset=utf-8"
+        );
+        assert_eq!(
+            content_type_for("feed.xml"),
+            "application/xml; charset=utf-8"
+        );
+        assert_eq!(content_type_for("icon.svg"), "image/svg+xml");
         assert_eq!(content_type_for("assets/mod.wasm"), "application/wasm");
         assert_eq!(content_type_for("fonts/f.woff"), "font/woff");
         assert_eq!(content_type_for("fonts/f.ttf"), "font/ttf");

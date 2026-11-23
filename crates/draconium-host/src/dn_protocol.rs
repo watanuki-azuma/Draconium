@@ -89,12 +89,7 @@ impl DnAssetHandler {
         if let Ok(nosniff) = "nosniff".parse() {
             response.headers.insert("x-content-type-options", nosniff);
         }
-        let needs_csp = mime.starts_with("text/html")
-            || mime.starts_with("image/svg+xml")
-            || mime.starts_with("application/xhtml+xml")
-            || mime.starts_with("text/xml")
-            || mime.starts_with("application/xml");
-        if needs_csp
+        if should_attach_csp(mime)
             && let Some(csp) = &self.csp_header
             && let Ok(csp_val) = csp.parse()
         {
@@ -115,6 +110,31 @@ impl DnAssetHandler {
         }
         *response.body.lock() = ResponseBody::Done(b"not found".to_vec());
         response
+    }
+}
+
+fn should_attach_csp(mime: &str) -> bool {
+    mime.starts_with("text/html")
+        || mime.starts_with("image/svg+xml")
+        || mime.starts_with("application/xhtml+xml")
+        || mime.starts_with("text/xml")
+        || mime.starts_with("application/xml")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn csp_applies_to_html_svg_and_xml_documents() {
+        for asset in ["index.html", "icon.svg", "app.xhtml", "view.xml"] {
+            let mime = protocol::content_type_for(asset);
+            assert!(should_attach_csp(mime), "missing CSP for {asset} ({mime})");
+        }
+        for asset in ["style.css", "app.js", "pic.png"] {
+            let mime = protocol::content_type_for(asset);
+            assert!(!should_attach_csp(mime), "unexpected CSP for {asset}");
+        }
     }
 }
 
