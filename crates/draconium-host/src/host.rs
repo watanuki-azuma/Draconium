@@ -666,6 +666,7 @@ struct Delegate {
     explicit_title: RefCell<Option<String>>,
     last_observed_fullscreen: Cell<bool>,
     consumed_f11: Cell<Option<PhysicalKey>>,
+    last_inner_size: Cell<PhysicalSize<u32>>,
     min_size: window_state::LogicalSize,
     max_size: window_state::LogicalSize,
     window: Rc<Window>,
@@ -1101,6 +1102,7 @@ impl Delegate {
                         .window
                         .request_inner_size(LogicalSize::new(size.width, size.height))
                 {
+                    self.last_inner_size.set(applied);
                     webview.resize(applied);
                     let actual = applied.to_logical::<u32>(self.window.scale_factor());
                     return Ok(format!("{}x{}", actual.width, actual.height));
@@ -1686,6 +1688,7 @@ impl Delegate {
         )) {
             // The size was applied synchronously; keep Servo in sync now
             // instead of waiting for a Resized event that may not come.
+            self.last_inner_size.set(applied);
             webview.resize(applied);
         }
         let restore = self
@@ -1852,6 +1855,7 @@ impl WebViewDelegate for Delegate {
             .window
             .request_inner_size(PhysicalSize::new(width, height))
         {
+            self.last_inner_size.set(applied);
             webview.resize(applied);
         }
     }
@@ -2353,6 +2357,7 @@ fn spawn_child_window(
         explicit_title: RefCell::new(None),
         last_observed_fullscreen: Cell::new(window.fullscreen().is_some()),
         consumed_f11: Cell::new(None),
+        last_inner_size: Cell::new(window.inner_size()),
         min_size: MIN_SET_WINDOW_SIZE,
         max_size: MAX_SET_WINDOW_SIZE,
         window: window.clone(),
@@ -2670,6 +2675,7 @@ impl ApplicationHandler<HostEvent> for App {
             explicit_title: RefCell::new(None),
             last_observed_fullscreen: Cell::new(window.fullscreen().is_some()),
             consumed_f11: Cell::new(None),
+            last_inner_size: Cell::new(window.inner_size()),
             min_size,
             max_size,
             window,
@@ -3378,16 +3384,28 @@ impl ApplicationHandler<HostEvent> for App {
                     }
                     WindowEvent::Resized(size) => {
                         let child = &state.child_windows[idx];
+                        if size.width == 0 || size.height == 0 {
+                            return;
+                        }
+                        if child.delegate.last_inner_size.replace(size) == size {
+                            return;
+                        }
                         let _ = child.rendering_context.make_current();
                         child.webview.resize(size);
                         child.delegate.sync_fullscreen(&child.webview);
+                        state.servo.spin_event_loop();
+                        child.webview.paint();
+                        child.rendering_context.present();
+                        child.delegate.has_painted.set(true);
                     }
                     WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
                         let child = &state.child_windows[idx];
                         child
                             .webview
                             .set_hidpi_scale_factor(Scale::new(scale_factor as f32));
-                        child.webview.resize(child.delegate.window.inner_size());
+                        let size = child.delegate.window.inner_size();
+                        child.delegate.last_inner_size.set(size);
+                        child.webview.resize(size);
                     }
                     WindowEvent::Focused(focused) => {
                         let child = &mut state.child_windows[idx];
@@ -3532,9 +3550,19 @@ impl ApplicationHandler<HostEvent> for App {
                 state.delegate.has_painted.set(true);
             }
             WindowEvent::Resized(size) => {
+                if size.width == 0 || size.height == 0 {
+                    return;
+                }
+                if state.delegate.last_inner_size.replace(size) == size {
+                    return;
+                }
                 let _ = state.rendering_context.make_current();
                 webview.resize(size);
                 state.delegate.sync_fullscreen(webview);
+                state.servo.spin_event_loop();
+                webview.paint();
+                state.rendering_context.present();
+                state.delegate.has_painted.set(true);
             }
             WindowEvent::Moved(position) => {
                 // Position persistence (Milestone A): ignore OS minimize
@@ -3573,7 +3601,9 @@ impl ApplicationHandler<HostEvent> for App {
             }
             WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
                 webview.set_hidpi_scale_factor(Scale::new(scale_factor as f32));
-                webview.resize(state.delegate.window.inner_size());
+                let size = state.delegate.window.inner_size();
+                state.delegate.last_inner_size.set(size);
+                webview.resize(size);
             }
             WindowEvent::Focused(focused) => {
                 webview.set_focused(focused);

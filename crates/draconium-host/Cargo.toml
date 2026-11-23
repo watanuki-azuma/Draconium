@@ -1,6 +1,6 @@
 [package]
 name = "draconium-host"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 license = "MPL-2.0"
 description = "Lightweight, self-contained Rust desktop WebView host powered by Servo 0.8.0"
