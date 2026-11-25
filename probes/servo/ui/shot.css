@@ -1,0 +1,253 @@
+/* Draco Shot: minimal dark UI. The window itself is transparent; only the
+   idle panel and the capture stage paint anything. */
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+  height: 100%;
+  background: transparent;
+  color: #f2f2f2;
+  font-family: "Segoe UI", "Yu Gothic UI", sans-serif;
+  font-size: 14px;
+  overflow: hidden;
+  user-select: none;
+}
+
+button {
+  font: inherit;
+  color: inherit;
+  background: #3a3a3c;
+  border: 1px solid #55555a;
+  border-radius: 6px;
+  padding: 5px 10px;
+  cursor: pointer;
+}
+
+button:hover {
+  background: #48484c;
+}
+
+button.active {
+  background: #0a84ff;
+  border-color: #0a84ff;
+  color: #fff;
+}
+
+button.primary {
+  background: #0a84ff;
+  border-color: #0a84ff;
+  color: #fff;
+}
+
+button:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+input[type="text"] {
+  font: inherit;
+  color: #f2f2f2;
+  background: #1c1c1e;
+  border: 1px solid #55555a;
+  border-radius: 6px;
+  padding: 5px 8px;
+  width: 100%;
+}
+
+kbd {
+  background: #3a3a3c;
+  border: 1px solid #55555a;
+  border-bottom-width: 2px;
+  border-radius: 4px;
+  padding: 0 6px;
+  font-family: inherit;
+}
+
+/* ---- Idle panel ---- */
+
+#idle-panel {
+  margin: 18px;
+  padding: 18px 20px;
+  background: rgba(28, 28, 30, 0.97);
+  border: 1px solid #48484c;
+  border-radius: 12px;
+}
+
+#idle-panel h1 {
+  margin: 0 0 4px;
+  font-size: 20px;
+}
+
+#idle-panel .hint {
+  margin: 0 0 14px;
+  color: #bdbdc2;
+}
+
+#btn-capture {
+  width: 100%;
+  padding: 9px;
+  margin-bottom: 18px;
+  background: #0a84ff;
+  border-color: #0a84ff;
+  color: #fff;
+  font-weight: 600;
+}
+
+#settings-form .field {
+  display: block;
+  margin-bottom: 10px;
+}
+
+#settings-form .field > span:first-child {
+  display: block;
+  margin-bottom: 4px;
+  color: #bdbdc2;
+}
+
+#settings-form .row {
+  display: flex;
+  gap: 8px;
+}
+
+#settings-form .row input {
+  flex: 1;
+}
+
+#settings-form .note {
+  margin: -4px 0 10px;
+  font-size: 12px;
+  color: #8e8e93;
+}
+
+#settings-form .check {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 14px;
+}
+
+#btn-save-settings {
+  width: 100%;
+  padding: 8px;
+}
+
+/* ---- Capture stage ---- */
+
+#stage {
+  position: fixed;
+  inset: 0;
+  background: #111;
+}
+
+#canvas-wrap {
+  position: absolute;
+}
+
+#canvas-wrap canvas {
+  position: absolute;
+  left: 0;
+  top: 0;
+  width: 100%;
+  height: 100%;
+}
+
+#anno-canvas {
+  cursor: crosshair;
+  touch-action: none;
+}
+
+#select-rect {
+  position: absolute;
+  border: 1px solid #0a84ff;
+  box-shadow: 0 0 0 9999px rgba(0, 0, 0, 0.55);
+  pointer-events: none;
+}
+
+#text-input {
+  position: absolute;
+  z-index: 5;
+  font: inherit;
+  font-weight: 700;
+  color: #fff;
+  background: rgba(0, 0, 0, 0.55);
+  border: 1px dashed #0a84ff;
+  border-radius: 4px;
+  padding: 2px 4px;
+  resize: none;
+  overflow: hidden;
+  outline: none;
+}
+
+#toolbar {
+  position: absolute;
+  top: 10px;
+  left: 50%;
+  transform: translateX(-50%);
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 6px 8px;
+  background: rgba(28, 28, 30, 0.95);
+  border: 1px solid #48484c;
+  border-radius: 10px;
+  z-index: 10;
+  white-space: nowrap;
+}
+
+#toolbar .tool-group {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+#toolbar .tool-group + .tool-group {
+  border-left: 1px solid #48484c;
+  padding-left: 10px;
+}
+
+#color-group .swatch {
+  width: 20px;
+  height: 20px;
+  padding: 0;
+  border-radius: 50%;
+  border: 2px solid transparent;
+}
+
+#color-group .swatch.active {
+  border-color: #fff;
+}
+
+#stage-hint {
+  position: absolute;
+  bottom: 12px;
+  left: 50%;
+  transform: translateX(-50%);
+  margin: 0;
+  padding: 4px 12px;
+  background: rgba(28, 28, 30, 0.85);
+  border-radius: 999px;
+  color: #d7d7db;
+  font-size: 13px;
+  z-index: 10;
+  pointer-events: none;
+}
+
+/* ---- Toast ---- */
+
+#toast {
+  position: fixed;
+  bottom: 22px;
+  left: 50%;
+  transform: translateX(-50%);
+  max-width: 80%;
+  padding: 8px 14px;
+  background: rgba(28, 28, 30, 0.96);
+  border: 1px solid #48484c;
+  border-radius: 8px;
+  z-index: 100;
+}

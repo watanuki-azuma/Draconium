@@ -273,6 +273,7 @@ def phase_standalone_tests(verification: Verification) -> None:
         "crates/draconium-host/src/policy.rs",
         "probes/servo/src/workspace.rs",
         "probes/servo/src/starter.rs",
+        "probes/servo/src/shot.rs",
         "probes/servo/vendor/servo-paint/wheel_scroll.rs",
     ]
     for source in sources:
