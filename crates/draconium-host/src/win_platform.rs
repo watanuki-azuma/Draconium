@@ -825,16 +825,23 @@ pub fn normalize_bgra_to_rgba(pixels: &mut [u8]) {
     }
 }
 
-/// Downscale factor (1, 2, 4, ...) needed so a top-down RGBA frame fits the
-/// bridge payload budget ([`MAX_CAPABILITY_FILE_BYTES`]). Returns 1 when the
-/// frame already fits.
+/// Raw-RGBA byte budget for desktop captures. The frame crosses the bridge
+/// as base64 inside a JSON payload, and base64 inflates data by 4/3, so the
+/// raw budget is 3/4 of the payload ceiling ([`MAX_CLIPBOARD_BYTES`]) minus
+/// slack for PNG/zlib framing and the JSON wrapper. Budgeting the raw frame
+/// against the payload ceiling directly would overflow it by ~1/3.
+const CAPTURE_RAW_BUDGET_BYTES: u64 = (MAX_CLIPBOARD_BYTES as u64 - 64 * 1024) * 3 / 4;
+
+/// Downscale factor (1, 2, 4, ...) needed so a top-down RGBA frame, once
+/// PNG-encoded and base64-wrapped, stays within the bridge payload budget
+/// (see [`CAPTURE_RAW_BUDGET_BYTES`]). Returns 1 when the frame already fits.
 pub fn capture_downscale_factor(width: u32, height: u32) -> u32 {
     let mut factor: u64 = 1;
     loop {
         let scaled_w = u64::from(width) / factor;
         let scaled_h = u64::from(height) / factor;
         let bytes = scaled_w.saturating_mul(scaled_h).saturating_mul(4);
-        if bytes <= MAX_CAPABILITY_FILE_BYTES as u64 || factor >= 16 {
+        if bytes <= CAPTURE_RAW_BUDGET_BYTES || factor >= 16 {
             return factor as u32;
         }
         factor *= 2;
@@ -2907,7 +2914,9 @@ mod tests {
     #[test]
     fn capture_downscale_factor_respects_bridge_budget() {
         assert_eq!(capture_downscale_factor(1920, 1080), 1);
-        assert_eq!(capture_downscale_factor(2560, 1440), 1);
+        // 1440p raw is 14.7 MiB: under the payload ceiling raw, but its
+        // base64 form (~19.7 MiB) would exceed it, so it scales by 2.
+        assert_eq!(capture_downscale_factor(2560, 1440), 2);
         assert_eq!(capture_downscale_factor(3840, 2160), 2);
         assert_eq!(capture_downscale_factor(7680, 4320), 4);
     }

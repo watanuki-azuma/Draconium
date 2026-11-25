@@ -162,8 +162,10 @@ async function startCapture() {
   if (session.active || session.busy || !D) return;
   session.busy = true;
   try {
-    // Hide first so this window never appears inside its own screenshot.
+    // Hide first so this window never appears inside its own screenshot,
+    // and give the compositor a beat to actually remove it.
     D.window.hide();
+    await new Promise((resolve) => setTimeout(resolve, 150));
     const cap = await invokeAsync("capture_screen");
     const img = new Image();
     await new Promise((resolve, reject) => {
@@ -715,8 +717,8 @@ async function doSave() {
       await copyCanvasToClipboard(canvas);
     }
     endSession();
-    if (D.notify && typeof D.notify.notify === "function") {
-      D.notify.notify({
+    if (typeof D.notify === "function") {
+      D.notify({
         title: "Draco Shot",
         body: "保存しました: " + (saved && saved.fileName ? saved.fileName : "shot.png"),
       });
