@@ -1,0 +1,83 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Draco Shot</title>
+<link rel="stylesheet" href="shot.css">
+</head>
+<body>
+  <!-- Idle: launcher + the only four settings -->
+  <section id="idle-panel">
+    <h1>Draco Shot</h1>
+    <p class="hint"><kbd id="hotkey-label">Ctrl+Shift+S</kbd> で範囲キャプチャ</p>
+    <button id="btn-capture" type="button">範囲キャプチャを開始</button>
+    <form id="settings-form">
+      <label class="field">
+        <span>ホットキー</span>
+        <input id="set-hotkey" type="text" autocomplete="off" spellcheck="false">
+      </label>
+      <p class="note">ホットキーは次回起動時に反映されます（例: Ctrl+Shift+S、Ctrl+PrintScreen）</p>
+      <label class="field">
+        <span>保存先フォルダ</span>
+        <span class="row">
+          <input id="set-save-dir" type="text" autocomplete="off" spellcheck="false" placeholder="（既定: ピクチャ\Draco Shot）">
+          <button id="btn-pick-dir" type="button">選択</button>
+        </span>
+      </label>
+      <label class="field">
+        <span>ファイル名パターン</span>
+        <input id="set-pattern" type="text" autocomplete="off" spellcheck="false">
+      </label>
+      <p class="note">使えるトークン: {yyyy} {MM} {dd} {HH} {mm} {ss} {num}</p>
+      <label class="check">
+        <input id="set-autocopy" type="checkbox">
+        <span>保存時にクリップボードへもコピー</span>
+      </label>
+      <button id="btn-save-settings" type="submit">設定を保存</button>
+    </form>
+  </section>
+
+  <!-- Capture session: frozen screen, region select, annotation editor -->
+  <section id="stage" hidden>
+    <div id="canvas-wrap">
+      <canvas id="base-canvas"></canvas>
+      <canvas id="anno-canvas"></canvas>
+      <div id="select-rect" hidden></div>
+      <textarea id="text-input" hidden rows="1"></textarea>
+    </div>
+    <div id="toolbar" hidden>
+      <div class="tool-group" id="tool-group">
+        <button type="button" data-tool="arrow" title="矢印">矢印</button>
+        <button type="button" data-tool="rect" title="矩形">矩形</button>
+        <button type="button" data-tool="ellipse" title="楕円">楕円</button>
+        <button type="button" data-tool="line" title="直線">直線</button>
+        <button type="button" data-tool="text" title="テキスト">文字</button>
+        <button type="button" data-tool="step" title="番号ステップ">番号</button>
+        <button type="button" data-tool="highlight" title="蛍光マーカー">蛍光</button>
+        <button type="button" data-tool="mosaic" title="モザイク">モザイク</button>
+        <button type="button" data-tool="crop" title="トリミング（範囲の再指定）">トリミング</button>
+      </div>
+      <div class="tool-group" id="color-group"></div>
+      <div class="tool-group" id="width-group">
+        <button type="button" data-width="0">細</button>
+        <button type="button" data-width="1" class="active">中</button>
+        <button type="button" data-width="2">太</button>
+      </div>
+      <div class="tool-group">
+        <button type="button" id="btn-undo" title="元に戻す (Ctrl+Z)">↩</button>
+        <button type="button" id="btn-redo" title="やり直す (Ctrl+Y)">↪</button>
+      </div>
+      <div class="tool-group actions">
+        <button type="button" id="btn-copy" class="primary">コピー</button>
+        <button type="button" id="btn-save" class="primary">保存</button>
+        <button type="button" id="btn-cancel">キャンセル</button>
+      </div>
+    </div>
+    <p id="stage-hint">ドラッグで範囲を選択　Esc: キャンセル</p>
+  </section>
+
+  <div id="toast" hidden></div>
+  <script src="shot.js"></script>
+</body>
+</html>

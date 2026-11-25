@@ -151,6 +151,7 @@ fn parse_virtual_key(upper: &str) -> Option<u32> {
         "UP" => Some(0x26),
         "RIGHT" => Some(0x27),
         "DOWN" => Some(0x28),
+        "PRINTSCREEN" | "PRINT" | "SNAPSHOT" => Some(0x2C),
         _ => None,
     }
 }
@@ -814,6 +815,100 @@ pub fn encode_rgba_as_stored_png(width: u32, height: u32, rgba: &[u8]) -> Result
     Ok(png)
 }
 
+/// Convert top-down 32bpp BGRA pixels (as produced by Win32 `GetDIBits`) to
+/// RGBA in place: swap the R/B channels and force alpha to fully opaque (the
+/// alpha byte of a desktop capture is undefined).
+pub fn normalize_bgra_to_rgba(pixels: &mut [u8]) {
+    for px in pixels.chunks_exact_mut(4) {
+        px.swap(0, 2);
+        px[3] = 0xFF;
+    }
+}
+
+/// Raw-RGBA byte budget for desktop captures. The frame crosses the bridge
+/// as base64 inside a JSON payload, and base64 inflates data by 4/3, so the
+/// raw budget is 3/4 of the payload ceiling ([`MAX_CLIPBOARD_BYTES`]) minus
+/// slack for PNG/zlib framing and the JSON wrapper. Budgeting the raw frame
+/// against the payload ceiling directly would overflow it by ~1/3.
+const CAPTURE_RAW_BUDGET_BYTES: u64 = (MAX_CLIPBOARD_BYTES as u64 - 64 * 1024) * 3 / 4;
+
+/// Downscale factor (1, 2, 4, ...) needed so a top-down RGBA frame, once
+/// PNG-encoded and base64-wrapped, stays within the bridge payload budget
+/// (see [`CAPTURE_RAW_BUDGET_BYTES`]). Returns 1 when the frame already fits.
+pub fn capture_downscale_factor(width: u32, height: u32) -> u32 {
+    let mut factor: u64 = 1;
+    loop {
+        let scaled_w = u64::from(width) / factor;
+        let scaled_h = u64::from(height) / factor;
+        let bytes = scaled_w.saturating_mul(scaled_h).saturating_mul(4);
+        if bytes <= CAPTURE_RAW_BUDGET_BYTES || factor >= 16 {
+            return factor as u32;
+        }
+        factor *= 2;
+    }
+}
+
+/// Shrink a top-down RGBA frame by an integer `factor` using nearest-neighbor
+/// sampling (output pixel `(x, y)` copies input pixel `(x*factor, y*factor)`).
+/// A factor of 1 returns a copy of the input.
+pub fn downscale_rgba(
+    width: u32,
+    height: u32,
+    rgba: &[u8],
+    factor: u32,
+) -> Result<(u32, u32, Vec<u8>), String> {
+    if width == 0 || height == 0 || factor == 0 {
+        return Err("縮小対象の画像サイズが不正です".to_owned());
+    }
+    let expected = (width as usize)
+        .checked_mul(height as usize)
+        .and_then(|px| px.checked_mul(4))
+        .ok_or_else(|| "画像バッファサイズがオーバーフローしました".to_owned())?;
+    if rgba.len() != expected {
+        return Err("RGBA バッファサイズが不整合です".to_owned());
+    }
+    if factor == 1 {
+        return Ok((width, height, rgba.to_vec()));
+    }
+    let out_w = (width / factor).max(1);
+    let out_h = (height / factor).max(1);
+    let src_row = width as usize * 4;
+    let step = factor as usize * 4;
+    let mut out = Vec::with_capacity(out_w as usize * out_h as usize * 4);
+    for y in 0..out_h as usize {
+        let row_start = y * factor as usize * src_row;
+        for x in 0..out_w as usize {
+            let idx = row_start + x * step;
+            out.extend_from_slice(&rgba[idx..idx + 4]);
+        }
+    }
+    Ok((out_w, out_h, out))
+}
+
+/// Capture the primary display and return it as a JSON string
+/// (`{"width":W,"height":H,"scale":S,"pngBase64":"..."}`) in the same shape
+/// as [`win32::clipboard_read_image_json`]. Frames larger than the bridge
+/// payload budget are downscaled by [`capture_downscale_factor`] and the
+/// applied factor is reported as `scale`. Windows only.
+pub fn capture_desktop_image_json() -> Result<String, String> {
+    #[cfg(target_os = "windows")]
+    {
+        let (width, height, mut rgba) = win32::capture_primary_display_rgba()?;
+        normalize_bgra_to_rgba(&mut rgba);
+        let factor = capture_downscale_factor(width, height);
+        let (width, height, rgba) = downscale_rgba(width, height, &rgba, factor)?;
+        let png = encode_rgba_as_stored_png(width, height, &rgba)?;
+        let b64 = base64_encode(&png);
+        Ok(format!(
+            "{{\"width\":{width},\"height\":{height},\"scale\":{factor},\"pngBase64\":\"{b64}\"}}"
+        ))
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        Err("画面キャプチャは Windows のみ対応です".to_owned())
+    }
+}
+
 /// Encode top-down 8-bit RGBA pixels into a single-page `%PDF-1.4` document
 /// embedding a `/FlateDecode` RGB `/Image` XObject (zero external dependencies).
 pub fn encode_rgba_as_raster_pdf(width: u32, height: u32, rgba: &[u8]) -> Result<Vec<u8>, String> {
@@ -1345,6 +1440,7 @@ mod win32 {
     type Hwnd = isize;
     type Handle = isize;
     type Hkey = isize;
+    type Hdc = isize;
 
     const GWL_EXSTYLE: i32 = -20;
     const WS_EX_TRANSPARENT: isize = 0x0000_0020;
@@ -1376,6 +1472,36 @@ mod win32 {
     const WM_COPYDATA: u32 = 0x004A;
     const SMTO_BLOCK: u32 = 0x0001;
     const SMTO_ABORTIFHUNG: u32 = 0x0002;
+
+    const SM_CXSCREEN: i32 = 0;
+    const SM_CYSCREEN: i32 = 1;
+    const SRCCOPY: u32 = 0x00CC_0020;
+    const CAPTUREBLT: u32 = 0x4000_0000;
+    const BI_RGB: u32 = 0;
+    const DIB_RGB_COLORS: u32 = 0;
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct BitmapInfoHeader {
+        bi_size: u32,
+        bi_width: i32,
+        bi_height: i32,
+        bi_planes: u16,
+        bi_bit_count: u16,
+        bi_compression: u32,
+        bi_size_image: u32,
+        bi_x_pels_per_meter: i32,
+        bi_y_pels_per_meter: i32,
+        bi_clr_used: u32,
+        bi_clr_important: u32,
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct BitmapInfo {
+        bmi_header: BitmapInfoHeader,
+        bmi_colors: [u32; 1],
+    }
 
     #[repr(C)]
     #[derive(Clone, Copy)]
@@ -1419,6 +1545,38 @@ mod win32 {
             timeout: u32,
             result: *mut usize,
         ) -> isize;
+        fn GetSystemMetrics(index: i32) -> i32;
+        fn GetDC(hwnd: Hwnd) -> Hdc;
+        fn ReleaseDC(hwnd: Hwnd, hdc: Hdc) -> i32;
+    }
+
+    #[link(name = "gdi32")]
+    unsafe extern "system" {
+        fn CreateCompatibleDC(hdc: Hdc) -> Hdc;
+        fn CreateCompatibleBitmap(hdc: Hdc, width: i32, height: i32) -> isize;
+        fn SelectObject(hdc: Hdc, obj: isize) -> isize;
+        fn BitBlt(
+            hdc_dest: Hdc,
+            x_dest: i32,
+            y_dest: i32,
+            width: i32,
+            height: i32,
+            hdc_src: Hdc,
+            x_src: i32,
+            y_src: i32,
+            rop: u32,
+        ) -> i32;
+        fn GetDIBits(
+            hdc: Hdc,
+            bitmap: isize,
+            start: u32,
+            lines: u32,
+            bits: *mut c_void,
+            info: *mut BitmapInfo,
+            usage: u32,
+        ) -> i32;
+        fn DeleteDC(hdc: Hdc) -> i32;
+        fn DeleteObject(obj: isize) -> i32;
     }
 
     #[link(name = "dwmapi")]
@@ -1708,6 +1866,136 @@ mod win32 {
             return Err("EmptyClipboard に失敗しました".to_owned());
         }
         Ok(())
+    }
+
+    struct DcGuard(Hdc);
+
+    impl Drop for DcGuard {
+        fn drop(&mut self) {
+            // SAFETY: The DC was created by CreateCompatibleDC in the capture
+            // routine and is deleted exactly once here.
+            unsafe {
+                DeleteDC(self.0);
+            }
+        }
+    }
+
+    struct GdiObjectGuard(isize);
+
+    impl Drop for GdiObjectGuard {
+        fn drop(&mut self) {
+            // SAFETY: The GDI object was created by the capture routine, is
+            // deselected before this guard drops, and is deleted once here.
+            unsafe {
+                DeleteObject(self.0);
+            }
+        }
+    }
+
+    /// Capture the primary display as top-down 32bpp BGRA pixels (alpha byte
+    /// undefined; callers normalize via `normalize_bgra_to_rgba`).
+    pub fn capture_primary_display_rgba() -> Result<(u32, u32, Vec<u8>), String> {
+        // SAFETY: GetSystemMetrics takes a plain metric index.
+        let width = unsafe { GetSystemMetrics(SM_CXSCREEN) };
+        let height = unsafe { GetSystemMetrics(SM_CYSCREEN) };
+        if width <= 0 || height <= 0 {
+            return Err(format!(
+                "プライマリモニタのサイズを取得できませんでした ({width}x{height})"
+            ));
+        }
+        // SAFETY: GetDC(NULL) returns a screen DC that we release below.
+        let screen_dc = unsafe { GetDC(0) };
+        if screen_dc == 0 {
+            return Err("画面 DC の取得に失敗しました".to_owned());
+        }
+        let result = capture_from_screen_dc(screen_dc, width, height);
+        // SAFETY: Pairs with the GetDC above.
+        unsafe {
+            ReleaseDC(0, screen_dc);
+        }
+        result
+    }
+
+    fn capture_from_screen_dc(
+        screen_dc: Hdc,
+        width: i32,
+        height: i32,
+    ) -> Result<(u32, u32, Vec<u8>), String> {
+        // SAFETY: screen_dc is a live screen DC owned by the caller.
+        let mem_dc = unsafe { CreateCompatibleDC(screen_dc) };
+        if mem_dc == 0 {
+            return Err("互換 DC の作成に失敗しました".to_owned());
+        }
+        let _mem_dc_guard = DcGuard(mem_dc);
+        // SAFETY: screen_dc is live; dimensions were validated positive.
+        let bitmap = unsafe { CreateCompatibleBitmap(screen_dc, width, height) };
+        if bitmap == 0 {
+            return Err("互換ビットマップの作成に失敗しました".to_owned());
+        }
+        let _bitmap_guard = GdiObjectGuard(bitmap);
+        // SAFETY: mem_dc and bitmap are live GDI objects created above.
+        let previous = unsafe { SelectObject(mem_dc, bitmap) };
+        if previous == 0 {
+            return Err("ビットマップの選択に失敗しました".to_owned());
+        }
+        // SAFETY: Both DCs are live and the rectangle is the full display.
+        // CAPTUREBLT includes layered windows in the composed desktop image.
+        let blitted = unsafe {
+            BitBlt(
+                mem_dc,
+                0,
+                0,
+                width,
+                height,
+                screen_dc,
+                0,
+                0,
+                SRCCOPY | CAPTUREBLT,
+            )
+        };
+        if blitted == 0 {
+            return Err("画面の BitBlt に失敗しました".to_owned());
+        }
+        let mut info = BitmapInfo {
+            bmi_header: BitmapInfoHeader {
+                bi_size: std::mem::size_of::<BitmapInfoHeader>() as u32,
+                bi_width: width,
+                // Negative height requests a top-down DIB.
+                bi_height: -height,
+                bi_planes: 1,
+                bi_bit_count: 32,
+                bi_compression: BI_RGB,
+                bi_size_image: 0,
+                bi_x_pels_per_meter: 0,
+                bi_y_pels_per_meter: 0,
+                bi_clr_used: 0,
+                bi_clr_important: 0,
+            },
+            bmi_colors: [0; 1],
+        };
+        let mut pixels = vec![0u8; width as usize * height as usize * 4];
+        // SAFETY: pixels has room for width*height 32bpp rows; info describes
+        // exactly that layout; bitmap holds the BitBlt result.
+        let lines = unsafe {
+            GetDIBits(
+                mem_dc,
+                bitmap,
+                0,
+                height as u32,
+                pixels.as_mut_ptr() as *mut c_void,
+                &mut info,
+                DIB_RGB_COLORS,
+            )
+        };
+        // SAFETY: Restore the previous object so the bitmap guard may delete
+        // the bitmap while it is not selected into the DC.
+        unsafe {
+            SelectObject(mem_dc, previous);
+        }
+        if lines == 0 {
+            return Err("GetDIBits に失敗しました".to_owned());
+        }
+        Ok((width as u32, height as u32, pixels))
     }
 
     pub fn autostart_is_enabled(app_name: &str) -> Result<bool, String> {
@@ -2600,6 +2888,57 @@ mod tests {
         assert!(parse_hotkey("Ctrl+").is_err());
         assert!(parse_hotkey("Ctrl+A+B").is_err());
         assert!(parse_hotkey("").is_err());
+    }
+
+    #[test]
+    fn hotkey_parser_supports_print_screen_with_modifier() {
+        assert_eq!(
+            parse_hotkey("Ctrl+PrintScreen").unwrap(),
+            (MOD_CONTROL | MOD_NOREPEAT, 0x2C)
+        );
+        assert_eq!(
+            parse_hotkey("Ctrl+Shift+Snapshot").unwrap(),
+            (MOD_CONTROL | MOD_SHIFT | MOD_NOREPEAT, 0x2C)
+        );
+        // A modifier is still required: bare PrintScreen cannot be registered.
+        assert!(parse_hotkey("PrintScreen").is_err());
+    }
+
+    #[test]
+    fn bgra_normalization_swaps_channels_and_forces_opaque_alpha() {
+        let mut pixels = vec![0x10, 0x20, 0x30, 0x00, 0xAA, 0xBB, 0xCC, 0x7F];
+        normalize_bgra_to_rgba(&mut pixels);
+        assert_eq!(pixels, vec![0x30, 0x20, 0x10, 0xFF, 0xCC, 0xBB, 0xAA, 0xFF]);
+    }
+
+    #[test]
+    fn capture_downscale_factor_respects_bridge_budget() {
+        assert_eq!(capture_downscale_factor(1920, 1080), 1);
+        // 1440p raw is 14.7 MiB: under the payload ceiling raw, but its
+        // base64 form (~19.7 MiB) would exceed it, so it scales by 2.
+        assert_eq!(capture_downscale_factor(2560, 1440), 2);
+        assert_eq!(capture_downscale_factor(3840, 2160), 2);
+        assert_eq!(capture_downscale_factor(7680, 4320), 4);
+    }
+
+    #[test]
+    fn downscale_rgba_samples_nearest_source_pixels() {
+        // 4x2 frame where each pixel encodes its own coordinates.
+        let mut rgba = Vec::new();
+        for y in 0..2u8 {
+            for x in 0..4u8 {
+                rgba.extend_from_slice(&[x, y, 0, 255]);
+            }
+        }
+        let (w, h, out) = downscale_rgba(4, 2, &rgba, 2).unwrap();
+        assert_eq!((w, h), (2, 1));
+        assert_eq!(out, vec![0, 0, 0, 255, 2, 0, 0, 255]);
+        // Factor 1 is an exact copy; invalid buffers are rejected.
+        let (w, h, copy) = downscale_rgba(4, 2, &rgba, 1).unwrap();
+        assert_eq!((w, h), (4, 2));
+        assert_eq!(copy, rgba);
+        assert!(downscale_rgba(4, 2, &rgba[..8], 2).is_err());
+        assert!(downscale_rgba(0, 2, &[], 2).is_err());
     }
 
     #[test]

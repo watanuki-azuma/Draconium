@@ -84,6 +84,7 @@ pub use crate::window_state::{
 pub mod platform {
     pub use crate::unix_platform::{PlatformCapabilities, platform_capabilities};
     pub use crate::win_platform::{
-        opacity_to_alpha, parse_hotkey, validate_custom_uri_scheme, validate_devtools_addr,
+        capture_desktop_image_json, opacity_to_alpha, parse_hotkey, validate_custom_uri_scheme,
+        validate_devtools_addr,
     };
 }

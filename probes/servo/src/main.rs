@@ -2,6 +2,7 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
+mod shot;
 mod starter;
 mod workspace;
 
@@ -10,10 +11,11 @@ use std::path::{Path, PathBuf};
 
 use draconium_host::platform;
 use draconium_host::{
-    Capabilities, DevOrigin, EmbeddedAsset, HostConfig, HostHandler, Url, WindowConfig,
-    resolve_app_url_from, resolve_ui_path_from, run,
+    Capabilities, DevOrigin, EmbeddedAsset, HostConfig, HostHandler, LogicalSize, Url,
+    WindowConfig, resolve_app_url_from, resolve_ui_path_from, run,
 };
 
+use crate::shot::ShotApp;
 use crate::starter::StarterApp;
 use crate::workspace::{WorkspaceApp, default_workspace_dir};
 
@@ -43,6 +45,18 @@ const EMBEDDED_ASSETS: &[EmbeddedAsset] = &[
         path: "starter.js",
         bytes: include_bytes!("../ui/starter.js"),
     },
+    EmbeddedAsset {
+        path: "shot.html",
+        bytes: include_bytes!("../ui/shot.html"),
+    },
+    EmbeddedAsset {
+        path: "shot.css",
+        bytes: include_bytes!("../ui/shot.css"),
+    },
+    EmbeddedAsset {
+        path: "shot.js",
+        bytes: include_bytes!("../ui/shot.js"),
+    },
 ];
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -50,6 +64,7 @@ enum Mode {
     Workspace,
     Starter,
     Probe,
+    Shot,
 }
 
 impl Mode {
@@ -58,6 +73,7 @@ impl Mode {
             Mode::Workspace => "Local\\Draconium.Workspace",
             Mode::Starter => "Local\\Draconium.Starter",
             Mode::Probe => "Local\\Draconium.Probe",
+            Mode::Shot => "Local\\Draconium.Shot",
         }
     }
 
@@ -66,6 +82,7 @@ impl Mode {
             Mode::Workspace => "Draconium.Folio",
             Mode::Starter => "Draconium.Starter",
             Mode::Probe => "Draconium.Probe",
+            Mode::Shot => "Draconium.Shot",
         }
     }
 
@@ -74,6 +91,7 @@ impl Mode {
             Mode::Workspace => vec!["--workspace", "--single-instance"],
             Mode::Starter => vec!["--starter", "--single-instance"],
             Mode::Probe => vec!["--probe"],
+            Mode::Shot => vec!["--shot", "--single-instance"],
         }
     }
 
@@ -96,6 +114,17 @@ impl Mode {
                 .with_capture(true)
                 .with_app_commands(["echo", "host_info"]),
             Mode::Probe => Capabilities::restricted().with_capture(true),
+            Mode::Shot => Capabilities::restricted()
+                .with_window_sizing(true)
+                .with_file_dialogs(true)
+                .with_notifications(true)
+                .with_clipboard(false, true)
+                .with_app_commands([
+                    "capture_screen",
+                    "get_settings",
+                    "save_settings",
+                    "save_shot",
+                ]),
         }
     }
 }
@@ -109,6 +138,18 @@ impl HostHandler for WorkspaceApp {
 impl HostHandler for StarterApp {
     fn handle_request(&mut self, command: &str, payload: &str) -> Result<String, String> {
         StarterApp::handle_request(self, command, payload)
+    }
+}
+
+impl HostHandler for ShotApp {
+    fn handle_request(&mut self, command: &str, payload: &str) -> Result<String, String> {
+        match command {
+            // Desktop capture is a host platform primitive (the window
+            // `capturePng` command only photographs the page itself), so it
+            // is intercepted here to keep `shot.rs` std-only.
+            "capture_screen" => platform::capture_desktop_image_json(),
+            _ => ShotApp::handle_request(self, command, payload),
+        }
     }
 }
 
@@ -176,6 +217,7 @@ fn parse_args() -> Result<CliArgs, String> {
             "--workspace" => mode = Mode::Workspace,
             "--starter" => mode = Mode::Starter,
             "--probe" => mode = Mode::Probe,
+            "--shot" => mode = Mode::Shot,
             "--dn-assets" => dn_assets = true,
             "--csp-wasm" => csp_wasm = true,
             "--tray" => tray = true,
@@ -324,13 +366,27 @@ fn build_host_config(
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
-    let cli = match parse_args() {
+    let mut cli = match parse_args() {
         Ok(parsed) => parsed,
         Err(err) => {
             eprintln!("{err}");
             std::process::exit(2);
         }
     };
+
+    if cli.mode == Mode::Shot {
+        // Draco Shot is a tray-resident tool: force the resident flags, and
+        // fall back to the configured (or built-in default) hotkey when the
+        // CLI did not specify one.
+        cli.tray = true;
+        cli.single_instance = true;
+        if cli.hotkey.is_none() {
+            let spec = shot::configured_hotkey(&shot::default_shot_dir());
+            cli.hotkey = platform::parse_hotkey(&spec)
+                .ok()
+                .or_else(|| platform::parse_hotkey(shot::DEFAULT_HOTKEY).ok());
+        }
+    }
 
     match cli.mode {
         Mode::Workspace => {
@@ -372,6 +428,37 @@ fn main() -> Result<(), Box<dyn Error>> {
                 &cli,
             );
             run(config, StarterApp::default(), cli.self_test)
+        }
+        Mode::Shot => {
+            let data_dir = shot::default_shot_dir();
+            let (url, asset_root) = resolve_app_url_from(
+                manifest_dir(),
+                cli.dn_assets,
+                cli.dev_url.as_deref(),
+                "shot.html",
+                "ui/shot.html",
+                "ui/shot.html",
+            );
+            // Fullscreen overlay window: frameless, transparent, always on
+            // top, hidden until the hotkey (or tray) summons it.
+            let window = WindowConfig {
+                decorations: false,
+                always_on_top: true,
+                skip_taskbar: true,
+                transparent: true,
+                start_hidden: true,
+                initial_size: LogicalSize::new(520, 420),
+                ..WindowConfig::default()
+            };
+            let config = build_host_config(
+                "Draco Shot",
+                url,
+                asset_root,
+                apply_cli_window(window, &cli),
+                resolve_crash_dir(&cli, &data_dir),
+                &cli,
+            );
+            run(config, ShotApp::new(data_dir), cli.self_test)
         }
         Mode::Probe => {
             if cli.dn_assets {
