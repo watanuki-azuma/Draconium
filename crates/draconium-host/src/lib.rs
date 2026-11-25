@@ -11,8 +11,8 @@
 //!
 //! ```no_run
 //! use draconium_host::{
-//!     Capabilities, EmbeddedAsset, HostConfig, HostHandler, WindowConfig, resolve_app_url_from,
-//!     run,
+//!     Capabilities, EmbeddedAsset, HostConfig, HostHandler, WindowConfig, run,
+//!     try_resolve_app_url_from,
 //! };
 //! use std::path::Path;
 //!
@@ -33,14 +33,14 @@
 //! }
 //!
 //! fn main() -> Result<(), Box<dyn std::error::Error>> {
-//!     let (url, asset_root) = resolve_app_url_from(
+//!     let (url, asset_root) = try_resolve_app_url_from(
 //!         Path::new(env!("CARGO_MANIFEST_DIR")),
 //!         true,
 //!         None,
 //!         "index.html",
 //!         "ui/index.html",
 //!         "ui/index.html",
-//!     );
+//!     )?;
 //!     let config = HostConfig::new("My App", url)
 //!         .with_window(WindowConfig::standard(960, 640))
 //!         .with_asset_root(asset_root)
@@ -56,13 +56,16 @@ mod dn_protocol;
 mod embedder_ui;
 mod host;
 mod input;
+#[doc(hidden)]
+pub mod json;
+mod platform_capabilities;
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+mod platform_services;
 mod policy;
 mod protocol;
 #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 mod tray;
 mod unix_platform;
-#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
-mod win_platform;
 mod window_state;
 
 pub use url::Url;
@@ -82,8 +85,8 @@ pub use crate::window_state::{
 /// Platform validation, capability introspection, and parsing utilities for CLI
 /// flags and host setup.
 pub mod platform {
-    pub use crate::unix_platform::{PlatformCapabilities, platform_capabilities};
-    pub use crate::win_platform::{
+    pub use crate::platform_capabilities::{PlatformCapabilities, platform_capabilities};
+    pub use crate::platform_services::{
         opacity_to_alpha, parse_hotkey, validate_custom_uri_scheme, validate_devtools_addr,
     };
 }

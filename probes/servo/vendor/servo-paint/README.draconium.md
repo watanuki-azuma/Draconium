@@ -19,5 +19,7 @@ and quantizes intermediate `WheelScroll` steps to `2^-10` px to prevent multi-fr
 Only `lib.rs`, `painter.rs` and `webview_renderer.rs` differ from the published Rust files.
 `wheel_scroll.rs` contains the private interpolation and five focused tests;
 it has no external dependencies and can be tested directly with rustc.
+The Windows Servo check in `servo-build.yml` type-checks the full patched crate
+through the probe's Cargo manifest.
 The full crate is present because Cargo patches apply at package level.
 No engine version, dependency version or public API is added or changed.

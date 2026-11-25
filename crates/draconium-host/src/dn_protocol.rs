@@ -11,10 +11,10 @@
 //!
 //! Features:
 //! - Serves safe nested paths under `asset_root` (`dn://app/assets/...`),
-//!   verifying canonical path confinement inside `root_canon` to prevent
-//!   symlink or junction escapes.
+//!   verifying canonical path confinement and limiting each disk asset to
+//!   64 MiB.
 //! - Falls back to caller-supplied `embedded_assets` ([`protocol::EmbeddedAsset`])
-//!   when `asset_root` is `None` or a file is not overridden on disk.
+//!   when a file is absent, unreadable, or above the disk limit.
 //! - Injects `X-Content-Type-Options: nosniff` on all responses and the default
 //!   `Content-Security-Policy` header on HTML, SVG, and XML documents.
 
@@ -51,19 +51,6 @@ impl DnAssetHandler {
         }
     }
 
-    fn read_disk_asset(&self, rel_path: &str) -> Option<Vec<u8>> {
-        let root_canon = self.root_canon.as_ref()?;
-        let mut candidate = root_canon.clone();
-        for seg in rel_path.split('/') {
-            candidate.push(seg);
-        }
-        let canon = std::fs::canonicalize(&candidate).ok()?;
-        if !canon.starts_with(root_canon) || !canon.is_file() {
-            return None;
-        }
-        std::fs::read(&canon).ok()
-    }
-
     fn respond(&self, request: &Request) -> Response {
         let url = request.current_url();
         let timing = ResourceFetchTiming::new(request.timing_type());
@@ -73,16 +60,20 @@ impl DnAssetHandler {
         let Some(rel_path) = protocol::resolve_asset_path(url.path()) else {
             return Self::not_found(url, timing);
         };
-        let bytes = match self.read_disk_asset(&rel_path) {
+        let disk_bytes = self
+            .root_canon
+            .as_deref()
+            .and_then(|root| protocol::read_disk_asset(root, rel_path));
+        let bytes = match disk_bytes {
             Some(bytes) => bytes,
-            None => match protocol::embedded_lookup(self.embedded_assets, &rel_path) {
+            None => match protocol::embedded_lookup(self.embedded_assets, rel_path) {
                 Some(embedded) => embedded.to_vec(),
                 None => return Self::not_found(url, timing),
             },
         };
 
+        let mime = protocol::content_type_for(rel_path);
         let mut response = Response::new(url, timing);
-        let mime = protocol::content_type_for(&rel_path);
         if let Ok(content_type) = mime.parse() {
             response.headers.insert("content-type", content_type);
         }

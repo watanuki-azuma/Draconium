@@ -33,9 +33,9 @@
       </div>
 
       <nav class="mode-switch" aria-label="Editor layout" data-dn-no-drag>
-        <button type="button" class="mode-btn" data-mode="write" id="btn-mode-write">Write</button>
-        <button type="button" class="mode-btn is-active" data-mode="split" id="btn-mode-split">Split</button>
-        <button type="button" class="mode-btn" data-mode="preview" id="btn-mode-preview">Preview</button>
+        <button type="button" class="mode-btn" data-mode="write" id="btn-mode-write" aria-pressed="false">Write</button>
+        <button type="button" class="mode-btn is-active" data-mode="split" id="btn-mode-split" aria-pressed="true">Split</button>
+        <button type="button" class="mode-btn" data-mode="preview" id="btn-mode-preview" aria-pressed="false">Preview</button>
       </nav>
 
       <div class="window-controls" data-dn-no-drag>
@@ -93,15 +93,15 @@
 
           <div class="doc-actions">
             <span class="save-state" id="save-state" aria-live="polite">Saved</span>
-            <button type="button" class="btn btn-quiet" id="btn-export-menu" popovertarget="export-popover">Export</button>
+            <button type="button" class="btn btn-quiet" id="btn-export-menu" popovertarget="export-popover" aria-controls="export-popover" aria-expanded="false">Export</button>
             <button type="button" class="btn btn-quiet" id="btn-toggle-lab" aria-expanded="false">Render Lab</button>
-            <button type="button" class="btn btn-quiet btn-danger-quiet" id="btn-delete-note">Delete</button>
+            <button type="button" class="btn btn-quiet btn-danger-quiet" id="btn-delete-note">Move to Trash</button>
           </div>
         </div>
 
         <!-- Export Popover Menu -->
         <div id="export-popover" popover class="menu-popover">
-          <button type="button" class="menu-item" id="act-copy-md">Copy Markdown</button>
+          <button type="button" class="menu-item" id="act-copy-md" autofocus>Copy Markdown</button>
           <button type="button" class="menu-item" id="act-copy-html">Copy formatted HTML</button>
           <div class="menu-divider"></div>
           <button type="button" class="menu-item" id="act-save-md">Save Markdown copy</button>
@@ -137,15 +137,15 @@
             <div class="lab-metrics">
               <div class="metric-item">
                 <span class="metric-label">Frame rate</span>
-                <strong class="metric-value" id="lab-fps">60.0 fps</strong>
+                <strong class="metric-value" id="lab-fps">—</strong>
               </div>
               <div class="metric-item">
                 <span class="metric-label">Average frame</span>
-                <strong class="metric-value" id="lab-avg-ms">16.6 ms</strong>
+                <strong class="metric-value" id="lab-avg-ms">—</strong>
               </div>
               <div class="metric-item">
                 <span class="metric-label">95th percentile</span>
-                <strong class="metric-value" id="lab-p95-ms">18.0 ms</strong>
+                <strong class="metric-value" id="lab-p95-ms">—</strong>
               </div>
               <div class="metric-item">
                 <span class="metric-label">DOM nodes</span>

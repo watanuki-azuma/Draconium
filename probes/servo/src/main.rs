@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use draconium_host::platform;
 use draconium_host::{
     Capabilities, DevOrigin, EmbeddedAsset, HostConfig, HostHandler, Url, WindowConfig,
-    resolve_app_url_from, resolve_ui_path_from, run,
+    resolve_ui_path_from, run, try_resolve_app_url_from,
 };
 
 use crate::starter::StarterApp;
@@ -124,11 +124,11 @@ fn manifest_dir() -> &'static Path {
     Path::new(env!("CARGO_MANIFEST_DIR"))
 }
 
-fn file_url(exe_relative: &str, manifest_relative: &str) -> Url {
+fn file_url(exe_relative: &str, manifest_relative: &str) -> Result<Url, String> {
     let path = resolve_ui_path_from(manifest_dir(), exe_relative, manifest_relative)
         .canonicalize()
-        .unwrap_or_else(|err| panic!("UI file missing ({exe_relative}): {err}"));
-    Url::from_file_path(path).expect("Invalid UI file path")
+        .map_err(|err| format!("UI file unavailable ({exe_relative}): {err}"))?;
+    Url::from_file_path(path).map_err(|()| "Invalid UI file path".to_owned())
 }
 
 struct CliArgs {
@@ -335,19 +335,23 @@ fn main() -> Result<(), Box<dyn Error>> {
     match cli.mode {
         Mode::Workspace => {
             let data_dir = default_workspace_dir(cli.workspace_dir.clone());
-            let (url, asset_root) = resolve_app_url_from(
+            let (url, asset_root) = try_resolve_app_url_from(
                 manifest_dir(),
                 cli.dn_assets,
                 cli.dev_url.as_deref(),
                 "workspace.html",
                 "ui/workspace.html",
                 "ui/workspace.html",
-            );
+            )?;
             let config = build_host_config(
                 "Draconium Folio",
                 url,
                 asset_root,
-                apply_cli_window(WindowConfig::custom_chrome(1240, 800), &cli),
+                apply_cli_window(
+                    WindowConfig::custom_chrome(1240, 800)
+                        .with_min_size(Some(draconium_host::LogicalSize::new(500, 480))),
+                    &cli,
+                ),
                 resolve_crash_dir(&cli, &data_dir),
                 &cli,
             );
@@ -355,14 +359,14 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
         Mode::Starter => {
             let base_dir = default_workspace_dir(None);
-            let (url, asset_root) = resolve_app_url_from(
+            let (url, asset_root) = try_resolve_app_url_from(
                 manifest_dir(),
                 cli.dn_assets,
                 cli.dev_url.as_deref(),
                 "starter.html",
                 "ui/starter.html",
                 "ui/starter.html",
-            );
+            )?;
             let config = build_host_config(
                 "Draconium Starter",
                 url,
@@ -381,9 +385,9 @@ fn main() -> Result<(), Box<dyn Error>> {
             }
             let base_dir = default_workspace_dir(None);
             let url = if let Some(ref raw_dev) = cli.dev_url {
-                Url::parse(raw_dev).expect("validated --dev-url parses")
+                Url::parse(raw_dev)?
             } else {
-                file_url("ui/index.html", "../../ui/index.html")
+                file_url("ui/index.html", "../../ui/index.html")?
             };
             let config = build_host_config(
                 "Draconium - Servo",

@@ -69,6 +69,8 @@ pub struct Capabilities {
     pub allow_external_links: bool,
     pub allow_file_dialogs: bool,
     pub allow_file_drop: bool,
+    /// Also allow child windows to read files explicitly dropped into them.
+    pub allow_child_file_drop: bool,
     pub allow_safe_storage: bool,
     pub allow_notifications: bool,
     pub allow_window_sizing: bool,
@@ -91,6 +93,7 @@ impl Capabilities {
             allow_external_links: false,
             allow_file_dialogs: false,
             allow_file_drop: false,
+            allow_child_file_drop: false,
             allow_safe_storage: false,
             allow_notifications: false,
             allow_window_sizing: false,
@@ -117,6 +120,7 @@ impl Capabilities {
             allow_external_links: true,
             allow_file_dialogs: true,
             allow_file_drop: true,
+            allow_child_file_drop: false,
             allow_safe_storage: true,
             allow_notifications: true,
             allow_window_sizing: true,
@@ -132,18 +136,27 @@ impl Capabilities {
         }
     }
 
+    /// Allow a collection of complete command names, such as `["save", "load"]`.
     pub fn with_app_commands<I, S>(mut self, commands: I) -> Self
     where
         I: IntoIterator<Item = S>,
-        S: Into<String>,
+        S: AsRef<str>,
     {
-        let list: Vec<String> = commands.into_iter().map(Into::into).collect();
+        let list: Vec<String> = commands
+            .into_iter()
+            .map(|command| command.as_ref().to_owned())
+            .collect();
         self.allowed_app_commands = if list.is_empty() {
             AllowedAppCommands::None
         } else {
             AllowedAppCommands::AllowList(list)
         };
         self
+    }
+
+    /// Allow exactly one application command.
+    pub fn with_app_command(self, command: impl AsRef<str>) -> Self {
+        self.with_app_commands([command])
     }
 
     pub fn with_external_links(mut self, allow: bool) -> Self {
@@ -158,6 +171,12 @@ impl Capabilities {
 
     pub fn with_file_drop(mut self, allow: bool) -> Self {
         self.allow_file_drop = allow;
+        self
+    }
+
+    /// Permit child-window drops when file drop is also enabled for the parent.
+    pub fn with_child_file_drop(mut self, allow: bool) -> Self {
+        self.allow_child_file_drop = allow;
         self
     }
 
@@ -215,11 +234,13 @@ impl Capabilities {
     /// Produce an attenuated capability set for child windows (`window.open`
     /// or `Draconium.window.openChild`), stripping sensitive OS persistence,
     /// DPAPI, registry, file-picker, clipboard, and app-command privileges.
+    /// File drop is inherited only when the parent explicitly enables it for children.
     pub fn attenuate_for_child(&self) -> Self {
         Self {
             allow_external_links: self.allow_external_links,
             allow_file_dialogs: false,
-            allow_file_drop: false,
+            allow_file_drop: self.allow_file_drop && self.allow_child_file_drop,
+            allow_child_file_drop: false,
             allow_safe_storage: false,
             allow_notifications: self.allow_notifications,
             allow_window_sizing: self.allow_window_sizing,
@@ -331,6 +352,31 @@ impl Capabilities {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn single_command_builder_uses_the_whole_name() {
+        let caps = Capabilities::restricted().with_app_command("save_note");
+        assert!(caps.check_app_command("save_note").is_ok());
+        assert!(caps.check_app_command("s").is_err());
+    }
+
+    #[test]
+    fn child_drops_require_both_parent_permissions() {
+        let parent = Capabilities::restricted().with_file_drop(true);
+        assert!(!parent.attenuate_for_child().allow_file_drop);
+        let parent = parent.with_child_file_drop(true);
+        let child = parent.attenuate_for_child();
+        assert!(child.allow_file_drop);
+        assert!(!child.allow_file_dialogs);
+        assert!(child.check_window_command_name("file-read-text").is_ok());
+        assert!(!child.attenuate_for_child().allow_file_drop);
+        assert!(
+            !parent
+                .with_file_drop(false)
+                .attenuate_for_child()
+                .allow_file_drop
+        );
+    }
 
     #[test]
     fn standard_desktop_and_builders_allow_expected_commands_and_chrome() {

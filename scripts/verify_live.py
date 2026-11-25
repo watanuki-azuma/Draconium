@@ -20,6 +20,7 @@ import sys
 import threading
 import time
 import zlib
+from ctypes import wintypes
 
 PARENT_HTML = r"""<!doctype html>
 <html><head><title>VerifyLive</title></head><body><script>
@@ -32,6 +33,8 @@ PARENT_HTML = r"""<!doctype html>
     const decA = encA.ok ? await window.Draconium.safeStorage.decryptAsync(encA.data) : null;
     r.safeStorage = { encOk: enc.ok, decVal: dec && dec.data, asyncVal: decA && decA.data };
 
+    const sw = window.Draconium.clipboard.writeText("dn-live-sync-日本語");
+    const sr = window.Draconium.clipboard.readText();
     const cw = await window.Draconium.clipboard.writeTextAsync("dn-live-clip-日本語");
     const cr = await window.Draconium.clipboard.readTextAsync();
     const hw = window.Draconium.clipboard.writeHtml("<b>Hi</b>");
@@ -43,7 +46,7 @@ PARENT_HTML = r"""<!doctype html>
     const ir = window.Draconium.clipboard.readImage();
     const cc = window.Draconium.clipboard.clear();
     r.clipboard = {
-      cw: cw.ok, cr: cr.data,
+      sw: sw.ok, sr: sr.data, cw: cw.ok, cr: cr.data,
       hw: hw.ok, hr: hr.data,
       iw: iw.ok, irOk: ir.ok, irW: ir.data && ir.data.width, irH: ir.data && ir.data.height,
       cc: cc.ok
@@ -71,7 +74,7 @@ PARENT_HTML = r"""<!doctype html>
     r.wasmValid = WebAssembly.validate(new Uint8Array([0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00]));
 
     const childUrl = location.origin + "/child.html";
-    const oc = window.Draconium.window.openChild({ url: childUrl, title: "DraconiumChildVerify", width: 320, height: 240 });
+    const oc = await window.Draconium.window.openChildAsync({ url: childUrl, title: "DraconiumChildVerify", width: 320, height: 240 });
     r.openChild = oc;
 
     const badChild = window.Draconium.window.openChild({ url: "https://example.com" });
@@ -262,6 +265,52 @@ def recv_rdp_packet(sock: socket.socket) -> bytes:
     return bytes(buf)
 
 
+def answer_devtools_prompt(process_id: int, *, allow: bool) -> None:
+    """Answer the consent dialog of the Draconium process launched by this test."""
+    user32 = ctypes.windll.user32
+    enum_callback = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+    user32.EnumWindows.argtypes = (enum_callback, wintypes.LPARAM)
+    user32.GetWindowThreadProcessId.argtypes = (
+        wintypes.HWND, ctypes.POINTER(wintypes.DWORD)
+    )
+    user32.GetWindowTextW.argtypes = (wintypes.HWND, wintypes.LPWSTR, ctypes.c_int)
+    user32.GetClassNameW.argtypes = user32.GetWindowTextW.argtypes
+    user32.GetDlgItem.argtypes = (wintypes.HWND, ctypes.c_int)
+    user32.GetDlgItem.restype = wintypes.HWND
+    user32.PostMessageW.argtypes = (
+        wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM
+    )
+    window = None
+
+    @enum_callback
+    def find_prompt(hwnd, _):
+        nonlocal window
+        pid = wintypes.DWORD()
+        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+        if pid.value != process_id:
+            return True
+        name = ctypes.create_unicode_buffer(256)
+        user32.GetClassNameW(hwnd, name, len(name))
+        if name.value == "#32770":
+            user32.GetWindowTextW(hwnd, name, len(name))
+            if name.value == "Firefox DevTools":
+                window = hwnd
+                return False
+        return True
+
+    deadline = time.monotonic() + 10.0
+    while time.monotonic() < deadline:
+        window = None
+        user32.EnumWindows(find_prompt, 0)
+        if window:
+            button_id = 1 if allow else 2  # IDOK / IDCANCEL
+            button = user32.GetDlgItem(window, button_id)
+            if button and user32.PostMessageW(window, 0x0111, button_id, button):  # WM_COMMAND
+                return
+        time.sleep(0.1)
+    raise AssertionError("Could not answer the Firefox DevTools consent dialog")
+
+
 def test_devtools_rdp(exe: str) -> None:
     port = pick_free_port()
     addr = f"127.0.0.1:{port}"
@@ -274,21 +323,31 @@ def test_devtools_rdp(exe: str) -> None:
         errors="replace",
     )
     try:
-        banner = b""
-        deadline = time.time() + 15.0
-        while time.time() < deadline:
-            if proc.poll() is not None:
-                break
+        deadline = time.monotonic() + 15.0
+        while time.monotonic() < deadline and proc.poll() is None:
             try:
-                with socket.create_connection(("127.0.0.1", port), timeout=1.0) as sock:
-                    sock.settimeout(3.0)
-                    banner = recv_rdp_packet(sock)
-                    if b'"applicationType"' in banner:
-                        break
+                connection = socket.create_connection(("127.0.0.1", port), timeout=1.0)
             except OSError:
                 time.sleep(0.2)
+            else:
+                break
+        else:
+            raise AssertionError("DevTools RDP did not start on loopback")
+
+        with connection:
+            answer_devtools_prompt(proc.pid, allow=False)
+            connection.settimeout(3.0)
+            try:
+                rejected = connection.recv(1)
+            except ConnectionResetError:
+                rejected = b""
+            assert rejected == b"", "DevTools negotiated after the user denied the connection"
+
+        with socket.create_connection(("127.0.0.1", port), timeout=3.0) as sock:
+            answer_devtools_prompt(proc.pid, allow=True)
+            banner = recv_rdp_packet(sock)
         assert b'"applicationType"' in banner, f"DevTools RDP handshake missing: {banner!r}"
-        print(f"[PASS] devtools Firefox RDP handshake on {addr}: {len(banner)} bytes")
+        print(f"[PASS] DevTools RDP denied by Cancel and ready after approval on {addr}")
     finally:
         proc.terminate()
         try:
@@ -447,6 +506,8 @@ def test_live_http(exe: str, work_dir: str) -> None:
         "asyncVal": "dpapi-async",
     }, f"safeStorage mismatch: {p}"
     assert p.get("clipboard") == {
+        "sw": True,
+        "sr": "dn-live-sync-日本語",
         "cw": True,
         "cr": "dn-live-clip-日本語",
         "hw": True,
@@ -463,7 +524,7 @@ def test_live_http(exe: str, work_dir: str) -> None:
     assert p.get("opacity") == {"op1": True, "op2": True, "ct": True}
     assert p.get("printUsesExportPdf") is True
     assert p.get("wasmValid") is True
-    assert p.get("openChild") == {"ok": True, "data": "queued"}
+    assert p.get("openChild") == {"ok": True, "data": "opened"}
     assert p.get("badChildRejected") is True
     assert p.get("notify", {}).get("ok") is True
 

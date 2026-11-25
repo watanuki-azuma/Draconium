@@ -55,7 +55,8 @@
       const themeRes = window.Draconium.window.getTheme();
       if (themeRes && themeRes.ok) applyTheme(themeRes.data);
       window.Draconium.on("theme-changed", function (payload) {
-        if (payload && payload.theme) applyTheme(payload.theme);
+        const theme = typeof payload === "string" ? payload : payload && payload.theme;
+        if (theme === "light" || theme === "dark") applyTheme(theme);
       });
 
       const info = window.Draconium.invoke("host_info", "");

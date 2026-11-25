@@ -459,19 +459,13 @@ fn fill_os_random(bytes: &mut [u8]) -> bool {
 /// ([`fill_os_random`]) so the token actually carries 128 bits of entropy,
 /// not just 128 bits of length.
 ///
-/// # Panics
-/// Panics when the OS entropy source is unavailable. Issuing a token from a
-/// weaker, guessable generator (clock/PID/hash mixing) would silently
-/// downgrade the only authentication on privileged bridge commands, so
-/// token generation is deliberately fail-closed: the host must not start
-/// its privileged IPC with a token an attacker could predict.
-pub fn generate_session_token() -> String {
+/// Returns an error when the OS entropy source is unavailable.
+pub fn generate_session_token() -> Result<String, &'static str> {
     let mut bytes = [0u8; 16];
-    assert!(
-        fill_os_random(&mut bytes),
-        "OS entropy source unavailable; refusing to issue a guessable session token"
-    );
-    session_token_from_bytes(&bytes)
+    if !fill_os_random(&mut bytes) {
+        return Err("OS entropy source unavailable for the IPC session token");
+    }
+    Ok(session_token_from_bytes(&bytes))
 }
 
 /// Hex-encode 16 entropy bytes as the 32-character session token.
@@ -1267,7 +1261,11 @@ pub const PRELOAD_SCRIPT: &str = r#"
   const nativePrompt = window.prompt.bind(window);
   const listeners = new Map();
   const pendingAsync = new Map();
-  let nextAsyncId = 1;
+  // Keep replies from a previous document from matching a new page's calls.
+  const asyncScope = new Uint32Array(1);
+  window.crypto.getRandomValues(asyncScope);
+  const firstAsyncId = asyncScope[0] * 0x100000 + 1;
+  let nextAsyncId = firstAsyncId;
 
   function parseReply(raw) {
     if (typeof raw !== "string") return { ok: false, error: "cancelled" };
@@ -1303,6 +1301,9 @@ pub const PRELOAD_SCRIPT: &str = r#"
     if (cmd.startsWith("dn-")) {
       return Promise.resolve({ ok: false, error: "特権コマンドは window.Draconium API 経由で呼んでください" });
     }
+    if (nextAsyncId - firstAsyncId >= 0x100000) {
+      return Promise.resolve({ ok: false, error: "非同期要求の回数上限に達しました" });
+    }
     const callId = nextAsyncId++;
     return new Promise((resolve) => {
       pendingAsync.set(callId, { resolve, parseJson: false });
@@ -1316,6 +1317,9 @@ pub const PRELOAD_SCRIPT: &str = r#"
   }
 
   function callHostWindowAsync(name, payload, parseJson) {
+    if (nextAsyncId - firstAsyncId >= 0x100000) {
+      return Promise.resolve({ ok: false, error: "非同期要求の回数上限に達しました" });
+    }
     const callId = nextAsyncId++;
     return new Promise((resolve) => {
       pendingAsync.set(callId, { resolve, parseJson: Boolean(parseJson) });
@@ -1395,6 +1399,16 @@ pub const PRELOAD_SCRIPT: &str = r#"
     enumerable: false,
   });
 
+  function childWindowPayload(options) {
+    const opts = typeof options === "string" ? { url: options } : (options || {});
+    return JSON.stringify({
+      url: opts.url ? String(opts.url) : "about:blank",
+      title: opts.title ? String(opts.title) : "",
+      width: typeof opts.width === "number" ? opts.width : 800,
+      height: typeof opts.height === "number" ? opts.height : 600,
+    });
+  }
+
   const windowApi = Object.freeze({
     drag() { return callHostWindow("drag", ""); },
     dragResize(direction) { return callHostWindow("drag-resize", direction == null ? "" : String(direction)); },
@@ -1465,13 +1479,10 @@ pub const PRELOAD_SCRIPT: &str = r#"
       return callHostWindowAsync("export-pdf", JSON.stringify({ name: name ? String(name) : "capture.pdf" }), false);
     },
     openChild(options) {
-      const opts = typeof options === "string" ? { url: options } : (options || {});
-      return callHostWindow("open-child-window", JSON.stringify({
-        url: opts.url ? String(opts.url) : "about:blank",
-        title: opts.title ? String(opts.title) : "",
-        width: typeof opts.width === "number" ? opts.width : 800,
-        height: typeof opts.height === "number" ? opts.height : 600,
-      }));
+      return callHostWindow("open-child-window", childWindowPayload(options));
+    },
+    openChildAsync(options) {
+      return callHostWindowAsync("open-child-window", childWindowPayload(options), false);
     },
     getTheme() { return callHostWindow("get-theme", ""); },
     getPlatform() { return parseJsonReply(callHostWindow("get-platform", "")); },
@@ -1785,36 +1796,42 @@ pub const PRELOAD_SCRIPT: &str = r#"
 
   // --- Engine-gap shim 3: <a download> for data: and blob: URLs ---
   if (typeof document !== "undefined") {
-    document.addEventListener("click", (event) => {
+    document.addEventListener("click", async (event) => {
       if (event.defaultPrevented) return;
       const el = event.target instanceof Element ? event.target : null;
       const anchor = el ? el.closest("a[download][href]") : null;
       if (!anchor) return;
-      const href = anchor.getAttribute("href") || "";
+      const href = (anchor.getAttribute("href") || "").trim();
+      const isData = /^data:/i.test(href);
+      if (!isData && !/^blob:/i.test(href)) return;
+      event.preventDefault();
       const suggested = anchor.getAttribute("download") || "download.bin";
-      if (href.startsWith("data:")) {
-        event.preventDefault();
-        const comma = href.indexOf(",");
-        if (comma < 0) return;
-        const meta = href.slice(5, comma);
-        const body = href.slice(comma + 1);
+      let reply;
+      try {
         let dataBase64;
-        if (/;base64/i.test(meta)) {
-          dataBase64 = body;
+        if (isData) {
+          const comma = href.indexOf(",");
+          if (comma < 0) throw new Error("不正な data URL です");
+          const meta = href.slice(5, comma);
+          const body = decodeURIComponent(href.slice(comma + 1));
+          dataBase64 = /;base64$/i.test(meta)
+            ? body
+            : bytesToBase64(new TextEncoder().encode(body));
         } else {
-          const decoded = decodeURIComponent(body);
-          dataBase64 = bytesToBase64(new TextEncoder().encode(decoded));
+          const response = await fetch(href);
+          if (!response.ok) throw new Error("ダウンロードデータを取得できませんでした");
+          dataBase64 = bytesToBase64(new Uint8Array(await response.arrayBuffer()));
         }
-        callHostWindow("save-download", JSON.stringify({ name: suggested, dataBase64 }));
-      } else if (href.startsWith("blob:")) {
-        event.preventDefault();
-        fetch(href)
-          .then((res) => res.arrayBuffer())
-          .then((buf) => {
-            const dataBase64 = bytesToBase64(new Uint8Array(buf));
-            callHostWindow("save-download", JSON.stringify({ name: suggested, dataBase64 }));
-          })
-          .catch((error) => console.error("[dn download]", error));
+        reply = await callHostWindowAsync(
+          "save-download", JSON.stringify({ name: suggested, dataBase64 }), false
+        );
+      } catch (error) {
+        reply = { ok: false, error: String(error?.message || error) };
+      }
+      const handled = listeners.get("download-finished")?.size > 0;
+      dispatchFn("download-finished", { ...reply, suggestedName: suggested });
+      if (!reply.ok && reply.error !== "cancelled" && !handled) {
+        window.alert("ダウンロードに失敗しました: " + reply.error);
       }
     }, true);
   }
@@ -2070,8 +2087,8 @@ mod tests {
 
     #[test]
     fn session_tokens_are_32_lower_hex_and_unique() {
-        let first = generate_session_token();
-        let second = generate_session_token();
+        let first = generate_session_token().unwrap();
+        let second = generate_session_token().unwrap();
         assert_eq!(first.len(), 32);
         assert!(
             first
@@ -2088,7 +2105,7 @@ mod tests {
 
     #[test]
     fn session_token_auth_and_async_command_classification() {
-        let token = generate_session_token();
+        let token = generate_session_token().unwrap();
         assert_eq!(token.len(), 32);
 
         let valid = format!("dn-tok:{token}:dn-window:zoom-in");

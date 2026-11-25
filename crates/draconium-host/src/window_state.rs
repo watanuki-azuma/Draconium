@@ -189,247 +189,24 @@ pub fn physical_to_logical_position(x: i32, y: i32, scale_factor: f64) -> Logica
     )
 }
 
-// ---------------------------------------------------------------------------
-// Minimal top-level JSON field access for `config.json`.
-//
-// The host crate intentionally keeps zero external JSON dependencies, so
-// these helpers scan top-level depth-1 fields while respecting string
-// literals so braces inside strings do not disturb depth tracking.
-// ---------------------------------------------------------------------------
+#[cfg(not(test))]
+use crate::json;
+// Also compiled as an independent crate by the standalone test harness.
+#[cfg(test)]
+#[allow(dead_code)]
+#[path = "json.rs"]
+mod json;
 
-/// Decode a JSON string slice (without surrounding quotes) handling `\"` and
-/// `\\` escapes while preserving multi-byte UTF-8 characters intact.
-fn decode_json_string_content(inner: &str) -> String {
-    let mut out = String::with_capacity(inner.len());
-    let mut chars = inner.chars();
-    while let Some(ch) = chars.next() {
-        if ch == '\\' {
-            match chars.next() {
-                Some('"') => out.push('"'),
-                Some('\\') => out.push('\\'),
-                Some(other) => {
-                    out.push('\\');
-                    out.push(other);
-                }
-                None => out.push('\\'),
-            }
-        } else {
-            out.push(ch);
-        }
-    }
-    out
-}
-
-/// Find the value span (start, end) of a top-level field in a JSON object.
-///
-/// Returns `None` when `text` is not a JSON object or the key is absent at
-/// the top level. The span covers the raw value token (without surrounding
-/// whitespace).
-fn top_level_value_span(text: &str, key: &str) -> Option<(usize, usize)> {
-    let bytes = text.as_bytes();
-    let mut i = if bytes.starts_with(&[0xEF, 0xBB, 0xBF]) {
-        3
-    } else {
-        0
-    };
-    // Skip leading whitespace and require an opening brace.
-    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
-        i += 1;
-    }
-    if i >= bytes.len() || bytes[i] != b'{' {
-        return None;
-    }
-    i += 1;
-    let mut depth = 1i32;
-    while i < bytes.len() {
-        match bytes[i] {
-            b'"' => {
-                // Parse a string token using byte spans so UTF-8 sequences
-                // remain valid Rust `&str` slices.
-                let content_start = i + 1;
-                i += 1;
-                let mut closed = false;
-                let mut content_end = content_start;
-                while i < bytes.len() {
-                    match bytes[i] {
-                        b'\\' => {
-                            if i + 1 < bytes.len() {
-                                i += 2;
-                            } else {
-                                return None;
-                            }
-                        }
-                        b'"' => {
-                            content_end = i;
-                            closed = true;
-                            i += 1;
-                            break;
-                        }
-                        _ => {
-                            i += 1;
-                        }
-                    }
-                }
-                if !closed {
-                    return None;
-                }
-                let raw_content = text.get(content_start..content_end)?;
-                let content = if raw_content.contains('\\') {
-                    decode_json_string_content(raw_content)
-                } else {
-                    raw_content.to_owned()
-                };
-                if depth == 1 && content == key {
-                    // Expect ':' then the value.
-                    let mut j = i;
-                    while j < bytes.len() && bytes[j].is_ascii_whitespace() {
-                        j += 1;
-                    }
-                    if j < bytes.len() && bytes[j] == b':' {
-                        j += 1;
-                        while j < bytes.len() && bytes[j].is_ascii_whitespace() {
-                            j += 1;
-                        }
-                        let value_start = j;
-                        let value_end = scan_value_end(bytes, j)?;
-                        return Some((value_start, value_end));
-                    }
-                }
-            }
-            b'{' | b'[' => {
-                depth += 1;
-                i += 1;
-            }
-            b'}' | b']' => {
-                depth -= 1;
-                if depth == 0 {
-                    return None;
-                }
-                i += 1;
-            }
-            _ => {
-                i += 1;
-            }
-        }
-    }
-    None
-}
-
-/// Given the offset where a JSON value starts, return the offset just past
-/// its end (not including a trailing comma or closing brace).
-fn scan_value_end(bytes: &[u8], start: usize) -> Option<usize> {
-    let mut i = start;
-    if i >= bytes.len() {
-        return None;
-    }
-    match bytes[i] {
-        b'"' => {
-            i += 1;
-            while i < bytes.len() {
-                match bytes[i] {
-                    b'\\' => {
-                        if i + 1 < bytes.len() {
-                            i += 2;
-                        } else {
-                            return None;
-                        }
-                    }
-                    b'"' => return Some(i + 1),
-                    _ => i += 1,
-                }
-            }
-            None
-        }
-        b'{' | b'[' => {
-            let open = bytes[i];
-            let close = if open == b'{' { b'}' } else { b']' };
-            let mut depth = 0i32;
-            while i < bytes.len() {
-                match bytes[i] {
-                    b'"' => {
-                        i += 1;
-                        let mut closed = false;
-                        while i < bytes.len() {
-                            match bytes[i] {
-                                b'\\' => {
-                                    if i + 1 < bytes.len() {
-                                        i += 2;
-                                    } else {
-                                        return None;
-                                    }
-                                }
-                                b'"' => {
-                                    i += 1;
-                                    closed = true;
-                                    break;
-                                }
-                                _ => i += 1,
-                            }
-                        }
-                        if !closed {
-                            return None;
-                        }
-                    }
-                    byte if byte == open => {
-                        depth += 1;
-                        i += 1;
-                    }
-                    byte if byte == close => {
-                        depth -= 1;
-                        i += 1;
-                        if depth == 0 {
-                            return Some(i);
-                        }
-                    }
-                    _ => i += 1,
-                }
-            }
-            None
-        }
-        _ => {
-            // Number / true / false / null: runs until a delimiter.
-            while i < bytes.len() {
-                match bytes[i] {
-                    b',' | b'}' | b']' => break,
-                    byte if byte.is_ascii_whitespace() => break,
-                    _ => i += 1,
-                }
-            }
-            if i == start { None } else { Some(i) }
-        }
-    }
-}
-
-/// Read a top-level integer field. `null`, missing keys and non-numeric
-/// values all yield `None`.
+/// Read a top-level integer field. Missing and non-integer values yield `None`.
 pub fn json_get_i64(text: &str, key: &str) -> Option<i64> {
-    let (start, end) = top_level_value_span(text, key)?;
-    text[start..end].trim().parse::<i64>().ok()
+    let text = text.trim_start_matches('\u{FEFF}');
+    let (start, end) = json::value_span(text, key)?;
+    text[start..end].parse().ok()
 }
 
-/// Read a top-level string field (with `\"` and `\\` unescaped).
+/// Read and decode a top-level string field.
 pub fn json_get_string(text: &str, key: &str) -> Option<String> {
-    let (start, end) = top_level_value_span(text, key)?;
-    let raw = text[start..end].trim();
-    let inner = raw.strip_prefix('"')?.strip_suffix('"')?;
-    Some(decode_json_string_content(inner))
-}
-
-/// Escape a string for inclusion in a JSON string literal.
-fn json_escape(value: &str) -> String {
-    let mut out = String::with_capacity(value.len());
-    for ch in value.chars() {
-        match ch {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            ch if (ch as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", ch as u32)),
-            ch => out.push(ch),
-        }
-    }
-    out
+    json::json_get_string(text.trim_start_matches('\u{FEFF}'), key)
 }
 
 /// Replace or insert a top-level field with a pre-rendered JSON value token.
@@ -437,7 +214,7 @@ fn json_escape(value: &str) -> String {
 /// If `text` is not a JSON object it is returned unchanged.
 fn json_set_raw(text: &str, key: &str, value_token: &str) -> String {
     let text = text.trim_start_matches('\u{FEFF}');
-    if let Some((start, end)) = top_level_value_span(text, key) {
+    if let Some((start, end)) = json::value_span(text, key) {
         let mut out = String::with_capacity(text.len() + value_token.len());
         out.push_str(&text[..start]);
         out.push_str(value_token);
@@ -457,7 +234,7 @@ fn json_set_raw(text: &str, key: &str, value_token: &str) -> String {
     if has_fields {
         out.push_str(", ");
     }
-    out.push_str(&format!("\"{}\": {}", json_escape(key), value_token));
+    out.push_str(&format!("{}: {}", json::json_string(key), value_token));
     out.push_str(&text[insert_at..]);
     out
 }
@@ -473,7 +250,7 @@ pub fn json_set_i64(text: &str, key: &str, value: Option<i64>) -> String {
 
 /// Set a top-level string field.
 pub fn json_set_string(text: &str, key: &str, value: &str) -> String {
-    let token = format!("\"{}\"", json_escape(value));
+    let token = json::json_string(value);
     json_set_raw(text, key, &token)
 }
 

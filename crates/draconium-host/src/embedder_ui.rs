@@ -224,6 +224,7 @@ mod win32 {
     type Hmenu = *mut c_void;
     type Hinstance = isize;
     type ColorRef = u32;
+    const FNERR_BUFFERTOOSMALL: u32 = 0x3003;
 
     const MB_OK: u32 = 0x0000_0000;
     const MB_OKCANCEL: u32 = 0x0000_0001;
@@ -326,6 +327,7 @@ mod win32 {
     #[link(name = "comdlg32")]
     unsafe extern "system" {
         fn GetOpenFileNameW(lpofn: *mut OpenFileNameW) -> i32;
+        fn CommDlgExtendedError() -> u32;
         fn GetSaveFileNameW(lpofn: *mut OpenFileNameW) -> i32;
         fn ChooseColorW(lpcc: *mut ChooseColorW) -> i32;
     }
@@ -559,7 +561,7 @@ mod win32 {
         hwnd: Hwnd,
         extensions: &[String],
         allow_multiple: bool,
-    ) -> Option<Vec<PathBuf>> {
+    ) -> Result<Option<Vec<PathBuf>>, String> {
         let filter = build_file_filter_wide(extensions);
         let mut file_buf = vec![0u16; 32_768];
         let mut flags = OFN_EXPLORER | OFN_PATHMUSTEXIST | OFN_FILEMUSTEXIST | OFN_NOCHANGEDIR;
@@ -594,10 +596,16 @@ mod win32 {
         // SAFETY: `ofn` points to valid buffers that live through the call.
         let ok = unsafe { GetOpenFileNameW(&mut ofn) };
         if ok == 0 {
-            return None;
+            return match unsafe { CommDlgExtendedError() } {
+                0 => Ok(None),
+                FNERR_BUFFERTOOSMALL => {
+                    Err("File selection is too large. Select fewer files at once.".to_owned())
+                }
+                code => Err(format!("Could not open the file picker (code={code:#x})")),
+            };
         }
         let paths = parse_open_file_buffer(&file_buf);
-        if paths.is_empty() { None } else { Some(paths) }
+        Ok((!paths.is_empty()).then_some(paths))
     }
 
     pub fn show_save_file_dialog(
@@ -734,8 +742,8 @@ pub fn show_confirm(hwnd: isize, title: &str, message: &str, non_interactive: bo
     }
 }
 
-/// Show a native popup menu at client coordinates `(client_x, client_y)` and
-/// return the selected entry's `id`, or `None` when dismissed.
+/// Show a native popup menu at the given client coordinates on Windows or
+/// a selection dialog on desktop Unix. Returns the chosen ID when confirmed.
 pub fn show_popup_menu(
     hwnd: isize,
     client_x: i32,
@@ -750,22 +758,36 @@ pub fn show_popup_menu(
     {
         win32::show_popup_menu(hwnd, client_x, client_y, entries)
     }
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    {
+        let _ = (hwnd, client_x, client_y);
+        let enabled: Vec<_> = entries
+            .iter()
+            .filter(|entry| entry.enabled && !entry.separator)
+            .map(|entry| (entry.id, entry.label.as_str()))
+            .collect();
+        if enabled.is_empty() {
+            return None;
+        }
+        crate::unix_platform::show_menu_dialog(&enabled)
+            .filter(|id| enabled.iter().any(|(enabled_id, _)| enabled_id == id))
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
     {
         let _ = (hwnd, client_x, client_y);
         None
     }
 }
 
-/// Show a native file-open dialog for `<input type="file">`.
+/// Show a native file-open dialog. Cancellation and dialog failures are distinct.
 pub fn show_open_file_dialog(
     hwnd: isize,
     extensions: &[String],
     allow_multiple: bool,
     non_interactive: bool,
-) -> Option<Vec<PathBuf>> {
+) -> Result<Option<Vec<PathBuf>>, String> {
     if non_interactive {
-        return None;
+        return Ok(None);
     }
     #[cfg(target_os = "windows")]
     {
@@ -774,12 +796,15 @@ pub fn show_open_file_dialog(
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     {
         let _ = hwnd;
-        crate::unix_platform::show_open_file_dialog(extensions, allow_multiple)
+        Ok(crate::unix_platform::show_open_file_dialog(
+            extensions,
+            allow_multiple,
+        ))
     }
     #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
     {
         let _ = (hwnd, extensions, allow_multiple);
-        None
+        Ok(None)
     }
 }
 

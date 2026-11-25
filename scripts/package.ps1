@@ -29,6 +29,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+$App = $App.ToLowerInvariant()
 
 $repoRoot = Split-Path -Parent $PSScriptRoot
 if ([string]::IsNullOrWhiteSpace($OutputDir)) {
@@ -48,10 +49,24 @@ if (-not (Test-Path -LiteralPath $uiSourceDir -PathType Container)) {
     throw "UI directory not found: $uiSourceDir"
 }
 
-$uiPatterns = switch ($App) {
-    'all'       { @('*.html', '*.css', '*.js') }
-    'workspace' { @('workspace.html', 'workspace.css', 'workspace.js') }
-    'starter'   { @('starter.html', 'starter.css', 'starter.js') }
+$requiredApps = if ($App -eq 'all') { @('workspace', 'starter') } else { @($App) }
+$requiredUiFiles = @(foreach ($appName in $requiredApps) {
+    foreach ($extension in @('html', 'css', 'js')) {
+        $file = Join-Path $uiSourceDir "$appName.$extension"
+        if (-not (Test-Path -LiteralPath $file -PathType Leaf)) {
+            throw "Required UI asset for App='$App' is missing: $file"
+        }
+        Get-Item -LiteralPath $file
+    }
+})
+$uiFiles = if ($App -eq 'all') {
+    $requiredUiFiles
+    Get-ChildItem -LiteralPath $uiSourceDir -File |
+        Where-Object {
+            $_.Extension -in @('.html', '.css', '.js') -and $_.Name -notin $requiredUiFiles.Name
+        }
+} else {
+    $requiredUiFiles
 }
 
 $runtimeDlls = @()
@@ -149,16 +164,8 @@ try {
         Copy-Item -LiteralPath $dll.FullName -Destination (Join-Path $stage $dll.Name) -Force
     }
 
-    $copied = 0
-    foreach ($pattern in $uiPatterns) {
-        $files = @(Get-ChildItem -LiteralPath $uiSourceDir -Filter $pattern -File)
-        foreach ($file in $files) {
-            Copy-Item -LiteralPath $file.FullName -Destination (Join-Path $uiOutputDir $file.Name)
-            $copied++
-        }
-    }
-    if ($copied -eq 0) {
-        throw "No UI assets matched for App='$App' in $uiSourceDir"
+    foreach ($file in $uiFiles) {
+        Copy-Item -LiteralPath $file.FullName -Destination (Join-Path $uiOutputDir $file.Name)
     }
 
     $licensePath = Join-Path $repoRoot 'LICENSE'
@@ -189,4 +196,4 @@ try {
 if ($runtimeDlls.Count -gt 0) {
     Write-Output "Packaged GStreamer runtime ($($runtimeDlls.Count) runtime DLLs, $($pluginFiles.Count)/$($requiredPlugins.Count) plugins) to $OutputDir"
 }
-Write-Output "Packaged Draconium ($App, $copied UI files) to $OutputDir"
+Write-Output "Packaged Draconium ($App, $($uiFiles.Count) UI files) to $OutputDir"
