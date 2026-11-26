@@ -10,13 +10,28 @@
 //! module uses only the Rust standard library so it can be unit-tested
 //! standalone via `rustc --edition 2024 --test -D warnings probes/servo/src/workspace.rs`.
 
-use std::fs;
-use std::io::ErrorKind;
-use std::path::{Path, PathBuf};
-use std::time::UNIX_EPOCH;
+#[cfg(not(test))]
+use draconium_host::json;
+// Also compiled as an independent crate by the standalone test harness.
+#[cfg(test)]
+#[allow(dead_code)]
+#[path = "../../../crates/draconium-host/src/json.rs"]
+mod json;
+use json::{json_get_string, json_get_u32, json_string as json_escape};
+
+use std::fs::{self, File, Metadata, OpenOptions};
+use std::io::{ErrorKind, Read, Write};
+use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 const MAX_NOTE_BYTES: usize = 4 * 1024 * 1024;
+// A full-size note can also have a title, tags, and a UTF-8 BOM.
+const MAX_NOTE_FILE_BYTES: usize = MAX_NOTE_BYTES + 4096;
 const INIT_MARKER: &str = ".folio-initialized";
+const TRASH_DIR: &str = ".folio-trash";
+const EXTERNAL_ID_PREFIX: &str = "file:";
+static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
 
 const SEED_NOTES: &[(&str, &str)] = &[
     (
@@ -138,7 +153,10 @@ impl WorkspaceApp {
     /// Dispatches UI commands from `Draconium.invoke` / `Draconium.invokeAsync`.
     pub fn handle_request(&mut self, command: &str, payload: &str) -> Result<String, String> {
         match command {
-            "list_notes" => self.list_notes(),
+            "list_notes" => match json_get_string(payload, "query") {
+                Some(query) => self.search_notes(query.trim()),
+                None => self.list_notes(),
+            },
             "load_note" => self.load_note(payload),
             "save_note" => self.save_note(payload),
             "create_note" => self.create_note(payload),
@@ -169,7 +187,7 @@ impl WorkspaceApp {
         if !has_md {
             for (id, raw) in SEED_NOTES {
                 let path = self.note_path(id)?;
-                atomic_write(&self.data_dir, &path, &format!("{id}.md.tmp"), raw)
+                atomic_write(&self.data_dir, &path, raw)
                     .map_err(|err| format!("Failed to seed note '{id}': {err}"))?;
             }
         }
@@ -178,20 +196,32 @@ impl WorkspaceApp {
     }
 
     fn note_path(&self, id: &str) -> Result<PathBuf, String> {
+        if let Some(name) = id.strip_prefix(EXTERNAL_ID_PREFIX) {
+            let path = Path::new(name);
+            if let Some(Component::Normal(component)) = path.components().next()
+                && component == name
+                && is_markdown_file(path)
+                && (!cfg!(windows) || !name.contains(':'))
+            {
+                return Ok(self.data_dir.join(name));
+            }
+            return Err("Invalid external note id".to_owned());
+        }
         validate_note_id(id)?;
         Ok(self.data_dir.join(format!("{id}.md")))
     }
 
     fn read_parsed_note(&self, id: &str) -> Result<ParsedNote, String> {
         let path = self.note_path(id)?;
-        let meta = fs::metadata(&path).map_err(|err| match err.kind() {
-            ErrorKind::NotFound => format!("Note not found: {id}"),
-            _ => format!("Failed to inspect note '{id}': {err}"),
-        })?;
-        let raw = fs::read_to_string(&path)
-            .map_err(|err| format!("Failed to read note '{id}': {err}"))?;
+        self.read_parsed_note_at(&path, id)
+    }
+
+    fn read_parsed_note_at(&self, path: &Path, id: &str) -> Result<ParsedNote, String> {
+        let (raw, meta) = read_note_file(path, id)?;
         let clean = raw.strip_prefix('\u{FEFF}').unwrap_or(&raw);
-        let (title, tags, content) = parse_frontmatter(clean, id);
+        let document = parse_document(clean, note_stem(path));
+        let content = document.content.replace("\r\n", "\n");
+        check_note_body_size(&content, document.frontmatter.is_some())?;
         let excerpt = build_excerpt(&content);
         let updated_at = meta
             .modified()
@@ -201,8 +231,8 @@ impl WorkspaceApp {
             .unwrap_or(0);
         Ok(ParsedNote {
             id: id.to_owned(),
-            title,
-            tags,
+            title: document.title,
+            tags: document.tags,
             content,
             excerpt,
             bytes: raw.len(),
@@ -212,41 +242,50 @@ impl WorkspaceApp {
 
     /// Lists all `.md` notes in the workspace directory, sorted by recency then ID.
     pub fn list_notes(&self) -> Result<String, String> {
+        self.search_notes("")
+    }
+
+    fn search_notes(&self, query: &str) -> Result<String, String> {
         self.ensure_seeded()?;
         let entries = fs::read_dir(&self.data_dir)
             .map_err(|err| format!("Failed to list workspace directory: {err}"))?;
-        let mut notes = Vec::new();
+        let query = query.to_lowercase();
+        let mut items = Vec::new();
+        let mut note_count = 0;
+        let mut unreadable_count = 0;
         for entry in entries.filter_map(Result::ok) {
             let path = entry.path();
-            if !path.is_file() {
+            if !is_markdown_file(&path) || !entry.file_type().is_ok_and(|kind| kind.is_file()) {
                 continue;
             }
-            let is_md = path
-                .extension()
-                .and_then(|ext| ext.to_str())
-                .is_some_and(|ext| ext.eq_ignore_ascii_case("md"));
-            if !is_md {
-                continue;
-            }
-            let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+            let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+                unreadable_count += 1;
                 continue;
             };
-            if validate_note_id(stem).is_err() {
+            let id = if let Some(stem) = name.strip_suffix(".md")
+                && validate_note_id(stem).is_ok()
+            {
+                stem.to_owned()
+            } else {
+                format!("{EXTERNAL_ID_PREFIX}{name}")
+            };
+            let Ok(note) = self.read_parsed_note_at(&path, &id) else {
+                unreadable_count += 1;
+                continue;
+            };
+            note_count += 1;
+            if !query.is_empty()
+                && !note.title.to_lowercase().contains(&query)
+                && !note
+                    .tags
+                    .iter()
+                    .any(|tag| tag.to_lowercase().contains(&query))
+                && !note.excerpt.to_lowercase().contains(&query)
+                && !note.content.to_lowercase().contains(&query)
+            {
                 continue;
             }
-            if let Ok(parsed) = self.read_parsed_note(stem) {
-                notes.push(parsed);
-            }
-        }
-        notes.sort_by(|a, b| {
-            b.updated_at
-                .cmp(&a.updated_at)
-                .then_with(|| a.id.cmp(&b.id))
-        });
-
-        let mut items = Vec::with_capacity(notes.len());
-        for note in &notes {
-            items.push(format!(
+            let item = format!(
                 r#"{{"id":{},"title":{},"tags":{},"excerpt":{},"bytes":{},"updatedAt":{}}}"#,
                 json_escape(&note.id),
                 json_escape(&note.title),
@@ -254,14 +293,16 @@ impl WorkspaceApp {
                 json_escape(&note.excerpt),
                 note.bytes,
                 note.updated_at
-            ));
+            );
+            items.push((note.updated_at, note.id, item));
         }
+        items.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+        let items: Vec<_> = items.into_iter().map(|(_, _, item)| item).collect();
 
         let dir_display = self.data_dir.to_string_lossy();
         Ok(format!(
-            r#"{{"workspaceDir":{},"noteCount":{},"notes":[{}]}}"#,
+            r#"{{"workspaceDir":{},"noteCount":{note_count},"unreadableCount":{unreadable_count},"maxNoteBytes":{MAX_NOTE_BYTES},"notes":[{}]}}"#,
             json_escape(&dir_display),
-            notes.len(),
             items.join(",")
         ))
     }
@@ -285,14 +326,16 @@ impl WorkspaceApp {
         let tags_raw = json_get_string(payload, "tags").unwrap_or_default();
         let content =
             json_get_string(payload, "content").ok_or_else(|| "Missing note content".to_owned())?;
-        if content.len() > MAX_NOTE_BYTES {
-            return Err("Note exceeds the 4 MiB limit".to_owned());
-        }
         let path = self.note_path(&id)?;
-        let title = sanitize_title(&title_raw, &id);
+        // A delayed save must not recreate a note moved to the trash.
+        let (raw, _) = read_note_file(&path, &id)?;
+        let clean = raw.strip_prefix('\u{FEFF}').unwrap_or(&raw);
+        let document = parse_document(clean, note_stem(&path));
+        check_note_body_size(&content, document.frontmatter.is_some())?;
+        let title = sanitize_title(&title_raw, note_stem(&path));
         let tags = parse_tag_list(&tags_raw);
-        let serialized = format_markdown_document(&title, &tags, &content);
-        atomic_write(&self.data_dir, &path, &format!("{id}.md.tmp"), &serialized)
+        let serialized = format_markdown_document(&title, &tags, &content, Some(&document))?;
+        atomic_write(&self.data_dir, &path, &serialized)
             .map_err(|err| format!("Failed to save note '{id}': {err}"))?;
         let _ = fs::write(self.data_dir.join(INIT_MARKER), b"v1\n");
         let saved = self.read_parsed_note(&id)?;
@@ -320,30 +363,33 @@ impl WorkspaceApp {
             sanitize_title(&title_raw, "untitled-note")
         };
         let tags = parse_tag_list(&tags_raw);
-        let id = self.allocate_unique_id(&title);
+        let id = self.allocate_unique_id(&title)?;
         let content = content_raw.unwrap_or_else(|| format!("# {title}\n\n"));
         if content.len() > MAX_NOTE_BYTES {
             return Err("Note exceeds the 4 MiB limit".to_owned());
         }
         let path = self.note_path(&id)?;
-        let serialized = format_markdown_document(&title, &tags, &content);
-        atomic_write(&self.data_dir, &path, &format!("{id}.md.tmp"), &serialized)
+        let serialized = format_markdown_document(&title, &tags, &content, None)?;
+        atomic_write(&self.data_dir, &path, &serialized)
             .map_err(|err| format!("Failed to create note '{id}': {err}"))?;
         let created = self.read_parsed_note(&id)?;
         Ok(serialize_full_note(&created))
     }
 
-    /// Deletes a note by ID (`{"id":"..."}`).
+    /// Moves a note into a recoverable workspace trash folder (`{"id":"..."}`).
     pub fn delete_note(&self, payload: &str) -> Result<String, String> {
         let id = json_get_string(payload, "id")
             .filter(|s| !s.is_empty())
             .ok_or_else(|| "Missing note id".to_owned())?;
         let path = self.note_path(&id)?;
-        match fs::remove_file(&path) {
-            Ok(()) => Ok(format!(r#"{{"deleted":true,"id":{}}}"#, json_escape(&id))),
-            Err(err) if err.kind() == ErrorKind::NotFound => Err(format!("Note not found: {id}")),
-            Err(err) => Err(format!("Failed to delete note '{id}': {err}")),
-        }
+        note_metadata(&path, &id)?;
+        let trash_path = move_to_trash(&path, &self.data_dir.join(TRASH_DIR))
+            .map_err(|err| format!("Failed to move note '{id}' to the trash: {err}"))?;
+        Ok(format!(
+            r#"{{"deleted":true,"id":{},"trashPath":{}}}"#,
+            json_escape(&id),
+            json_escape(&trash_path.to_string_lossy())
+        ))
     }
 
     /// Imports an external `.md` or `.txt` file payload as a new workspace note.
@@ -357,18 +403,17 @@ impl WorkspaceApp {
             return Err("Imported file exceeds the 4 MiB limit".to_owned());
         }
         let clean = raw_content.strip_prefix('\u{FEFF}').unwrap_or(&raw_content);
-        let base_stem = Path::new(&file_name)
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("imported-note");
-        let (title, mut tags, content) = parse_frontmatter(clean, base_stem);
-        if tags.is_empty() {
-            tags.push("imported".to_owned());
-        }
-        let id = self.allocate_unique_id(&title);
+        let document = parse_document(clean, note_stem(Path::new(&file_name)));
+        let tags = if document.tags.is_empty() {
+            &["imported".to_owned()]
+        } else {
+            document.tags.as_slice()
+        };
+        let id = self.allocate_unique_id(&document.title)?;
         let path = self.note_path(&id)?;
-        let serialized = format_markdown_document(&title, &tags, &content);
-        atomic_write(&self.data_dir, &path, &format!("{id}.md.tmp"), &serialized)
+        let serialized =
+            format_markdown_document(&document.title, tags, document.content, Some(&document))?;
+        atomic_write(&self.data_dir, &path, &serialized)
             .map_err(|err| format!("Failed to import note '{id}': {err}"))?;
         let imported = self.read_parsed_note(&id)?;
         Ok(serialize_full_note(&imported))
@@ -383,26 +428,76 @@ impl WorkspaceApp {
         let frames = json_get_u32(trimmed, "frames").unwrap_or(0);
         let dom_nodes = json_get_u32(trimmed, "domNodes").unwrap_or(0);
         let path = self.data_dir.join("benchmark.json");
-        atomic_write(&self.data_dir, &path, "benchmark.json.tmp", trimmed)
+        atomic_write(&self.data_dir, &path, trimmed)
             .map_err(|err| format!("Failed to save benchmark metrics: {err}"))?;
         Ok(format!(
             r#"{{"recorded":true,"frames":{frames},"domNodes":{dom_nodes}}}"#
         ))
     }
 
-    fn allocate_unique_id(&self, title: &str) -> String {
+    fn allocate_unique_id(&self, title: &str) -> Result<String, String> {
         let base = slugify(title);
-        if !self.data_dir.join(format!("{base}.md")).exists() {
-            return base;
-        }
-        for idx in 2..=999 {
-            let candidate = format!("{base}-{idx}");
-            if !self.data_dir.join(format!("{candidate}.md")).exists() {
-                return candidate;
+        for candidate in
+            std::iter::once(base.clone()).chain((2..=10_000).map(|i| format!("{base}-{i}")))
+        {
+            match fs::symlink_metadata(self.note_path(&candidate)?) {
+                Ok(_) => {}
+                Err(err) if err.kind() == ErrorKind::NotFound => return Ok(candidate),
+                Err(err) => return Err(format!("Failed to allocate a note filename: {err}")),
             }
         }
-        format!("note-{}", std::process::id())
+        Err("Could not allocate a unique note filename".to_owned())
     }
+}
+
+fn is_markdown_file(path: &Path) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("md"))
+}
+
+fn note_stem(path: &Path) -> &str {
+    path.file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or("imported-note")
+}
+
+fn note_metadata(path: &Path, id: &str) -> Result<Metadata, String> {
+    let metadata = fs::symlink_metadata(path).map_err(|err| match err.kind() {
+        ErrorKind::NotFound => format!("Note not found: {id}"),
+        _ => format!("Failed to inspect note '{id}': {err}"),
+    })?;
+    if !metadata.file_type().is_file() {
+        return Err(format!("Note '{id}' is not a regular file"));
+    }
+    Ok(metadata)
+}
+
+fn read_note_file(path: &Path, id: &str) -> Result<(String, Metadata), String> {
+    let metadata = note_metadata(path, id)?;
+    let limit = MAX_NOTE_FILE_BYTES as u64;
+    let too_large = || format!("Note '{id}' exceeds the 4 MiB limit plus frontmatter allowance");
+    if metadata.len() > limit {
+        return Err(too_large());
+    }
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    File::open(path)
+        .and_then(|file| file.take(limit + 1).read_to_end(&mut bytes))
+        .map_err(|err| format!("Failed to read note '{id}': {err}"))?;
+    if bytes.len() > MAX_NOTE_FILE_BYTES {
+        return Err(too_large());
+    }
+    let raw = String::from_utf8(bytes).map_err(|err| format!("Note '{id}' is not UTF-8: {err}"))?;
+    Ok((raw, metadata))
+}
+
+fn check_note_body_size(content: &str, has_frontmatter: bool) -> Result<(), String> {
+    // Older Folio versions appended a newline after checking the body length.
+    let limit = MAX_NOTE_BYTES + usize::from(has_frontmatter && content.ends_with('\n'));
+    if content.len() > limit {
+        return Err("Note exceeds the 4 MiB limit".to_owned());
+    }
+    Ok(())
 }
 
 fn serialize_full_note(note: &ParsedNote) -> String {
@@ -512,7 +607,7 @@ fn parse_tag_list(raw: &str) -> Vec<String> {
             .collect();
         let normalized = cleaned.trim().to_owned();
         if !normalized.is_empty()
-            && normalized.len() <= 32
+            && normalized.chars().count() <= 32
             && !tags
                 .iter()
                 .any(|t: &String| t.eq_ignore_ascii_case(&normalized))
@@ -526,30 +621,46 @@ fn parse_tag_list(raw: &str) -> Vec<String> {
     tags
 }
 
-fn parse_frontmatter(raw: &str, fallback_id: &str) -> (String, Vec<String>, String) {
-    let normalized = raw.replace("\r\n", "\n");
+struct NoteDocument<'a> {
+    title: String,
+    tags: Vec<String>,
+    content: &'a str,
+    frontmatter: Option<Frontmatter<'a>>,
+}
+
+struct Frontmatter<'a> {
+    raw: &'a str,
+    fields: Vec<MetadataField<'a>>,
+}
+
+struct MetadataField<'a> {
+    key: &'a str,
+    value: &'a str,
+    start: usize,
+    end: usize,
+}
+
+fn parse_document<'a>(raw: &'a str, fallback_id: &str) -> NoteDocument<'a> {
     let mut title = String::new();
     let mut tags = Vec::new();
-    let body: String;
-
-    if let Some(rest) = normalized.strip_prefix("---\n")
-        && let Some(end_idx) = rest.find("\n---\n")
-    {
-        let header = &rest[..end_idx];
-        body = rest[end_idx + 5..].trim_start_matches('\n').to_owned();
-        for line in header.lines() {
-            if let Some(val) = line.strip_prefix("title:") {
-                title = sanitize_title(val, fallback_id);
-            } else if let Some(val) = line.strip_prefix("tags:") {
-                tags = parse_tag_list(val);
+    let (frontmatter, content) = match split_frontmatter(raw) {
+        Some((frontmatter, content)) => (Some(frontmatter), content),
+        None => (None, raw),
+    };
+    if let Some(frontmatter) = &frontmatter {
+        for field in &frontmatter.fields {
+            match field.key {
+                "title" => title = sanitize_title(&decode_yaml_scalar(field.value), fallback_id),
+                "tags" => {
+                    let continuation = &frontmatter.raw[field.start..field.end];
+                    tags = parse_metadata_tags(field.value, continuation);
+                }
+                _ => {}
             }
         }
-    } else {
-        body = normalized;
     }
-
     if title.is_empty() {
-        for line in body.lines() {
+        for line in content.lines() {
             let trimmed = line.trim();
             if let Some(heading) = trimmed.strip_prefix("# ") {
                 title = sanitize_title(heading, fallback_id);
@@ -560,27 +671,202 @@ fn parse_frontmatter(raw: &str, fallback_id: &str) -> (String, Vec<String>, Stri
     if title.is_empty() {
         title = sanitize_title(fallback_id, fallback_id);
     }
-    (title, tags, body)
+    NoteDocument {
+        title,
+        tags,
+        content,
+        frontmatter,
+    }
 }
 
-fn format_markdown_document(title: &str, tags: &[String], content: &str) -> String {
+fn split_frontmatter(raw: &str) -> Option<(Frontmatter<'_>, &str)> {
+    let (opening, rest) = raw.split_once('\n')?;
+    if opening.trim_end() != "---" {
+        return None;
+    }
+
+    let mut offset = 0;
+    let mut fields: Vec<MetadataField<'_>> = Vec::new();
+    for line in rest.split_inclusive('\n') {
+        let text = line.trim_end();
+        let end = offset + line.len();
+        if text == "---" {
+            if fields.is_empty() {
+                return None;
+            }
+            let content = &rest[end..];
+            let content = content
+                .strip_prefix("\r\n")
+                .or_else(|| content.strip_prefix('\n'))
+                .unwrap_or(content);
+            return Some((
+                Frontmatter {
+                    raw: &rest[..offset],
+                    fields,
+                },
+                content,
+            ));
+        }
+
+        let trimmed = text.trim_start();
+        if !trimmed.is_empty() && !trimmed.starts_with('#') {
+            if text.starts_with([' ', '\t']) || text.starts_with("- ") {
+                let field = fields.last_mut()?;
+                if text.starts_with("- ")
+                    && !field.value.is_empty()
+                    && !field.value.starts_with('#')
+                {
+                    return None;
+                }
+                field.end = end;
+            } else {
+                let (key, value) = mapping_entry(text)?;
+                fields.push(MetadataField {
+                    key,
+                    value,
+                    start: offset,
+                    end,
+                });
+            }
+        }
+        offset = end;
+    }
+    None
+}
+
+fn mapping_entry(text: &str) -> Option<(&str, &str)> {
+    let (raw_key, value) = text.split_once(':')?;
+    if !value.is_empty() && !value.starts_with(char::is_whitespace) {
+        return None;
+    }
+    let key = raw_key.trim_end();
+    let quoted_key = key
+        .strip_prefix('"')
+        .and_then(|key| key.strip_suffix('"'))
+        .or_else(|| {
+            key.strip_prefix('\'')
+                .and_then(|key| key.strip_suffix('\''))
+        });
+    if let Some(key) = quoted_key {
+        return Some((key, value.trim()));
+    }
+    if key.is_empty()
+        || !key
+            .chars()
+            .all(|ch| ch.is_alphanumeric() || matches!(ch, '_' | '-' | '.'))
+    {
+        return None;
+    }
+    Some((key, value.trim()))
+}
+
+fn decode_yaml_scalar(value: &str) -> String {
+    if value.starts_with('"')
+        && let Some((decoded, remaining)) = json::parse_string(value)
+        && (remaining.trim().is_empty() || remaining.trim_start().starts_with('#'))
+    {
+        return decoded;
+    }
+    if let Some(inner) = value
+        .strip_prefix('\'')
+        .and_then(|value| value.strip_suffix('\''))
+    {
+        return inner.replace("''", "'");
+    }
+    value.to_owned()
+}
+
+fn parse_metadata_tags(value: &str, block: &str) -> Vec<String> {
+    if value.is_empty() || value.starts_with('#') {
+        let tags: Vec<_> = block
+            .lines()
+            .skip(1)
+            .filter_map(|line| {
+                line.trim()
+                    .strip_prefix("- ")
+                    .map(|value| decode_yaml_scalar(value.trim()))
+            })
+            .collect();
+        return parse_tag_list(&tags.join(","));
+    }
+    if let Some(entries) = value
+        .strip_prefix('[')
+        .and_then(|value| value.strip_suffix(']'))
+    {
+        let tags: Vec<_> = entries
+            .split(',')
+            .map(|entry| decode_yaml_scalar(entry.trim()))
+            .collect();
+        return parse_tag_list(&tags.join(","));
+    }
+    parse_tag_list(&decode_yaml_scalar(value))
+}
+
+fn format_markdown_document(
+    title: &str,
+    tags: &[String],
+    content: &str,
+    original: Option<&NoteDocument<'_>>,
+) -> Result<String, String> {
     let normalized = content.replace("\r\n", "\n");
-    let mut out = String::new();
-    out.push_str("---\n");
-    out.push_str("title: ");
-    out.push_str(title);
-    out.push('\n');
-    if !tags.is_empty() {
-        out.push_str("tags: ");
-        out.push_str(&tags.join(", "));
-        out.push('\n');
+    let mut out = String::from("---\n");
+    let mut title_seen = false;
+    let mut tags_seen = false;
+    if let Some(document) = original
+        && let Some(header) = &document.frontmatter
+    {
+        let mut offset = 0;
+        for field in &header.fields {
+            out.push_str(&header.raw[offset..field.start]);
+            match field.key {
+                "title" if document.title != title => {
+                    if !title_seen {
+                        write_metadata_title(&mut out, title);
+                    }
+                }
+                "tags" if document.tags != tags => {
+                    if !tags_seen {
+                        write_metadata_tags(&mut out, tags);
+                    }
+                }
+                _ => out.push_str(&header.raw[field.start..field.end]),
+            }
+            title_seen |= field.key == "title";
+            tags_seen |= field.key == "tags";
+            offset = field.end;
+        }
+        out.push_str(&header.raw[offset..]);
+    }
+    if !title_seen {
+        write_metadata_title(&mut out, title);
+    }
+    if !tags_seen {
+        write_metadata_tags(&mut out, tags);
     }
     out.push_str("---\n\n");
     out.push_str(&normalized);
-    if !out.ends_with('\n') {
+    if out.len() > MAX_NOTE_FILE_BYTES {
+        return Err("Note exceeds the 4 MiB limit plus frontmatter allowance".to_owned());
+    }
+    Ok(out)
+}
+
+fn write_metadata_title(out: &mut String, title: &str) {
+    out.push_str("title: ");
+    out.push_str(&json_escape(title));
+    out.push('\n');
+}
+
+fn write_metadata_tags(out: &mut String, tags: &[String]) {
+    if tags.is_empty() {
+        return;
+    }
+    out.push_str("tags:\n");
+    for tag in tags {
+        out.push_str("  - ");
+        out.push_str(&json_escape(tag));
         out.push('\n');
     }
-    out
 }
 
 fn build_excerpt(content: &str) -> String {
@@ -629,176 +915,66 @@ fn build_excerpt(content: &str) -> String {
     "Empty note".to_owned()
 }
 
-fn atomic_write(
-    dir: &Path,
-    dst: &Path,
-    tmp_name: &str,
-    content: &str,
-) -> Result<(), std::io::Error> {
-    fs::create_dir_all(dir)?;
-    let tmp = dir.join(tmp_name);
-    fs::write(&tmp, content.as_bytes())?;
-    if let Err(err) = fs::rename(&tmp, dst) {
-        let _ = fs::remove_file(&tmp);
-        return Err(err);
-    }
-    Ok(())
+fn unique_suffix() -> String {
+    let serial = NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed);
+    format!("{}-{serial}", std::process::id())
 }
 
-fn json_escape(input: &str) -> String {
-    let mut out = String::with_capacity(input.len() + 2);
-    out.push('"');
-    for ch in input.chars() {
-        match ch {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            c if (c as u32) < 0x20 => {
-                out.push_str(&format!("\\u{:04x}", c as u32));
-            }
-            c => out.push(c),
+fn atomic_write(dir: &Path, dst: &Path, content: &str) -> std::io::Result<()> {
+    fs::create_dir_all(dir)?;
+    let (tmp, mut file) = loop {
+        let tmp = dir.join(format!(".folio-{}.tmp", unique_suffix()));
+        match OpenOptions::new().write(true).create_new(true).open(&tmp) {
+            Ok(file) => break (tmp, file),
+            Err(err) if err.kind() == ErrorKind::AlreadyExists => continue,
+            Err(err) => return Err(err),
         }
+    };
+    let written = file.write_all(content.as_bytes());
+    drop(file);
+    let result = written.and_then(|()| fs::rename(&tmp, dst));
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp);
     }
-    out.push('"');
-    out
+    result
+}
+
+fn move_to_trash(path: &Path, trash: &Path) -> std::io::Result<PathBuf> {
+    match fs::create_dir(trash) {
+        Ok(()) => {}
+        Err(err) if err.kind() == ErrorKind::AlreadyExists => {
+            if !fs::symlink_metadata(trash)?.file_type().is_dir() {
+                return Err(err);
+            }
+        }
+        Err(err) => return Err(err),
+    }
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let entry_dir = loop {
+        let dir = trash.join(format!("{timestamp}-{}", unique_suffix()));
+        match fs::create_dir(&dir) {
+            Ok(()) => break dir,
+            Err(err) if err.kind() == ErrorKind::AlreadyExists => continue,
+            Err(err) => return Err(err),
+        }
+    };
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| std::io::Error::new(ErrorKind::InvalidInput, "Missing note filename"))?;
+    let target = entry_dir.join(file_name);
+    if let Err(err) = fs::rename(path, &target) {
+        let _ = fs::remove_dir(&entry_dir);
+        return Err(err);
+    }
+    Ok(std::path::absolute(&target).unwrap_or(target))
 }
 
 fn json_string_array(items: &[String]) -> String {
     let encoded: Vec<String> = items.iter().map(|item| json_escape(item)).collect();
     format!("[{}]", encoded.join(","))
-}
-
-fn json_find_key_value<'a>(json: &'a str, key: &str) -> Option<&'a str> {
-    let bytes = json.as_bytes();
-    let mut i = 0;
-    let mut depth = 0usize;
-    while i < bytes.len() {
-        match bytes[i] {
-            b'{' => {
-                depth += 1;
-                i += 1;
-            }
-            b'}' => {
-                depth = depth.saturating_sub(1);
-                i += 1;
-            }
-            b'"' => {
-                let (parsed, next_i) = parse_json_string(json, i)?;
-                i = next_i;
-                if depth == 1 && parsed == key {
-                    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
-                        i += 1;
-                    }
-                    if i < bytes.len() && bytes[i] == b':' {
-                        i += 1;
-                        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
-                            i += 1;
-                        }
-                        return Some(&json[i..]);
-                    }
-                }
-            }
-            _ => {
-                i += 1;
-            }
-        }
-    }
-    None
-}
-
-fn parse_json_string(input: &str, start: usize) -> Option<(String, usize)> {
-    let bytes = input.as_bytes();
-    if bytes.get(start).copied() != Some(b'"') {
-        return None;
-    }
-    let mut i = start + 1;
-    let mut out = String::new();
-    while i < bytes.len() {
-        let b = bytes[i];
-        if b == b'"' {
-            return Some((out, i + 1));
-        }
-        if b == b'\\' {
-            i += 1;
-            let esc = *bytes.get(i)?;
-            match esc {
-                b'"' => {
-                    out.push('"');
-                    i += 1;
-                }
-                b'\\' => {
-                    out.push('\\');
-                    i += 1;
-                }
-                b'/' => {
-                    out.push('/');
-                    i += 1;
-                }
-                b'n' => {
-                    out.push('\n');
-                    i += 1;
-                }
-                b'r' => {
-                    out.push('\r');
-                    i += 1;
-                }
-                b't' => {
-                    out.push('\t');
-                    i += 1;
-                }
-                b'b' => {
-                    out.push('\u{0008}');
-                    i += 1;
-                }
-                b'f' => {
-                    out.push('\u{000C}');
-                    i += 1;
-                }
-                b'u' => {
-                    let hex = input.get(i + 1..i + 5)?;
-                    let code = u16::from_str_radix(hex, 16).ok()?;
-                    i += 5;
-                    if (0xD800..=0xDBFF).contains(&code) && input.get(i..i + 2) == Some("\\u") {
-                        let low_hex = input.get(i + 2..i + 6)?;
-                        let low = u16::from_str_radix(low_hex, 16).ok()?;
-                        if (0xDC00..=0xDFFF).contains(&low) {
-                            let combined =
-                                0x10000 + (((code as u32 - 0xD800) << 10) | (low as u32 - 0xDC00));
-                            if let Some(ch) = char::from_u32(combined) {
-                                out.push(ch);
-                            }
-                            i += 6;
-                            continue;
-                        }
-                    }
-                    if let Some(ch) = char::from_u32(code as u32) {
-                        out.push(ch);
-                    }
-                }
-                _ => return None,
-            }
-        } else {
-            let rest = &input[i..];
-            let ch = rest.chars().next()?;
-            out.push(ch);
-            i += ch.len_utf8();
-        }
-    }
-    None
-}
-
-fn json_get_string(json: &str, key: &str) -> Option<String> {
-    let val = json_find_key_value(json, key)?;
-    let (parsed, _) = parse_json_string(val, 0)?;
-    Some(parsed)
-}
-
-fn json_get_u32(json: &str, key: &str) -> Option<u32> {
-    let val = json_find_key_value(json, key)?;
-    let end = val.find(|c: char| !c.is_ascii_digit()).unwrap_or(val.len());
-    val[..end].parse().ok()
 }
 
 #[cfg(test)]
@@ -881,6 +1057,21 @@ mod tests {
             .handle_request("delete_note", r#"{"id":"design-system-notes"}"#)
             .expect("delete_note");
         assert!(deleted.contains(r#""deleted":true"#), "{deleted}");
+        let trashed = PathBuf::from(json_get_string(&deleted, "trashPath").unwrap());
+        assert!(trashed.starts_with(dir.join(TRASH_DIR)));
+        assert!(
+            fs::read_to_string(&trashed)
+                .unwrap()
+                .contains("Clean planes.")
+        );
+        assert!(!dir.join("design-system-notes.md").exists());
+        assert!(
+            app.handle_request(
+                "save_note",
+                r#"{"id":"design-system-notes","content":"stale edit"}"#
+            )
+            .is_err()
+        );
 
         let bench = app
             .handle_request(
@@ -890,6 +1081,96 @@ mod tests {
             .expect("record_benchmark");
         assert!(bench.contains(r#""recorded":true"#), "{bench}");
         assert!(dir.join("benchmark.json").is_file());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn external_filenames_round_trip_and_search_matches_the_full_body() {
+        let dir = temp_workspace("external");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("2026.11 日本語ノート.MD");
+        let long_tag = "日本語でも保存できる長いタグ";
+        let unknown = "author:\n  name: Writer\n  public: false\n";
+        let raw = format!(
+            "---\ntitle: External\n{unknown}tags:\n  - '{long_tag}'\n  - review\n---   \n\nAn excerpt.\n\nUnindexed SEARCHTERM.\n"
+        );
+        fs::write(&path, &raw).unwrap();
+        fs::write(dir.join("other.md"), "Unrelated note").unwrap();
+        let mut app = WorkspaceApp::new(dir.clone());
+        let list = app
+            .handle_request("list_notes", r#"{"query":" searchterm "}"#)
+            .unwrap();
+        assert!(list.contains(r#""noteCount":2"#), "{list}");
+        assert!(!list.contains("Unrelated note"), "{list}");
+        let id = json_get_string(list.split_once("\"notes\":[").unwrap().1, "id").unwrap();
+        let load_payload = format!(r#"{{"id":{}}}"#, json_escape(&id));
+        let loaded = app.handle_request("load_note", &load_payload).unwrap();
+        assert!(loaded.contains(long_tag), "{loaded}");
+        assert!(loaded.contains("Unindexed SEARCHTERM."), "{loaded}");
+        let save_payload = format!(
+            r#"{{"id":{},"title":"External","tags":"{long_tag}, review","content":"Changed body."}}"#,
+            json_escape(&id)
+        );
+        app.handle_request("save_note", &save_payload).unwrap();
+        let saved = fs::read_to_string(&path).unwrap();
+        assert!(saved.contains(unknown), "{saved}");
+        assert!(
+            saved.contains(&format!("tags:\n  - '{long_tag}'\n  - review\n")),
+            "{saved}"
+        );
+        assert!(saved.ends_with("Changed body."), "{saved}");
+        assert!(
+            !app.handle_request("list_notes", r#"{"query":"searchterm"}"#)
+                .unwrap()
+                .contains("External")
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn frontmatter_accepts_eof_delimiter_and_preserves_thematic_breaks() {
+        let raw = "---\r\ntitle: Empty document\r\ntags:\r\n- rust\r\n--- \t";
+        let parsed = parse_document(raw, "fallback");
+        assert_eq!(parsed.title, "Empty document");
+        assert_eq!(parsed.tags, ["rust"]);
+        assert_eq!(parsed.content, "");
+
+        let raw = "---\nA Markdown paragraph.\n---\nMore Markdown.";
+        let parsed = parse_document(raw, "fallback");
+        assert!(parsed.frontmatter.is_none());
+        assert_eq!(parsed.content, raw);
+        let formatted =
+            format_markdown_document("Imported", &["guide".into()], raw, Some(&parsed)).unwrap();
+        assert_eq!(parse_document(&formatted, "fallback").content, raw);
+    }
+
+    #[test]
+    fn oversized_notes_are_rejected_and_full_size_notes_can_be_read() {
+        let dir = temp_workspace("size");
+        fs::create_dir_all(&dir).unwrap();
+        File::create(dir.join("oversized.md"))
+            .unwrap()
+            .set_len(MAX_NOTE_FILE_BYTES as u64 + 1)
+            .unwrap();
+        fs::write(
+            dir.join("oversized-body.md"),
+            "a".repeat(MAX_NOTE_BYTES + 1),
+        )
+        .unwrap();
+        let mut app = WorkspaceApp::new(dir.clone());
+        for id in ["oversized", "oversized-body"] {
+            let err = app
+                .handle_request("load_note", &format!(r#"{{"id":"{id}"}}"#))
+                .unwrap_err();
+            assert!(err.contains("4 MiB"), "{err}");
+        }
+        let list = app.handle_request("list_notes", "{}").unwrap();
+        assert!(list.contains(r#""unreadableCount":2"#), "{list}");
+        let content = "a".repeat(MAX_NOTE_BYTES);
+        let payload = format!(r#"{{"title":"Full size","content":"{content}"}}"#);
+        app.handle_request("create_note", &payload).unwrap();
+        let parsed = app.read_parsed_note("full-size").unwrap();
+        assert_eq!(parsed.content.len(), MAX_NOTE_BYTES);
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -911,7 +1192,16 @@ mod tests {
     fn rejects_traversal_and_reserved_note_ids() {
         let dir = temp_workspace("security");
         let mut app = WorkspaceApp::new(dir.clone());
-        for bad in ["../escape", "sub/note", "CON", ".hidden", "bad:id", ""] {
+        for bad in [
+            "../escape",
+            "sub/note",
+            "CON",
+            ".hidden",
+            "bad:id",
+            "file:../escape.md",
+            "file:sub/note.md",
+            "",
+        ] {
             let payload = format!(r#"{{"id":{}}}"#, json_escape(bad));
             assert!(
                 app.handle_request("load_note", &payload).is_err(),

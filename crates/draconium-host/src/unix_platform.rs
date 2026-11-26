@@ -2,8 +2,7 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-//! Cross-platform OS integration layer (`macos` / `linux`) and runtime
-//! [`PlatformCapabilities`] introspection for `draconium-host`.
+//! Native macOS and Linux services and POSIX single-instance IPC.
 //!
 //! All formatting, escaping, parsing, and capability metadata functions are
 //! compiled and unit-tested on every host OS (including Windows) via
@@ -13,194 +12,6 @@
 //! crates beyond Rust `std`.
 
 use std::path::{Path, PathBuf};
-
-/// Runtime capability matrix describing which native OS host features are
-/// implemented on the current platform.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct PlatformCapabilities {
-    pub os: &'static str,
-    pub native_dialogs: bool,
-    pub clipboard_text: bool,
-    pub clipboard_html: bool,
-    pub clipboard_image: bool,
-    pub notifications: bool,
-    pub autostart: bool,
-    pub single_instance: bool,
-    pub system_theme: bool,
-    pub external_url: bool,
-    pub system_tray: bool,
-    pub global_hotkey: bool,
-    pub safe_storage: bool,
-    pub window_opacity: bool,
-    pub click_through: bool,
-    pub custom_uri_scheme: bool,
-    pub media_gstreamer: bool,
-}
-
-impl PlatformCapabilities {
-    /// Returns the native capability matrix for the compiled target OS.
-    pub const fn for_current_os() -> Self {
-        let mut capabilities = {
-            #[cfg(target_os = "windows")]
-            {
-                Self::windows()
-            }
-            #[cfg(target_os = "macos")]
-            {
-                Self::macos()
-            }
-            #[cfg(target_os = "linux")]
-            {
-                Self::linux()
-            }
-            #[cfg(all(unix, not(any(target_os = "macos", target_os = "linux"))))]
-            {
-                Self::other_unix()
-            }
-            #[cfg(not(any(target_os = "windows", unix)))]
-            {
-                Self::other()
-            }
-        };
-        capabilities.media_gstreamer = cfg!(feature = "media-gstreamer");
-        capabilities
-    }
-
-    /// Capability matrix for Windows (`win32` FFI backend).
-    pub const fn windows() -> Self {
-        Self {
-            os: "windows",
-            native_dialogs: true,
-            clipboard_text: true,
-            clipboard_html: true,
-            clipboard_image: true,
-            notifications: true,
-            autostart: true,
-            single_instance: true,
-            system_theme: true,
-            external_url: true,
-            system_tray: true,
-            global_hotkey: true,
-            safe_storage: true,
-            window_opacity: true,
-            click_through: true,
-            custom_uri_scheme: true,
-            media_gstreamer: false,
-        }
-    }
-
-    /// Capability matrix for macOS (`osascript` / `pbcopy` / `LaunchAgents` / Unix socket backend).
-    pub const fn macos() -> Self {
-        Self {
-            os: "macos",
-            native_dialogs: true,
-            clipboard_text: true,
-            clipboard_html: true,
-            clipboard_image: true,
-            notifications: true,
-            autostart: true,
-            single_instance: true,
-            system_theme: true,
-            external_url: true,
-            system_tray: false,
-            global_hotkey: false,
-            safe_storage: false,
-            window_opacity: false,
-            click_through: false,
-            custom_uri_scheme: false,
-            media_gstreamer: false,
-        }
-    }
-
-    /// Capability matrix for Linux (`zenity`/`kdialog` / `wl-copy`/`xclip` / XDG autostart / Unix socket backend).
-    pub const fn linux() -> Self {
-        Self {
-            os: "linux",
-            native_dialogs: true,
-            clipboard_text: true,
-            clipboard_html: true,
-            clipboard_image: true,
-            notifications: true,
-            autostart: true,
-            single_instance: true,
-            system_theme: true,
-            external_url: true,
-            system_tray: false,
-            global_hotkey: false,
-            safe_storage: false,
-            window_opacity: false,
-            click_through: false,
-            custom_uri_scheme: true,
-            media_gstreamer: false,
-        }
-    }
-
-    /// Capability matrix for other Unix targets (Unix domain socket single-instance only).
-    pub const fn other_unix() -> Self {
-        Self {
-            media_gstreamer: false,
-            single_instance: true,
-            ..Self::other()
-        }
-    }
-
-    /// Conservative fallback for unsupported targets.
-    pub const fn other() -> Self {
-        Self {
-            os: "other",
-            native_dialogs: false,
-            clipboard_text: false,
-            clipboard_html: false,
-            clipboard_image: false,
-            notifications: false,
-            autostart: false,
-            single_instance: false,
-            system_theme: false,
-            external_url: false,
-            system_tray: false,
-            global_hotkey: false,
-            safe_storage: false,
-            window_opacity: false,
-            click_through: false,
-            custom_uri_scheme: false,
-            media_gstreamer: false,
-        }
-    }
-
-    /// Serializes this capability matrix to a JSON object string for `Draconium.window.getPlatform()`.
-    pub fn to_json(&self) -> String {
-        format!(
-            concat!(
-                r#"{{"os":"{}","nativeDialogs":{},"clipboardText":{},"clipboardHtml":{},"#,
-                r#""clipboardImage":{},"notifications":{},"autostart":{},"singleInstance":{},"#,
-                r#""systemTheme":{},"externalUrl":{},"systemTray":{},"globalHotkey":{},"#,
-                r#""safeStorage":{},"windowOpacity":{},"clickThrough":{},"customUriScheme":{},"mediaGstreamer":{}}}"#
-            ),
-            self.os,
-            self.native_dialogs,
-            self.clipboard_text,
-            self.clipboard_html,
-            self.clipboard_image,
-            self.notifications,
-            self.autostart,
-            self.single_instance,
-            self.system_theme,
-            self.external_url,
-            self.system_tray,
-            self.global_hotkey,
-            self.safe_storage,
-            self.window_opacity,
-            self.click_through,
-            self.custom_uri_scheme,
-            self.media_gstreamer
-        )
-    }
-}
-
-/// Returns the compiled target OS's native host capability matrix.
-pub const fn platform_capabilities() -> PlatformCapabilities {
-    PlatformCapabilities::for_current_os()
-}
 
 // ---------------------------------------------------------------------------
 // Pure cross-platform escaping, formatting, and parsing helpers
@@ -260,6 +71,13 @@ fn fnv1a_32(input: &str) -> u32 {
         hash = hash.wrapping_mul(0x0100_0193);
     }
     hash
+}
+
+/// Stable suffix for OS registration names derived from an arbitrary app tag.
+pub(crate) fn stable_identifier_hash(input: &str) -> u64 {
+    input.bytes().fold(0xcbf2_9ce4_8422_2325, |hash, byte| {
+        (hash ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3)
+    })
 }
 
 #[cfg_attr(not(unix), allow(dead_code))]
@@ -467,7 +285,15 @@ pub fn escape_xml_text(input: &str) -> String {
 /// Derives a reverse-DNS macOS LaunchAgent label from `app_name`.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub fn macos_launch_agent_label(app_name: &str) -> String {
-    format!("io.draconium.{}", sanitize_unix_identifier(app_name))
+    format!("io.draconium.{}", autostart_identifier(app_name))
+}
+
+fn autostart_identifier(app_name: &str) -> String {
+    format!(
+        "{}--{:016x}",
+        sanitize_unix_identifier(app_name),
+        stable_identifier_hash(app_name)
+    )
 }
 
 /// Builds a macOS `LaunchAgents` `.plist` XML file for user login autostart.
@@ -655,6 +481,28 @@ pub fn build_xdg_autostart_desktop(
          Terminal=false\n\
          X-GNOME-Autostart-enabled=true\n"
     ))
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn xdg_desktop_value<'a>(contents: &'a str, key: &str) -> Option<&'a str> {
+    contents
+        .lines()
+        .map(str::trim)
+        .skip_while(|line| *line != "[Desktop Entry]")
+        .skip(1)
+        .take_while(|line| !line.starts_with('['))
+        .filter_map(|line| line.split_once('='))
+        .find_map(|(name, value)| (name.trim() == key).then(|| value.trim()))
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn xdg_autostart_enabled(contents: &str) -> bool {
+    xdg_desktop_value(contents, "Type") == Some("Application")
+        && xdg_desktop_value(contents, "Exec").is_some_and(|command| !command.is_empty())
+        && !xdg_desktop_value(contents, "Hidden")
+            .is_some_and(|value| value.eq_ignore_ascii_case("true"))
+        && !xdg_desktop_value(contents, "X-GNOME-Autostart-enabled")
+            .is_some_and(|value| value.eq_ignore_ascii_case("false"))
 }
 
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
@@ -1269,6 +1117,66 @@ mod runtime {
         run_command_stdout("osascript", &["-e", &script]).is_some()
     }
 
+    #[cfg(target_os = "macos")]
+    pub fn show_menu_dialog(entries: &[(u32, &str)]) -> Option<u32> {
+        let script = concat!(
+            "on run menuItems\n",
+            "set picked to choose from list menuItems with prompt \"Choose an item\"\n",
+            "if picked is false then return \"\"\n",
+            "return item 1 of picked\n",
+            "end run"
+        );
+        let items: Vec<String> = entries
+            .iter()
+            .map(|(id, label)| format!("{id}. {label}"))
+            .collect();
+        let mut args = vec!["-e", script];
+        args.extend(items.iter().map(String::as_str));
+        let selected = run_command_stdout("osascript", &args)?;
+        selected.split_once(". ")?.0.parse().ok()
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn show_menu_dialog(entries: &[(u32, &str)]) -> Option<u32> {
+        let items: Vec<String> = entries
+            .iter()
+            .flat_map(|(id, label)| [id.to_string(), format!(" {label}")])
+            .collect();
+        let mut command = Command::new("zenity");
+        command.args([
+            "--list",
+            "--title=Choose an item",
+            "--column=ID",
+            "--column=Item",
+            "--hide-column=1",
+            "--print-column=1",
+        ]);
+        let output = match command
+            .args(&items)
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .output()
+        {
+            Ok(output) => output,
+            Err(err) if err.kind() == ErrorKind::NotFound => Command::new("kdialog")
+                .args(["--menu", "Choose an item"])
+                .args(&items)
+                .stdin(Stdio::null())
+                .stderr(Stdio::null())
+                .output()
+                .ok()?,
+            Err(_) => return None,
+        };
+        if !output.status.success() {
+            return None;
+        }
+        std::str::from_utf8(&output.stdout)
+            .ok()?
+            .trim()
+            .parse()
+            .ok()
+    }
+
     #[cfg(target_os = "linux")]
     pub fn show_confirm(title: &str, message: &str) -> bool {
         let title_arg = format!("--title={title}");
@@ -1581,10 +1489,11 @@ mod runtime {
     }
 
     #[cfg(target_os = "macos")]
-    pub fn clipboard_read_image_png() -> Result<Vec<u8>, String> {
-        read_macos_clipboard_data("the clipboard as «class PNGf»", "«data PNGf")?
-            .filter(|png| !png.is_empty())
-            .ok_or_else(|| "クリップボードに画像がありません".to_owned())
+    pub fn clipboard_read_image_png() -> Result<Option<Vec<u8>>, String> {
+        Ok(
+            read_macos_clipboard_data("the clipboard as «class PNGf»", "«data PNGf")?
+                .filter(|png| !png.is_empty()),
+        )
     }
 
     #[cfg(target_os = "macos")]
@@ -1595,18 +1504,17 @@ mod runtime {
     }
 
     #[cfg(target_os = "linux")]
-    pub fn clipboard_read_image_png() -> Result<Vec<u8>, String> {
+    pub fn clipboard_read_image_png() -> Result<Option<Vec<u8>>, String> {
         read_linux_clipboard(
             &[
-                ("wl-paste", &["--type", "image/png"]),
+                ("wl-paste", &["--no-newline", "--type", "image/png"]),
                 (
                     "xclip",
                     &["-o", "-selection", "clipboard", "-t", "image/png"],
                 ),
             ],
             false,
-        )?
-        .ok_or_else(|| "クリップボードに画像がありません".to_owned())
+        )
     }
 
     #[cfg(target_os = "linux")]
@@ -1677,15 +1585,48 @@ mod runtime {
     }
 
     #[cfg(target_os = "macos")]
-    fn autostart_file_path(app_name: &str) -> Result<PathBuf, String> {
+    fn launch_agent_path(label: &str) -> Result<PathBuf, String> {
         let home = std::env::var_os("HOME")
             .filter(|v| !v.is_empty())
             .ok_or_else(|| "HOME 環境変数が未設定です".to_owned())?;
-        let label = macos_launch_agent_label(app_name);
         Ok(PathBuf::from(home)
             .join("Library")
             .join("LaunchAgents")
             .join(format!("{label}.plist")))
+    }
+
+    #[cfg(target_os = "macos")]
+    fn launch_agent_entry(path: &Path, label: &str) -> bool {
+        let Some(path) = path.to_str().filter(|_| path.is_file()) else {
+            return false;
+        };
+        let extract =
+            |key| run_command_stdout("plutil", &["-extract", key, "raw", "-o", "-", "--", path]);
+        extract("Label").is_some_and(|value| value.trim() == label)
+            && extract("ProgramArguments.0").is_some_and(|value| !value.trim().is_empty())
+    }
+
+    #[cfg(target_os = "macos")]
+    fn legacy_launch_agent(app_name: &str) -> Result<Option<(String, PathBuf)>, String> {
+        // The old label discarded characters, so lossy names cannot establish ownership.
+        if app_name != sanitize_unix_identifier(app_name) {
+            return Ok(None);
+        }
+        let label = format!("io.draconium.{app_name}");
+        let path = launch_agent_path(&label)?;
+        Ok(launch_agent_entry(&path, &label).then_some((label, path)))
+    }
+
+    #[cfg(target_os = "macos")]
+    fn launch_agent_disabled(domain: &str, label: &str) -> bool {
+        run_command_stdout("launchctl", &["print-disabled", domain]).is_some_and(|contents| {
+            contents.lines().any(|line| {
+                line.trim().split_once("=>").is_some_and(|(name, state)| {
+                    name.trim().trim_matches('"') == label
+                        && matches!(state.trim().trim_end_matches(';'), "disabled" | "true")
+                })
+            })
+        })
     }
 
     #[cfg(target_os = "linux")]
@@ -1702,19 +1643,69 @@ mod runtime {
     }
 
     #[cfg(target_os = "linux")]
-    fn autostart_file_path(app_name: &str) -> Result<PathBuf, String> {
-        let id = sanitize_unix_identifier(app_name);
+    fn autostart_desktop_path(id: &str) -> Result<PathBuf, String> {
         Ok(xdg_config_dir()?
             .join("autostart")
             .join(format!("{id}.desktop")))
     }
 
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[cfg(target_os = "linux")]
+    fn read_autostart_desktop(path: &Path) -> Result<Option<String>, String> {
+        match fs::read_to_string(path) {
+            Ok(contents) => Ok(Some(contents)),
+            Err(err) if err.kind() == ErrorKind::NotFound => Ok(None),
+            Err(err) => Err(format!("Could not read XDG autostart entry: {err}")),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn legacy_autostart_desktop(app_name: &str) -> Result<Option<(PathBuf, String)>, String> {
+        let path = autostart_desktop_path(&sanitize_unix_identifier(app_name))?;
+        let name = escape_xdg_name(app_name)?;
+        Ok(read_autostart_desktop(&path)?
+            .filter(|contents| xdg_desktop_value(contents, "Name") == Some(name.as_str()))
+            .map(|contents| (path, contents)))
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn autostart_is_enabled(app_name: &str) -> Result<bool, String> {
+        let _ = escape_xdg_name(app_name)?;
+        let path = autostart_desktop_path(&autostart_identifier(app_name))?;
+        if let Some(contents) = read_autostart_desktop(&path)? {
+            return Ok(xdg_autostart_enabled(&contents));
+        }
+        Ok(legacy_autostart_desktop(app_name)?
+            .is_some_and(|(_, contents)| xdg_autostart_enabled(&contents)))
+    }
+
+    #[cfg(target_os = "macos")]
     pub fn autostart_is_enabled(app_name: &str) -> Result<bool, String> {
         if app_name.trim().is_empty() {
             return Err("アプリ名が空です".to_owned());
         }
-        Ok(autostart_file_path(app_name)?.is_file())
+        let label = macos_launch_agent_label(app_name);
+        let path = launch_agent_path(&label)?;
+        let label = if path.is_file() {
+            if !launch_agent_entry(&path, &label) {
+                return Ok(false);
+            }
+            label
+        } else if let Some((label, _)) = legacy_launch_agent(app_name)? {
+            label
+        } else {
+            return Ok(false);
+        };
+        let uid = current_uid().map_err(|err| format!("Could not read user ID: {err}"))?;
+        Ok(!launch_agent_disabled(&format!("gui/{uid}"), &label))
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn remove_autostart_file(path: &Path) -> Result<(), String> {
+        match fs::remove_file(path) {
+            Ok(()) => Ok(()),
+            Err(err) if err.kind() == ErrorKind::NotFound => Ok(()),
+            Err(err) => Err(format!("Could not remove autostart entry: {err}")),
+        }
     }
 
     #[cfg(target_os = "macos")]
@@ -1727,11 +1718,13 @@ mod runtime {
         if app_name.trim().is_empty() {
             return Err("アプリ名が空です".to_owned());
         }
-        let path = autostart_file_path(app_name)?;
+        let label = macos_launch_agent_label(app_name);
+        let path = launch_agent_path(&label)?;
+        let legacy = legacy_launch_agent(app_name)?;
         if !enabled {
-            if path.is_file() {
-                std::fs::remove_file(&path)
-                    .map_err(|err| format!("LaunchAgent 削除失敗: {err}"))?;
+            remove_autostart_file(&path)?;
+            if let Some((_, legacy_path)) = legacy {
+                remove_autostart_file(&legacy_path)?;
             }
             return Ok(());
         }
@@ -1747,10 +1740,20 @@ mod runtime {
             std::fs::create_dir_all(parent)
                 .map_err(|err| format!("LaunchAgents ディレクトリ作成失敗: {err}"))?;
         }
-        let label = macos_launch_agent_label(app_name);
         let plist = build_launch_agent_plist(&label, &program_args);
         std::fs::write(&path, plist.as_bytes())
-            .map_err(|err| format!("LaunchAgent 書込失敗: {err}"))
+            .map_err(|err| format!("LaunchAgent 書込失敗: {err}"))?;
+        let uid = current_uid().map_err(|err| format!("Could not read user ID: {err}"))?;
+        let domain = format!("gui/{uid}");
+        if launch_agent_disabled(&domain, &label)
+            && run_command_stdout("launchctl", &["enable", &format!("{domain}/{label}")]).is_none()
+        {
+            return Err("Could not enable the LaunchAgent override".to_owned());
+        }
+        if let Some((_, legacy_path)) = legacy {
+            remove_autostart_file(&legacy_path)?;
+        }
+        Ok(())
     }
 
     #[cfg(target_os = "linux")]
@@ -1760,14 +1763,12 @@ mod runtime {
         exe: &Path,
         args: &[&str],
     ) -> Result<(), String> {
-        if app_name.trim().is_empty() {
-            return Err("アプリ名が空です".to_owned());
-        }
-        let path = autostart_file_path(app_name)?;
+        let path = autostart_desktop_path(&autostart_identifier(app_name))?;
+        let legacy = legacy_autostart_desktop(app_name)?;
         if !enabled {
-            if path.is_file() {
-                std::fs::remove_file(&path)
-                    .map_err(|err| format!("XDG autostart 削除失敗: {err}"))?;
+            remove_autostart_file(&path)?;
+            if let Some((legacy_path, _)) = legacy {
+                remove_autostart_file(&legacy_path)?;
             }
             return Ok(());
         }
@@ -1780,7 +1781,11 @@ mod runtime {
                 .map_err(|err| format!("XDG autostart ディレクトリ作成失敗: {err}"))?;
         }
         std::fs::write(&path, entry.as_bytes())
-            .map_err(|err| format!("XDG autostart 書込失敗: {err}"))
+            .map_err(|err| format!("XDG autostart 書込失敗: {err}"))?;
+        if let Some((legacy_path, _)) = legacy {
+            remove_autostart_file(&legacy_path)?;
+        }
+        Ok(())
     }
 
     #[cfg(test)]
@@ -1861,56 +1866,6 @@ pub use runtime::*;
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn platform_capabilities_json_and_presets() {
-        let current = platform_capabilities();
-        assert!(!current.os.is_empty());
-        assert!(current.to_json().starts_with(r#"{"os":""#));
-        assert_eq!(current.media_gstreamer, cfg!(feature = "media-gstreamer"));
-
-        let win = PlatformCapabilities::windows();
-        assert_eq!(win.os, "windows");
-        assert!(win.safe_storage && win.system_tray && win.custom_uri_scheme);
-        assert!(!win.media_gstreamer);
-        let win_json = win.to_json();
-        assert!(win_json.contains(r#""os":"windows""#), "{win_json}");
-        assert!(win_json.contains(r#""nativeDialogs":true"#), "{win_json}");
-        assert!(win_json.contains(r#""mediaGstreamer":false"#), "{win_json}");
-
-        let media_enabled = PlatformCapabilities {
-            media_gstreamer: true,
-            ..win
-        };
-        assert!(media_enabled.media_gstreamer);
-        assert!(media_enabled.to_json().contains(r#""mediaGstreamer":true"#));
-
-        let mac = PlatformCapabilities::macos();
-        assert_eq!(mac.os, "macos");
-        assert!(mac.native_dialogs && mac.clipboard_text && mac.autostart && mac.single_instance);
-        assert!(mac.clipboard_image);
-        assert!(!mac.custom_uri_scheme);
-        assert!(!mac.safe_storage && !mac.media_gstreamer);
-        assert!(mac.to_json().contains(r#""mediaGstreamer":false"#));
-
-        let linux = PlatformCapabilities::linux();
-        assert_eq!(linux.os, "linux");
-        assert!(linux.native_dialogs && linux.notifications && linux.autostart);
-        assert!(linux.clipboard_image && linux.custom_uri_scheme);
-        assert!(!linux.system_tray && !linux.media_gstreamer);
-        assert!(linux.to_json().contains(r#""mediaGstreamer":false"#));
-
-        let other = PlatformCapabilities::other();
-        assert_eq!(other.os, "other");
-        assert!(!other.native_dialogs && !other.single_instance && !other.media_gstreamer);
-        assert!(other.to_json().contains(r#""mediaGstreamer":false"#));
-
-        let other_unix = PlatformCapabilities::other_unix();
-        assert_eq!(other_unix.os, "other");
-        assert!(!other_unix.native_dialogs && other_unix.single_instance);
-        assert!(!other_unix.media_gstreamer);
-        assert!(other_unix.to_json().contains(r#""mediaGstreamer":false"#));
-    }
 
     #[test]
     fn sanitize_unix_identifier_and_build_instance_paths() {
@@ -2057,7 +2012,15 @@ mod tests {
     #[test]
     fn autostart_plist_and_xdg_desktop_generators() {
         let label = macos_launch_agent_label("Draconium.Folio");
-        assert_eq!(label, "io.draconium.Draconium.Folio");
+        assert!(label.starts_with("io.draconium.Draconium.Folio--"));
+        assert_ne!(
+            autostart_identifier("Desk/Work"),
+            autostart_identifier("Desk-Work")
+        );
+        assert_ne!(
+            macos_launch_agent_label("Folio"),
+            macos_launch_agent_label("folio")
+        );
         let plist = build_launch_agent_plist(
             &label,
             &[
@@ -2065,7 +2028,7 @@ mod tests {
                 "--workspace".to_owned(),
             ],
         );
-        assert!(plist.contains("<string>io.draconium.Draconium.Folio</string>"));
+        assert!(plist.contains(&format!("<string>{label}</string>")));
         assert!(plist.contains("&amp; &lt;test&gt;"));
         assert!(plist.contains("<key>RunAtLoad</key>"));
 
@@ -2081,6 +2044,20 @@ mod tests {
             desktop.contains(r#"Exec="/opt/my;apps/draconium 100%%" --workspace "--tag=\\$HOME""#),
             "{desktop}"
         );
+    }
+
+    #[test]
+    fn xdg_autostart_checks_desktop_entry_status() {
+        let entry = build_xdg_autostart_desktop("Folio", Path::new("/usr/bin/true"), &[]).unwrap();
+        assert!(xdg_autostart_enabled(&entry));
+        assert!(!xdg_autostart_enabled(&format!("{entry}Hidden=true\n")));
+        assert!(!xdg_autostart_enabled(
+            &entry.replace("enabled=true", "enabled=false")
+        ));
+        assert!(!xdg_autostart_enabled(&entry.replace("Exec=", "Other=")));
+        assert!(xdg_autostart_enabled(&format!(
+            "{entry}[Other Group]\nHidden=true\n"
+        )));
     }
 
     #[test]

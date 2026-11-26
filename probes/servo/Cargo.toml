@@ -13,5 +13,9 @@ media-gstreamer = ["draconium-host/media-gstreamer"]
 draconium-host = { path = "../../crates/draconium-host" }
 url = "2.5"
 
+[[example]]
+name = "hello"
+path = "../../crates/draconium-host/examples/hello.rs"
+
 [patch.crates-io]
 servo-paint = { path = "vendor/servo-paint" }

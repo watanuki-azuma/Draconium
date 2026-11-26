@@ -1,4 +1,4 @@
-//! Windows OS integration & engine-gap host primitives.
+//! Desktop services, shared helpers, and the native Windows backend.
 //!
 //! Bridges capabilities that Servo 0.8.0 / winit 0.30 do not provide directly:
 //! - Win11 DWM rounded corners & dark titlebar (`DwmSetWindowAttribute`)
@@ -20,6 +20,8 @@ use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::json::json_string;
+
 /// Hard cap on capability-scoped file reads (16 MiB) so a huge dropped file
 /// cannot exhaust memory inside the JS bridge.
 pub const MAX_CAPABILITY_FILE_BYTES: usize = 16 * 1024 * 1024;
@@ -28,7 +30,7 @@ pub const MAX_CLIPBOARD_BYTES: usize = 16 * 1024 * 1024;
 /// Hard cap on clipboard/export image dimensions (4096 x 4096 pixels).
 pub const MAX_CLIPBOARD_IMAGE_PIXELS: usize = 4096 * 4096;
 /// Maximum number of active file tokens kept in memory per host session.
-const MAX_CAPABILITY_TOKENS: usize = 64;
+pub(crate) const MAX_CAPABILITY_TOKENS: usize = 64;
 /// Maximum number of `.crash.json` reports retained in the crash directory.
 const MAX_CRASH_REPORTS: usize = 10;
 
@@ -43,27 +45,6 @@ pub const MOD_CONTROL: u32 = 0x0002;
 pub const MOD_SHIFT: u32 = 0x0004;
 pub const MOD_WIN: u32 = 0x0008;
 pub const MOD_NOREPEAT: u32 = 0x4000;
-
-/// Escape a string as a JSON string literal (including surrounding quotes).
-pub fn json_string(value: &str) -> String {
-    let mut out = String::with_capacity(value.len() + 2);
-    out.push('"');
-    for ch in value.chars() {
-        match ch {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            '\u{08}' => out.push_str("\\b"),
-            '\u{0C}' => out.push_str("\\f"),
-            ch if (ch as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", ch as u32)),
-            ch => out.push(ch),
-        }
-    }
-    out.push('"');
-    out
-}
 
 /// Convert a requested opacity (`0.0..=1.0`) into a Win32 alpha byte.
 ///
@@ -1012,7 +993,33 @@ pub fn sanitize_instance_tag(tag: &str) -> String {
 
 /// Compute the scoped Win32 window class/title name for a given instance tag.
 pub fn instance_window_name(tag: &str) -> String {
-    format!("Draconium.TrayWindow.{}", sanitize_instance_tag(tag))
+    let mutex_name = instance_mutex_name(tag);
+    format!(
+        "Draconium.TrayWindow.{}.{:016x}",
+        sanitize_instance_tag(&mutex_name),
+        crate::unix_platform::stable_identifier_hash(&mutex_name)
+    )
+}
+
+fn instance_mutex_name(tag: &str) -> String {
+    let (scope, name) = if let Some(name) = tag.strip_prefix("Global\\") {
+        ("Global", name)
+    } else {
+        ("Local", tag.strip_prefix("Local\\").unwrap_or(tag))
+    };
+    if !name.is_empty()
+        && name.len() <= 240
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+    {
+        return format!("{scope}\\{name}");
+    }
+    format!(
+        "{scope}\\Draconium.Instance~{}.{:016x}",
+        sanitize_instance_tag(name),
+        crate::unix_platform::stable_identifier_hash(name)
+    )
 }
 
 /// Build the compact JSON payload sent from a second instance to the primary
@@ -1097,22 +1104,79 @@ impl CrashReport {
     }
 }
 
-/// Write a [`CrashReport`] as `<dir>/crash-<ts>-<pid>.crash.json` and prune
+/// Pick a per-user state directory on supported desktop platforms.
+pub(crate) fn default_crash_dir() -> PathBuf {
+    let absolute_env = |key| {
+        std::env::var_os(key)
+            .map(PathBuf::from)
+            .filter(|path| path.is_absolute())
+    };
+    let state_dir = if cfg!(windows) {
+        absolute_env("LOCALAPPDATA").map(|dir| dir.join("Draconium"))
+    } else if cfg!(target_os = "macos") {
+        absolute_env("HOME").map(|home| home.join("Library/Application Support/Draconium"))
+    } else {
+        absolute_env("XDG_STATE_HOME")
+            .or_else(|| absolute_env("HOME").map(|home| home.join(".local/state")))
+            .map(|dir| dir.join("draconium"))
+    };
+    if let Some(dir) = state_dir {
+        return dir.join("crashes");
+    }
+    let mut nonce = [0u8; 16];
+    if fill_os_random(&mut nonce) {
+        std::env::temp_dir().join(format!(
+            "draconium-crashes-{:032x}",
+            u128::from_ne_bytes(nonce)
+        ))
+    } else {
+        PathBuf::new()
+    }
+}
+
+/// Write a [`CrashReport`] to a new `*.crash.json` file and prune
 /// older reports beyond `MAX_CRASH_REPORTS`.
 pub fn write_crash_report(dir: &Path, report: &CrashReport) -> Result<PathBuf, String> {
-    std::fs::create_dir_all(dir)
+    use std::io::Write;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    if dir.as_os_str().is_empty() {
+        return Err("No private crash report directory is available".to_owned());
+    }
+    let mut directory = std::fs::DirBuilder::new();
+    directory.recursive(true);
+    let mut file_options = std::fs::OpenOptions::new();
+    file_options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+        directory.mode(0o700);
+        file_options.mode(0o600);
+    }
+    directory
+        .create(dir)
         .map_err(|err| format!("クラッシュレポート保存先作成失敗: {err}"))?;
+    static NEXT_REPORT: AtomicU64 = AtomicU64::new(0);
     let file_name = format!(
-        "crash-{:015}-{}.crash.json",
-        report.timestamp_unix_ms, report.pid
+        "crash-{:015}-{}-{:016x}.crash.json",
+        report.timestamp_unix_ms,
+        report.pid,
+        NEXT_REPORT.fetch_add(1, Ordering::Relaxed),
     );
     let path = dir.join(file_name);
-    std::fs::write(&path, report.to_json())
+    let mut file = file_options
+        .open(&path)
         .map_err(|err| format!("クラッシュレポート書き込み失敗: {err}"))?;
+    if let Err(err) = file.write_all(report.to_json().as_bytes()) {
+        drop(file);
+        let _ = std::fs::remove_file(&path);
+        return Err(format!("クラッシュレポート書き込み失敗: {err}"));
+    }
 
     if let Ok(entries) = std::fs::read_dir(dir) {
         let mut files: Vec<PathBuf> = entries
             .filter_map(Result::ok)
+            .filter(|e| e.file_type().is_ok_and(|kind| kind.is_file()))
             .map(|e| e.path())
             .filter(|p| {
                 p.file_name()
@@ -1130,202 +1194,15 @@ pub fn write_crash_report(dir: &Path, report: &CrashReport) -> Result<PathBuf, S
     Ok(path)
 }
 
-/// Minimal flat JSON object reader for bridge payloads (zero external crates).
-/// Supports top-level string, boolean, u32, and string-array fields with
-/// standard JSON escape sequences (`\"`, `\\`, `\n`, `\r`, `\t`, `\uXXXX`).
-pub fn json_get_string(json: &str, key: &str) -> Option<String> {
-    let val = find_top_level_field(json, key)?;
-    let (s, _) = parse_json_str(val)?;
-    Some(s)
-}
-
-pub fn json_get_bool(json: &str, key: &str) -> Option<bool> {
-    let val = find_top_level_field(json, key)?.trim_start();
-    if val.starts_with("true") {
-        Some(true)
-    } else if val.starts_with("false") {
-        Some(false)
-    } else {
-        None
-    }
-}
-
-pub fn json_get_u32(json: &str, key: &str) -> Option<u32> {
-    let val = find_top_level_field(json, key)?.trim_start();
-    let end = val.find(|c: char| !c.is_ascii_digit()).unwrap_or(val.len());
-    if end == 0 {
-        None
-    } else {
-        val[..end].parse::<u32>().ok()
-    }
-}
-
-pub fn json_get_strict_u32(json: &str, key: &str) -> Option<u32> {
-    let value = find_top_level_field(json, key)?;
-    let end = value.bytes().take_while(u8::is_ascii_digit).count();
-    let (digits, rest) = value.split_at(end);
-    if (digits.len() > 1 && digits.starts_with('0'))
-        || !rest
-            .trim_start_matches([' ', '\t', '\n', '\r'])
-            .starts_with([',', '}'])
-    {
-        return None;
-    }
-    digits.parse().ok()
-}
-
-pub fn json_get_string_array(json: &str, key: &str) -> Option<Vec<String>> {
-    let mut rest = find_top_level_field(json, key)?.trim_start();
-    rest = rest.strip_prefix('[')?;
-    let mut out = Vec::new();
-    loop {
-        rest = rest.trim_start();
-        if rest.starts_with(']') {
-            return Some(out);
-        }
-        let (item, after) = parse_json_str(rest)?;
-        out.push(item);
-        rest = after.trim_start();
-        if let Some(next) = rest.strip_prefix(',') {
-            rest = next;
-        } else if rest.starts_with(']') {
-            return Some(out);
-        } else {
-            return None;
-        }
-    }
-}
-
-fn find_top_level_field<'a>(json: &'a str, target_key: &str) -> Option<&'a str> {
-    let mut rest = json.trim_start().strip_prefix('{')?;
-    loop {
-        rest = rest.trim_start();
-        if rest.is_empty() || rest.starts_with('}') {
-            return None;
-        }
-        let (key, after_key) = parse_json_str(rest)?;
-        let after_colon = after_key.trim_start().strip_prefix(':')?.trim_start();
-        if key == target_key {
-            return Some(after_colon);
-        }
-        let after_val = skip_json_value(after_colon)?.trim_start();
-        if let Some(next) = after_val.strip_prefix(',') {
-            rest = next;
-        } else {
-            return None;
-        }
-    }
-}
-
-fn parse_json_str(input: &str) -> Option<(String, &str)> {
-    let rest = input.strip_prefix('"')?;
-    let mut out = String::new();
-    let mut chars = rest.char_indices();
-    while let Some((idx, ch)) = chars.next() {
-        match ch {
-            '"' => return Some((out, &rest[idx + 1..])),
-            '\\' => {
-                let (_, esc) = chars.next()?;
-                match esc {
-                    '"' => out.push('"'),
-                    '\\' => out.push('\\'),
-                    '/' => out.push('/'),
-                    'b' => out.push('\u{08}'),
-                    'f' => out.push('\u{0C}'),
-                    'n' => out.push('\n'),
-                    'r' => out.push('\r'),
-                    't' => out.push('\t'),
-                    'u' => {
-                        let code = read_hex4(&mut chars)?;
-                        if (0xD800..=0xDBFF).contains(&code) {
-                            let (_, b1) = chars.next()?;
-                            let (_, b2) = chars.next()?;
-                            if b1 != '\\' || b2 != 'u' {
-                                return None;
-                            }
-                            let low = read_hex4(&mut chars)?;
-                            if !(0xDC00..=0xDFFF).contains(&low) {
-                                return None;
-                            }
-                            let cp = 0x10000
-                                + ((u32::from(code) - 0xD800) << 10)
-                                + (u32::from(low) - 0xDC00);
-                            out.push(char::from_u32(cp)?);
-                        } else {
-                            out.push(char::from_u32(u32::from(code))?);
-                        }
-                    }
-                    _ => return None,
-                }
-            }
-            ch => out.push(ch),
-        }
-    }
-    None
-}
-
-fn read_hex4(chars: &mut std::str::CharIndices<'_>) -> Option<u16> {
-    let mut val = 0u16;
-    for _ in 0..4 {
-        let (_, ch) = chars.next()?;
-        let digit = ch.to_digit(16)? as u16;
-        val = (val << 4) | digit;
-    }
-    Some(val)
-}
-
-fn skip_json_value(input: &str) -> Option<&str> {
-    let s = input.trim_start();
-    let first = s.chars().next()?;
-    match first {
-        '"' => parse_json_str(s).map(|(_, after)| after),
-        '{' | '[' => {
-            let mut depth = 0usize;
-            let mut in_str = false;
-            let mut escaped = false;
-            for (idx, ch) in s.char_indices() {
-                if in_str {
-                    if escaped {
-                        escaped = false;
-                    } else if ch == '\\' {
-                        escaped = true;
-                    } else if ch == '"' {
-                        in_str = false;
-                    }
-                    continue;
-                }
-                match ch {
-                    '"' => in_str = true,
-                    '{' | '[' => depth += 1,
-                    '}' | ']' => {
-                        depth = depth.saturating_sub(1);
-                        if depth == 0 {
-                            return Some(&s[idx + 1..]);
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            None
-        }
-        _ => {
-            let end = s
-                .find(|c: char| c == ',' || c == '}' || c == ']' || c.is_whitespace())
-                .unwrap_or(s.len());
-            if end == 0 { None } else { Some(&s[end..]) }
-        }
-    }
-}
-
 #[cfg(target_os = "windows")]
 mod win32 {
     use std::ffi::c_void;
     use std::ptr;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use super::{
-        DN_COPYDATA_MAGIC, MAX_CLIPBOARD_BYTES, MAX_COPYDATA_BYTES, base64_encode, build_cf_html,
-        dib_to_rgba, encode_rgba_as_stored_png, instance_window_name, parse_cf_html,
+        DN_COPYDATA_MAGIC, MAX_CLIPBOARD_BYTES, MAX_COPYDATA_BYTES, build_cf_html, dib_to_rgba,
+        encode_rgba_as_stored_png, instance_mutex_name, instance_window_name, parse_cf_html,
         validate_custom_uri_scheme, validate_registry_app_name,
     };
 
@@ -1362,10 +1239,14 @@ mod win32 {
     const REG_OPTION_NON_VOLATILE: u32 = 0;
     const REG_SZ: u32 = 1;
     const RRF_RT_REG_SZ: u32 = 0x0000_0002;
+    const RRF_RT_REG_BINARY: u32 = 0x0000_0008;
     const RRF_RT_REG_DWORD: u32 = 0x0000_0010;
     const ERROR_SUCCESS: u32 = 0;
     const ERROR_FILE_NOT_FOUND: u32 = 2;
     const ERROR_ALREADY_EXISTS: u32 = 183;
+    const AUTOSTART_RUN_KEY: &str = "Software\\Microsoft\\Windows\\CurrentVersion\\Run";
+    const AUTOSTART_APPROVAL_KEY: &str =
+        "Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\StartupApproved\\Run";
 
     const CRYPTPROTECT_UI_FORBIDDEN: u32 = 0x0000_0001;
 
@@ -1690,10 +1571,7 @@ mod win32 {
         }
         let (width, height, rgba) = dib_to_rgba(&dib)?;
         let png = encode_rgba_as_stored_png(width, height, &rgba)?;
-        let b64 = base64_encode(&png);
-        Ok(format!(
-            "{{\"width\":{width},\"height\":{height},\"pngBase64\":\"{b64}\",\"dataUrl\":\"data:image/png;base64,{b64}\"}}"
-        ))
+        Ok(super::clipboard_png_json(width, height, &png))
     }
 
     pub fn clipboard_write_image_dib(hwnd: Hwnd, dib: &[u8]) -> Result<(), String> {
@@ -1712,27 +1590,94 @@ mod win32 {
 
     pub fn autostart_is_enabled(app_name: &str) -> Result<bool, String> {
         let clean = validate_registry_app_name(app_name)?;
-        let subkey = wide_nul("Software\\Microsoft\\Windows\\CurrentVersion\\Run");
+        let run_key = wide_nul(AUTOSTART_RUN_KEY);
+        let approval_key = wide_nul(AUTOSTART_APPROVAL_KEY);
         let val_name = wide_nul(&clean);
-        let mut size: u32 = 0;
-        // SAFETY: Querying value size with NULL buffer.
+        let mut command = vec![0u16; 32_768];
+        let mut size = (command.len() * size_of::<u16>()) as u32;
+        // SAFETY: Sized mutable buffer for a UTF-16 registry string.
         let status = unsafe {
             RegGetValueW(
                 HKEY_CURRENT_USER,
-                subkey.as_ptr(),
+                run_key.as_ptr(),
                 val_name.as_ptr(),
                 RRF_RT_REG_SZ,
                 ptr::null_mut(),
-                ptr::null_mut(),
+                command.as_mut_ptr().cast(),
                 &raw mut size,
             )
         };
-        if status == ERROR_SUCCESS {
-            Ok(size > 2)
-        } else if status == ERROR_FILE_NOT_FOUND {
-            Ok(false)
+        match status {
+            ERROR_FILE_NOT_FOUND => return Ok(false),
+            ERROR_SUCCESS => {}
+            _ => {
+                return Err(format!(
+                    "自動起動コマンドの確認に失敗しました (code={status})"
+                ));
+            }
+        }
+        let end = command
+            .iter()
+            .position(|&unit| unit == 0)
+            .unwrap_or(command.len());
+        if String::from_utf16_lossy(&command[..end]).trim().is_empty() {
+            return Ok(false);
+        }
+        let mut approval = [0u8; 32];
+        let mut size = approval.len() as u32;
+        // SAFETY: Sized mutable buffer for StartupApproved's binary status record.
+        let status = unsafe {
+            RegGetValueW(
+                HKEY_CURRENT_USER,
+                approval_key.as_ptr(),
+                val_name.as_ptr(),
+                RRF_RT_REG_BINARY,
+                ptr::null_mut(),
+                approval.as_mut_ptr().cast(),
+                &raw mut size,
+            )
+        };
+        match status {
+            ERROR_FILE_NOT_FOUND => Ok(true),
+            ERROR_SUCCESS => Ok(!matches!(approval[0], 0x03 | 0x07)),
+            _ => Err(format!(
+                "自動起動の許可状態の確認に失敗しました (code={status})"
+            )),
+        }
+    }
+
+    fn clear_autostart_approval(val_name: &[u16]) -> Result<(), String> {
+        let approval_key = wide_nul(AUTOSTART_APPROVAL_KEY);
+        let mut hkey = 0;
+        // SAFETY: Opening the user's StartupApproved Run subkey to clear one override.
+        let status = unsafe {
+            RegOpenKeyExW(
+                HKEY_CURRENT_USER,
+                approval_key.as_ptr(),
+                0,
+                KEY_WRITE,
+                &raw mut hkey,
+            )
+        };
+        if status == ERROR_FILE_NOT_FOUND {
+            return Ok(());
+        }
+        if status != ERROR_SUCCESS {
+            return Err(format!(
+                "自動起動の許可キーを開けませんでした (code={status})"
+            ));
+        }
+        let status = unsafe {
+            let status = RegDeleteValueW(hkey, val_name.as_ptr());
+            RegCloseKey(hkey);
+            status
+        };
+        if status == ERROR_SUCCESS || status == ERROR_FILE_NOT_FOUND {
+            Ok(())
         } else {
-            Err(format!("自動起動状態の確認に失敗しました (code={status})"))
+            Err(format!(
+                "自動起動の許可状態を更新できませんでした (code={status})"
+            ))
         }
     }
 
@@ -1742,7 +1687,7 @@ mod win32 {
         command_line: &str,
     ) -> Result<(), String> {
         let clean = validate_registry_app_name(app_name)?;
-        let subkey = wide_nul("Software\\Microsoft\\Windows\\CurrentVersion\\Run");
+        let subkey = wide_nul(AUTOSTART_RUN_KEY);
         let val_name = wide_nul(&clean);
         let mut hkey: Hkey = 0;
         // SAFETY: Opening or creating HKCU Run key for write (fresh profiles may lack `Run`).
@@ -1810,7 +1755,11 @@ mod win32 {
         unsafe {
             RegCloseKey(hkey);
         }
-        res
+        res?;
+        if enabled {
+            clear_autostart_approval(&val_name)?;
+        }
+        Ok(())
     }
 
     pub fn register_uri_scheme(scheme: &str, command_line: &str) -> Result<(), String> {
@@ -1937,34 +1886,42 @@ mod win32 {
     }
 
     pub fn forward_to_running_instance(instance_tag: &str, json_payload: &str) -> bool {
-        if json_payload.len() > MAX_COPYDATA_BYTES {
+        if json_payload.is_empty() || json_payload.len() > MAX_COPYDATA_BYTES {
             return false;
         }
         let win_name = wide_nul(&instance_window_name(instance_tag));
-        // SAFETY: Searching top-level windows for the primary instance's OS event window.
-        let target_hwnd = unsafe { FindWindowExW(0, 0, win_name.as_ptr(), win_name.as_ptr()) };
-        if target_hwnd == 0 {
-            return false;
-        }
         let cds = CopyDataStruct {
             dw_data: DN_COPYDATA_MAGIC,
             cb_data: json_payload.len() as u32,
             lp_data: json_payload.as_ptr().cast(),
         };
-        let mut result: usize = 0;
-        // SAFETY: `cds` and `json_payload` remain alive for the synchronous `SendMessageTimeoutW` call.
-        let sent = unsafe {
-            SendMessageTimeoutW(
-                target_hwnd,
-                WM_COPYDATA,
-                0,
-                (&raw const cds) as isize,
-                SMTO_BLOCK | SMTO_ABORTIFHUNG,
-                2000,
-                &raw mut result,
-            )
-        };
-        sent != 0 && result != 0
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            // The mutex can be acquired before the primary finishes creating the tray window.
+            let target_hwnd = unsafe { FindWindowExW(0, 0, win_name.as_ptr(), win_name.as_ptr()) };
+            if target_hwnd != 0 {
+                let mut result = 0;
+                // SAFETY: Both buffers remain alive for this synchronous Win32 call.
+                let sent = unsafe {
+                    SendMessageTimeoutW(
+                        target_hwnd,
+                        WM_COPYDATA,
+                        0,
+                        (&raw const cds) as isize,
+                        SMTO_BLOCK | SMTO_ABORTIFHUNG,
+                        2000,
+                        &raw mut result,
+                    )
+                };
+                if sent == 0 || result != 0 {
+                    return sent != 0;
+                }
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(30));
+        }
     }
 
     pub fn apply_dwm_rounded_corners(hwnd: Hwnd) {
@@ -2144,7 +2101,7 @@ mod win32 {
 
     impl SingleInstanceLock {
         pub fn acquire(name: &str) -> Result<Option<Self>, String> {
-            let wide = wide_nul(name);
+            let wide = wide_nul(&instance_mutex_name(name));
             let handle = unsafe { CreateMutexW(ptr::null(), 0, wide.as_ptr()) };
             if handle == 0 {
                 return Err("単一インスタンス Mutex の作成に失敗しました".to_owned());
@@ -2333,6 +2290,14 @@ pub fn clipboard_write_html(hwnd: isize, fragment: &str) -> Result<(), String> {
     }
 }
 
+#[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
+fn clipboard_png_json(width: u32, height: u32, png: &[u8]) -> String {
+    let b64 = base64_encode(png);
+    format!(
+        "{{\"width\":{width},\"height\":{height},\"pngBase64\":\"{b64}\",\"dataUrl\":\"data:image/png;base64,{b64}\"}}"
+    )
+}
+
 pub fn clipboard_read_image_json(hwnd: isize) -> Result<String, String> {
     #[cfg(target_os = "windows")]
     {
@@ -2341,16 +2306,15 @@ pub fn clipboard_read_image_json(hwnd: isize) -> Result<String, String> {
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     {
         let _ = hwnd;
-        let png = crate::unix_platform::clipboard_read_image_png()?;
+        let Some(png) = crate::unix_platform::clipboard_read_image_png()? else {
+            return Ok("null".to_owned());
+        };
         if png.len() > MAX_CLIPBOARD_BYTES {
             return Err("Clipboard image exceeds the size limit".to_owned());
         }
         let (width, height) = crate::unix_platform::parse_png_dimensions(&png)
             .ok_or_else(|| "Clipboard PNG header is invalid".to_owned())?;
-        let b64 = base64_encode(&png);
-        Ok(format!(
-            "{{\"width\":{width},\"height\":{height},\"dataUrl\":\"data:image/png;base64,{b64}\"}}"
-        ))
+        Ok(clipboard_png_json(width, height, &png))
     }
     #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
     {
@@ -2559,6 +2523,9 @@ pub fn forward_to_running_instance(instance_tag: &str, json_payload: &str) -> bo
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::json::{
+        json_get_bool, json_get_strict_u32, json_get_string, json_get_string_array, json_get_u32,
+    };
 
     #[test]
     fn base64_roundtrip_and_limits() {
@@ -2820,8 +2787,20 @@ mod tests {
         assert!(validate_custom_uri_scheme("ms-settings").is_err());
 
         assert_eq!(
-            instance_window_name("Local\\Draconium.Workspace"),
-            "Draconium.TrayWindow.LocalDraconiumWorkspace"
+            instance_mutex_name("Local\\Draconium.Workspace"),
+            "Local\\Draconium.Workspace"
+        );
+        assert_eq!(
+            instance_window_name("Draconium.Workspace"),
+            instance_window_name("Local\\Draconium.Workspace")
+        );
+        assert_ne!(
+            instance_mutex_name("project\\one"),
+            instance_mutex_name("project/one")
+        );
+        assert_ne!(
+            instance_window_name("project\\one"),
+            instance_window_name("project/one")
         );
 
         let report = CrashReport::new(
@@ -2838,7 +2817,18 @@ mod tests {
 
         let crash_dir = std::env::temp_dir().join(format!("dn-crash-test-{}", std::process::id()));
         let written = write_crash_report(&crash_dir, &report).unwrap();
+        let second = write_crash_report(&crash_dir, &report).unwrap();
         assert!(written.is_file());
+        assert_ne!(written, second);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            for path in [&crash_dir, &written, &second] {
+                let permissions = path.metadata().unwrap().permissions();
+                assert_eq!(permissions.mode() & 0o077, 0);
+            }
+        }
+        let _ = std::fs::remove_file(&second);
         let _ = std::fs::remove_file(&written);
         let _ = std::fs::remove_dir(&crash_dir);
     }

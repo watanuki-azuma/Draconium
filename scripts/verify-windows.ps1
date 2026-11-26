@@ -118,7 +118,14 @@ function Invoke-ReleaseBuild {
         [string]$LogPath,
         [int]$ParallelJobs
     )
-    $cmd = "`"$CargoExe`" build --release --frozen -j $ParallelJobs --manifest-path `"$ManifestPath`""
+    # Recompile both first-party crates so a cached build cannot bypass the
+    # warning gate. Retain the expensive Servo dependency artifacts.
+    $cleanCmd = "`"$CargoExe`" clean --release --frozen -p draconium -p draconium-host --manifest-path `"$ManifestPath`""
+    if ((Invoke-CmdLogged -CommandLine $cleanCmd -LogPath $LogPath) -ne 0) {
+        Get-Content -LiteralPath $LogPath -Tail 60 | Out-Host
+        throw "Could not clean first-party release artifacts. See $LogPath"
+    }
+    $cmd = "`"$CargoExe`" build --release --frozen --color never -j $ParallelJobs --manifest-path `"$ManifestPath`""
     $exitCode = Invoke-CmdLogged -CommandLine $cmd -LogPath $LogPath
     if ($exitCode -ne 0) {
         Get-Content -LiteralPath $LogPath -Tail 60 | Out-Host
@@ -126,14 +133,15 @@ function Invoke-ReleaseBuild {
     }
 
     $lines = Get-Content -LiteralPath $LogPath -Encoding UTF8
-    $compileMatch = $lines | Select-String 'Compiling draconium(?:-host)? v' | Select-Object -First 1
-    if ($compileMatch) {
-        $tailLines = $lines[($compileMatch.LineNumber - 1)..($lines.Length - 1)]
-        $draconiumWarnings = @($tailLines | Where-Object { $_ -match '^warning(\[[^\]]+\])?:' })
-        if ($draconiumWarnings.Count -gt 0) {
-            $draconiumWarnings | Out-Host
-            throw "draconium-host / draconium emitted $($draconiumWarnings.Count) compiler warning(s)."
+    foreach ($package in @('draconium-host', 'draconium')) {
+        if (-not ($lines | Select-String "^\s*Compiling $package v")) {
+            throw "Release build did not compile $package. See $LogPath"
         }
+    }
+    $draconiumWarnings = @($lines | Select-String '^warning: `draconium(?:-host)?` \([^)]+\) generated \d+ warnings?')
+    if ($draconiumWarnings.Count -gt 0) {
+        $draconiumWarnings | Out-Host
+        throw "draconium-host / draconium emitted compiler warnings. See $LogPath"
     }
     Write-Host '[PASS] Release MSVC build succeeded with 0 warnings in draconium-host and draconium' -ForegroundColor Green
 }
@@ -147,10 +155,6 @@ $rustcExe = Resolve-Tool -Name 'rustc' -Candidates @(
     (Join-Path $toolchainBin 'rustc.exe'),
     (Join-Path $env:USERPROFILE '.cargo\bin\rustc.exe')
 )
-$rustfmtExe = Resolve-Tool -Name 'rustfmt' -Candidates @(
-    (Join-Path $toolchainBin 'rustfmt.exe'),
-    (Join-Path $env:USERPROFILE '.cargo\bin\rustfmt.exe')
-)
 $nodeExe = Resolve-Tool -Name 'node' -Candidates @('C:\Program Files\nodejs\node.exe')
 $pythonExe = Resolve-Tool -Name 'python' -Candidates @(
     (Join-Path $env:LOCALAPPDATA 'Programs\Python\Python313\python.exe'),
@@ -160,6 +164,7 @@ $pythonExe = Resolve-Tool -Name 'python' -Candidates @(
 
 Assert-NoRunningHost
 Initialize-MsvcEnv -CargoExe $cargoExe -PythonExe $pythonExe
+$env:PATH = "$(Split-Path -Parent $nodeExe);$env:PATH"
 
 if (Test-Path -LiteralPath $WorkDir) {
     Remove-Item -LiteralPath $WorkDir -Recurse -Force
@@ -189,67 +194,11 @@ try {
 }
 
 try {
-    Write-Host '=== Phase 1: Static Checks (rustfmt, cargo metadata, node --check) ===' -ForegroundColor Cyan
-    $hostManifestPath = Join-Path $repoRoot 'crates\draconium-host\Cargo.toml'
-    & $cargoExe fmt --check --manifest-path $hostManifestPath
-    if ($LASTEXITCODE -ne 0) { throw 'cargo fmt --check failed (draconium-host)' }
-    & $cargoExe fmt --check --manifest-path $manifestPath
-    if ($LASTEXITCODE -ne 0) { throw 'cargo fmt --check failed (draconium)' }
-    & $rustfmtExe --edition 2024 --check (Join-Path $PSScriptRoot 'win32_live_probe.rs')
-    if ($LASTEXITCODE -ne 0) { throw 'rustfmt --check on scripts/win32_live_probe.rs failed' }
-    $metaLog = Join-Path $WorkDir 'cargo-metadata.json'
-    $metaExit = Invoke-CmdLogged -CommandLine "`"$cargoExe`" metadata --format-version 1 --locked --offline --no-deps --manifest-path `"$manifestPath`"" -LogPath $metaLog
-    if ($metaExit -ne 0) { throw 'cargo metadata --locked --offline --no-deps failed' }
-    $jsFiles = Get-ChildItem -Path (Join-Path $repoRoot 'probes\servo\ui') -Filter '*.js' -File
-    foreach ($js in $jsFiles) {
-        & $nodeExe --check $js.FullName
-        if ($LASTEXITCODE -ne 0) { throw "node --check failed for $($js.FullName)" }
+    Write-Host '=== Phases 1-2: Static Checks, Standalone Tests, Platform Harness ===' -ForegroundColor Cyan
+    & $pythonExe (Join-Path $PSScriptRoot 'verify-ci.py')
+    if ($LASTEXITCODE -ne 0) {
+        throw 'verify-ci.py failed'
     }
-    Write-Host "[PASS] Static checks passed ($($jsFiles.Count) JS files, rustfmt, locked metadata)" -ForegroundColor Green
-
-    Write-Host '=== Phase 2: Rust Standalone Unit Tests (-D warnings) ===' -ForegroundColor Cyan
-    $unitDir = Join-Path $WorkDir 'unit-tests'
-    New-Item -ItemType Directory -Path $unitDir -Force | Out-Null
-    $modules = @(
-        @{ Name = 'win_platform'; RelPath = 'crates\draconium-host\src\win_platform.rs' },
-        @{ Name = 'unix_platform'; RelPath = 'crates\draconium-host\src\unix_platform.rs' },
-        @{ Name = 'window_state'; RelPath = 'crates\draconium-host\src\window_state.rs' },
-        @{ Name = 'bridge'; RelPath = 'crates\draconium-host\src\bridge.rs' },
-        @{ Name = 'embedder_ui'; RelPath = 'crates\draconium-host\src\embedder_ui.rs' },
-        @{ Name = 'protocol'; RelPath = 'crates\draconium-host\src\protocol.rs' },
-        @{ Name = 'tray'; RelPath = 'crates\draconium-host\src\tray.rs' },
-        @{ Name = 'policy'; RelPath = 'crates\draconium-host\src\policy.rs' },
-        @{ Name = 'workspace'; RelPath = 'probes\servo\src\workspace.rs' },
-        @{ Name = 'starter'; RelPath = 'probes\servo\src\starter.rs' },
-        @{ Name = 'wheel_scroll'; RelPath = 'probes\servo\vendor\servo-paint\wheel_scroll.rs' }
-    )
-    $totalPassed = 0
-    foreach ($mod in $modules) {
-        $srcPath = Join-Path $repoRoot $mod.RelPath
-        $outExe = Join-Path $unitDir "$($mod.Name).test.exe"
-        $compileLog = Join-Path $unitDir "$($mod.Name).compile.log"
-        $cExit = Invoke-CmdLogged -CommandLine "`"$rustcExe`" --edition 2024 --test -D warnings `"$srcPath`" -o `"$outExe`"" -LogPath $compileLog
-        if ($cExit -ne 0) {
-            Get-Content -LiteralPath $compileLog -Encoding UTF8 | Out-Host
-            throw "Unit test compile failed for $($mod.RelPath)"
-        }
-        $runLog = Join-Path $unitDir "$($mod.Name).run.log"
-        $rExit = Invoke-CmdLogged -CommandLine "`"$outExe`"" -LogPath $runLog
-        $runOut = Get-Content -LiteralPath $runLog -Encoding UTF8 -Raw
-        if ($rExit -ne 0) {
-            $runOut | Out-Host
-            throw "Unit test execution failed for $($mod.RelPath) (exit=$rExit)"
-        }
-        if ($runOut -match 'test result: ok\. (\d+) passed; 0 failed') {
-            $passed = [int]$Matches[1]
-            $totalPassed += $passed
-            Write-Host "  [PASS] $($mod.Name) ($passed/$passed)" -ForegroundColor Green
-        } else {
-            $runOut | Out-Host
-            throw "Unexpected test output for $($mod.RelPath)"
-        }
-    }
-    Write-Host "[PASS] All $($modules.Count) unit test modules passed ($totalPassed/$totalPassed)" -ForegroundColor Green
 
     Write-Host '=== Phase 3: Win32 Native Platform Probe ===' -ForegroundColor Cyan
     $winProbeExe = Join-Path $WorkDir 'win32_live_probe.exe'

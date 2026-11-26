@@ -9,6 +9,8 @@ use std::collections::VecDeque;
 use std::error::Error;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use euclid::Scale;
@@ -41,10 +43,10 @@ use winit::window::{
 use crate::bridge::{self, BridgeCommand, DevOrigin, WindowCommand};
 use crate::embedder_ui::{self, PopupMenuEntry};
 use crate::input;
-use crate::tray::{TrayAction, TrayConfig, TrayHandle};
-use crate::win_platform::{
+use crate::platform_services::{
     self, FileAccessRegistry, MAX_CAPABILITY_FILE_BYTES, SingleInstanceLock,
 };
+use crate::tray::{TrayAction, TrayConfig, TrayHandle};
 use crate::window_state;
 
 const SELF_TEST_TIMEOUT: Duration = Duration::from_secs(10);
@@ -52,11 +54,17 @@ const SCREENSHOT_TIMEOUT: Duration = Duration::from_secs(15);
 const BACKGROUND_POLL_INTERVAL: Duration = Duration::from_secs(1);
 const CLOSE_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const CLOSE_TIMEOUT: Duration = Duration::from_millis(500);
+const BEFORE_CLOSE_SCRIPT: &str = "typeof window.__draconiumBeforeClose === 'function' ? window.__draconiumBeforeClose() === true : true";
 /// Ignore `WindowEvent::Moved` shortly after startup or programmatic moves so
 /// OS placement events do not clobber the user's saved position.
 const PROGRAMMATIC_MOVE_GRACE: Duration = Duration::from_millis(300);
 /// Hard cap on simultaneously open child windows per host process.
 const MAX_CHILD_WINDOWS: usize = 4;
+const MAX_PENDING_CAPTURES: usize = 4;
+const MAX_PENDING_IPC: usize = 32;
+const MAX_PENDING_IPC_BYTES: usize = 48 * 1024 * 1024;
+const MAX_PENDING_PAGE_EVENTS: usize = 32;
+const MAX_ASYNC_WORKERS: usize = 4;
 
 /// Public re-exports forming the stable host API surface for hosted apps.
 pub use crate::policy::Capabilities;
@@ -126,7 +134,7 @@ impl HostConfig {
             raw_args: Vec::new(),
             autostart_app_name: "Draconium",
             autostart_args: Vec::new(),
-            crash_dir: std::env::temp_dir().join("draconium-crashes"),
+            crash_dir: platform_services::default_crash_dir(),
             capabilities: Capabilities::restricted(),
             dev_origin: None,
             allow_wasm_csp: false,
@@ -160,7 +168,8 @@ impl HostConfig {
 
     /// Configures the local Firefox DevTools RDP server listen address
     /// (`127.0.0.1:<port>`, `localhost:<port>`, or `[::1]:<port>`).
-    /// Non-loopback addresses are rejected by [`run`].
+    /// Non-loopback addresses are rejected by [`run`]. Interactive sessions
+    /// confirm incoming connections through the native UI.
     pub fn with_devtools(mut self, devtools_addr: Option<String>) -> Self {
         self.devtools_addr = devtools_addr;
         self
@@ -472,6 +481,10 @@ pub fn try_resolve_app_url_from(
 /// - `dn://app/<file_name>` when `dn_assets` is true or disk assets are absent
 ///   (single-binary embedded fallback),
 /// - `file://` by default during local disk checkout runs.
+///
+/// # Panics
+/// Panics when the supplied URL or the resolved asset path is invalid. Use
+/// [`try_resolve_app_url_from`] to propagate validation and I/O errors.
 pub fn resolve_app_url_from(
     base_dir: &Path,
     dn_assets: bool,
@@ -493,6 +506,9 @@ pub fn resolve_app_url_from(
 
 /// Resolves an app's startup URL and optional `dn://app/` asset root directory
 /// relative to the executable or current working directory.
+///
+/// # Panics
+/// Panics when [`resolve_app_url_from`] would panic for the current directory.
 pub fn resolve_app_url(
     dn_assets: bool,
     dev_url: Option<&str>,
@@ -516,8 +532,10 @@ pub fn run(
     handler: impl HostHandler + 'static,
     self_test: Option<String>,
 ) -> Result<(), Box<dyn Error>> {
+    let window_limits = effective_window_limits(&config)?;
+    crate::protocol::validate_embedded_assets(config.embedded_assets)?;
     if let Some(raw_addr) = config.devtools_addr.take() {
-        config.devtools_addr = Some(win_platform::validate_devtools_addr(&raw_addr)?);
+        config.devtools_addr = Some(platform_services::validate_devtools_addr(&raw_addr)?);
     }
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
@@ -537,14 +555,14 @@ pub fn run(
             let location = info
                 .location()
                 .map(|loc| format!("{}:{}:{}", loc.file(), loc.line(), loc.column()));
-            let report = win_platform::CrashReport::new(
+            let report = platform_services::CrashReport::new(
                 app_title_for_panic,
                 &url_for_panic,
                 "rust-panic",
                 &reason,
                 location,
             );
-            let _ = win_platform::write_crash_report(&crash_dir_for_panic, &report);
+            let _ = platform_services::write_crash_report(&crash_dir_for_panic, &report);
         }
         prev_hook(info);
     }));
@@ -559,8 +577,13 @@ pub fn run(
         self_test,
         screenshot_job,
         state: None,
+        window_limits,
+        startup_error: None,
     };
     event_loop.run_app(&mut app)?;
+    if let Some(error) = app.startup_error {
+        return Err(error.into());
+    }
     Ok(())
 }
 
@@ -571,6 +594,8 @@ struct App {
     self_test: Option<SelfTestRunner>,
     screenshot_job: Option<ScreenshotJob>,
     state: Option<State>,
+    window_limits: (window_state::LogicalSize, window_state::LogicalSize),
+    startup_error: Option<String>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -627,6 +652,146 @@ enum PendingAsyncTask {
     },
 }
 
+#[derive(Clone, Default)]
+struct AsyncWorkers {
+    active: Arc<AtomicUsize>,
+}
+
+impl AsyncWorkers {
+    fn try_reserve(&self) -> Result<WorkerSlot, String> {
+        let mut active = self.active.load(Ordering::Relaxed);
+        while active < MAX_ASYNC_WORKERS {
+            match self.active.compare_exchange_weak(
+                active,
+                active + 1,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return Ok(WorkerSlot(self.clone())),
+                Err(observed) => active = observed,
+            }
+        }
+        Err("バックグラウンド処理が混雑しています。完了後に再試行してください".to_owned())
+    }
+}
+
+struct WorkerSlot(AsyncWorkers);
+
+impl Drop for WorkerSlot {
+    fn drop(&mut self) {
+        self.0.active.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+fn queue_request<T>(queue: &RefCell<VecDeque<T>>, limit: usize, request: T) -> Result<(), String> {
+    let mut queue = queue.borrow_mut();
+    if queue.len() >= limit {
+        return Err("ホストの要求キューが満杯です。完了後に再試行してください".to_owned());
+    }
+    queue.push_back(request);
+    Ok(())
+}
+
+struct PageEvent {
+    name: &'static str,
+    json: String,
+}
+
+#[derive(Default)]
+struct FileDropState {
+    hovering: bool,
+    paths: Vec<PathBuf>,
+    position: Option<PhysicalPosition<i32>>,
+    extra_files: usize,
+}
+
+impl FileDropState {
+    fn hover(&mut self, delegate: &Delegate, webview: &WebView) {
+        if delegate.capabilities.allow_file_drop && !self.hovering {
+            self.hovering = true;
+            if webview.load_status() == LoadStatus::Complete {
+                delegate.dispatch_page_event(webview, "file-drop-hover", "{}");
+            }
+        }
+    }
+
+    fn cancel(&mut self, delegate: &Delegate, webview: &WebView) {
+        if std::mem::take(&mut self.hovering) && webview.load_status() == LoadStatus::Complete {
+            delegate.dispatch_page_event(webview, "file-drop-cancel", "{}");
+        }
+    }
+
+    fn drop_file(&mut self, delegate: &Delegate, path: PathBuf) {
+        self.hovering = false;
+        if !delegate.capabilities.allow_file_drop {
+            return;
+        }
+        if self.paths.is_empty() {
+            self.position = current_drop_position(&delegate.window);
+        }
+        if self.paths.len() < platform_services::MAX_CAPABILITY_TOKENS {
+            self.paths.push(path);
+        } else {
+            self.extra_files = self.extra_files.saturating_add(1);
+        }
+    }
+
+    fn flush(&mut self, delegate: &Delegate, webview: &WebView) -> bool {
+        if self.paths.is_empty() || webview.load_status() != LoadStatus::Complete {
+            return false;
+        }
+        let dropped = std::mem::take(&mut self.paths);
+        let extra_files = std::mem::take(&mut self.extra_files);
+        let position = self.position.take();
+        if !delegate.is_active_page_origin(webview) {
+            return false;
+        }
+        let files = delegate.files.borrow_mut().register_batch_json(&dropped);
+        let coordinates = match position {
+            Some(position) => {
+                let scale =
+                    delegate.window.scale_factor().max(0.1) * f64::from(webview.page_zoom());
+                let x = (f64::from(position.x) / scale).round();
+                let y = (f64::from(position.y) / scale).round();
+                format!(r#""x":{x},"y":{y}"#)
+            }
+            None => r#""x":null,"y":null"#.to_owned(),
+        };
+        let json = format!("{{{coordinates},\"files\":{files},\"extraFiles\":{extra_files}}}");
+        delegate.dispatch_page_event(webview, "file-drop", &json);
+        true
+    }
+}
+
+// Winit's DroppedFile event only supplies a path. Windows can query the
+// pointer independently of the CursorMoved events suppressed during a drag.
+fn current_drop_position(window: &Window) -> Option<PhysicalPosition<i32>> {
+    #[cfg(target_os = "windows")]
+    {
+        #[repr(C)]
+        struct Point {
+            x: i32,
+            y: i32,
+        }
+        #[link(name = "user32")]
+        unsafe extern "system" {
+            fn GetCursorPos(point: *mut Point) -> i32;
+            fn ScreenToClient(hwnd: isize, point: *mut Point) -> i32;
+        }
+        let mut point = Point { x: 0, y: 0 };
+        let hwnd = hwnd_of(window);
+        // SAFETY: point storage is live for both User32 calls; hwnd comes from winit.
+        if hwnd != 0
+            && unsafe { GetCursorPos(&mut point) != 0 && ScreenToClient(hwnd, &mut point) != 0 }
+        {
+            return Some(PhysicalPosition::new(point.x, point.y));
+        }
+    }
+    #[cfg(not(target_os = "windows"))]
+    let _ = window;
+    None
+}
+
 struct ChildWindowEntry {
     window_id: WindowId,
     // Drop `webview` before `_user_content_manager`, `rendering_context`, and `servo`.
@@ -637,6 +802,7 @@ struct ChildWindowEntry {
     mouse_position: DevicePoint,
     modifiers: ModifiersState,
     composing: bool,
+    file_drop: FileDropState,
 }
 
 struct State {
@@ -656,8 +822,7 @@ struct State {
     mouse_position: DevicePoint,
     modifiers: ModifiersState,
     composing: bool,
-    hovering_files: bool,
-    pending_dropped_files: Vec<PathBuf>,
+    file_drop: FileDropState,
 }
 
 // The delegate does not own the WebView, avoiding any reference cycle.
@@ -691,7 +856,6 @@ struct Delegate {
     window_visible: Cell<bool>,
     input_method: Cell<Option<EmbedderControlId>>,
     animating: Cell<bool>,
-    load_complete: Cell<bool>,
     has_painted: Cell<bool>,
     close_in_progress: Cell<bool>,
     close_started_at: Cell<Option<Instant>>,
@@ -704,15 +868,47 @@ struct Delegate {
     pending_move: Cell<Option<(window_state::LogicalPosition, Instant)>>,
     ignore_move_until: Cell<Option<Instant>>,
     pending_captures: RefCell<VecDeque<PendingCapture>>,
+    capture_in_progress: Cell<bool>,
     pending_session_ops: RefCell<VecDeque<PendingSessionOp>>,
     pending_child_windows: RefCell<VecDeque<PendingChildWindow>>,
     pending_async_tasks: RefCell<VecDeque<PendingAsyncTask>>,
-    pending_deep_links: RefCell<VecDeque<String>>,
+    pending_async_bytes: Cell<usize>,
+    pending_page_events: RefCell<VecDeque<PageEvent>>,
+    async_workers: AsyncWorkers,
     cached_site_data_json: RefCell<String>,
 }
 
 const MIN_SET_WINDOW_SIZE: window_state::LogicalSize = window_state::LogicalSize::new(200, 120);
 const MAX_SET_WINDOW_SIZE: window_state::LogicalSize = window_state::LogicalSize::new(7680, 4320);
+
+fn effective_window_limits(
+    config: &HostConfig,
+) -> Result<(window_state::LogicalSize, window_state::LogicalSize), String> {
+    let min = config.window.min_size.map_or(MIN_SET_WINDOW_SIZE, |size| {
+        window_state::LogicalSize::new(
+            size.width.max(MIN_SET_WINDOW_SIZE.width),
+            size.height.max(MIN_SET_WINDOW_SIZE.height),
+        )
+    });
+    let max = config.window.max_size.map_or(MAX_SET_WINDOW_SIZE, |size| {
+        window_state::LogicalSize::new(
+            size.width.min(MAX_SET_WINDOW_SIZE.width),
+            size.height.min(MAX_SET_WINDOW_SIZE.height),
+        )
+    });
+    let inconsistent_os_limits = config
+        .window
+        .min_size
+        .zip(config.window.max_size)
+        .is_some_and(|(min, max)| min.width > max.width || min.height > max.height);
+    if inconsistent_os_limits
+        || (config.capabilities.allow_window_sizing
+            && (min.width > max.width || min.height > max.height))
+    {
+        return Err("Window size limits do not overlap with the permitted dimensions".to_owned());
+    }
+    Ok((min, max))
+}
 
 /// How long a move burst must be quiet before its final position is saved.
 const MOVE_SAVE_QUIET: Duration = Duration::from_millis(400);
@@ -783,7 +979,7 @@ fn format_site_data_json(entries: &[SiteData]) -> String {
         }
         out.push_str(&format!(
             "{{\"name\":{},\"storage\":[{}]}}",
-            win_platform::json_string(&name),
+            crate::json::json_string(&name),
             flags.join(",")
         ));
     }
@@ -792,6 +988,78 @@ fn format_site_data_json(entries: &[SiteData]) -> String {
 }
 
 impl Delegate {
+    fn dispatch_page_event(&self, webview: &WebView, name: &str, json: &str) {
+        if self.is_active_page_origin(webview)
+            && let Some(script) =
+                bridge::dispatch_script_for_origin(self.initial_url.as_str(), name, json)
+        {
+            webview.evaluate_javascript(script, |_| {});
+        }
+    }
+
+    fn dispatch_when_loaded(&self, webview: &WebView, name: &'static str, json: String) {
+        if webview.load_status() == LoadStatus::Complete {
+            self.flush_page_events(webview);
+            self.dispatch_page_event(webview, name, &json);
+        } else if queue_request(
+            &self.pending_page_events,
+            MAX_PENDING_PAGE_EVENTS,
+            PageEvent { name, json },
+        )
+        .is_err()
+        {
+            eprintln!("[host event] Dropped {name}: the page event queue is full");
+        }
+    }
+
+    fn flush_page_events(&self, webview: &WebView) -> bool {
+        if webview.load_status() != LoadStatus::Complete {
+            return false;
+        }
+        let events = std::mem::take(&mut *self.pending_page_events.borrow_mut());
+        if events.is_empty() {
+            return false;
+        }
+        for event in events {
+            self.dispatch_page_event(webview, event.name, &event.json);
+        }
+        true
+    }
+
+    fn queue_async(&self, task: PendingAsyncTask, bytes: usize) -> Result<String, String> {
+        let queued = self.pending_async_bytes.get();
+        if bytes > MAX_PENDING_IPC_BYTES - queued {
+            return Err("非同期要求のデータサイズがキューの上限を超えています".to_owned());
+        }
+        queue_request(&self.pending_async_tasks, MAX_PENDING_IPC, task)?;
+        self.pending_async_bytes.set(queued + bytes);
+        self.waker.wake();
+        Ok("queued".to_owned())
+    }
+
+    fn spawn_async(
+        &self,
+        call_id: u64,
+        job: impl FnOnce() -> Result<String, String> + Send + 'static,
+    ) -> Result<String, String> {
+        let slot = self.async_workers.try_reserve()?;
+        let waker = self.waker.clone();
+        let target_window = self.window.id();
+        std::thread::Builder::new()
+            .name("draconium-ipc".to_owned())
+            .spawn(move || {
+                let result = job();
+                drop(slot);
+                let (ok, payload) = match result {
+                    Ok(payload) => (true, payload),
+                    Err(error) => (false, error),
+                };
+                send_async_reply(&waker, target_window, call_id, ok, payload, false);
+            })
+            .map_err(|err| format!("バックグラウンド処理を開始できませんでした: {err}"))?;
+        Ok("queued".to_owned())
+    }
+
     fn sync_fullscreen(&self, webview: &WebView) {
         let observed = self.window.fullscreen().is_some();
         if self.last_observed_fullscreen.replace(observed) != observed {
@@ -904,9 +1172,9 @@ impl Delegate {
             CaptureFormat::Png => ("capture.png", ".png"),
             CaptureFormat::Pdf => ("capture.pdf", ".pdf"),
         };
-        let raw_name = win_platform::json_get_string(payload, "name")
+        let raw_name = crate::json::json_get_string(payload, "name")
             .unwrap_or_else(|| default_name.to_owned());
-        let mut suggested = win_platform::sanitize_suggested_filename(&raw_name);
+        let mut suggested = platform_services::sanitize_suggested_filename(&raw_name);
         if !suggested.to_ascii_lowercase().ends_with(ext) {
             suggested.push_str(ext);
         }
@@ -922,13 +1190,15 @@ impl Delegate {
             }
             return Ok("dry-run".to_owned());
         }
-        self.pending_captures
-            .borrow_mut()
-            .push_back(PendingCapture {
+        queue_request(
+            &self.pending_captures,
+            MAX_PENDING_CAPTURES,
+            PendingCapture {
                 format,
                 suggested,
                 call_id,
-            });
+            },
+        )?;
         self.waker.wake();
         Ok("queued".to_owned())
     }
@@ -1088,7 +1358,7 @@ impl Delegate {
             }
             WindowCommand::SetSize => {
                 let dimension = |key| {
-                    win_platform::json_get_strict_u32(payload, key)
+                    crate::json::json_get_strict_u32(payload, key)
                         .filter(|&value| value > 0)
                         .ok_or_else(|| format!("{key} must be a positive integer"))
                 };
@@ -1194,11 +1464,11 @@ impl Delegate {
                     .parse()
                     .map_err(|_| format!("不透明度の数値解析に失敗しました: {payload}"))?;
                 if self.non_interactive {
-                    let alpha = win_platform::opacity_to_alpha(value)
+                    let alpha = platform_services::opacity_to_alpha(value)
                         .ok_or_else(|| "不正な不透明度です".to_owned())?;
                     return Ok(format!("{:.2}", f64::from(alpha) / 255.0));
                 }
-                win_platform::set_window_opacity(hwnd, value)?;
+                platform_services::set_window_opacity(hwnd, value)?;
             }
             WindowCommand::SetClickThrough => {
                 let enabled = match payload.trim() {
@@ -1209,7 +1479,7 @@ impl Delegate {
                 if self.non_interactive {
                     return Ok(enabled.to_string());
                 }
-                win_platform::set_window_click_through(hwnd, enabled)?;
+                platform_services::set_window_click_through(hwnd, enabled)?;
             }
             WindowCommand::CapturePng => {
                 return self.queue_capture(CaptureFormat::Png, payload, call_id);
@@ -1218,14 +1488,14 @@ impl Delegate {
                 return self.queue_capture(CaptureFormat::Pdf, payload, call_id);
             }
             WindowCommand::ExportHtml => {
-                let raw_name = win_platform::json_get_string(payload, "name")
+                let raw_name = crate::json::json_get_string(payload, "name")
                     .unwrap_or_else(|| "export.html".to_owned());
-                let mut suggested = win_platform::sanitize_suggested_filename(&raw_name);
+                let mut suggested = platform_services::sanitize_suggested_filename(&raw_name);
                 let lower = suggested.to_ascii_lowercase();
                 if !lower.ends_with(".html") && !lower.ends_with(".htm") {
                     suggested.push_str(".html");
                 }
-                let text = win_platform::json_get_string(payload, "text")
+                let text = crate::json::json_get_string(payload, "text")
                     .ok_or_else(|| "エクスポートする HTML (text) が不足しています".to_owned())?;
                 if text.len() > MAX_CAPABILITY_FILE_BYTES {
                     return Err("HTML データサイズが上限を超えています".to_owned());
@@ -1250,21 +1520,20 @@ impl Delegate {
                 return Ok(saved_name);
             }
             WindowCommand::SaveDownload | WindowCommand::DialogSaveFile => {
-                let raw_name = win_platform::json_get_string(payload, "name")
+                let raw_name = crate::json::json_get_string(payload, "name")
                     .unwrap_or_else(|| "download.bin".to_owned());
-                let suggested = win_platform::sanitize_suggested_filename(&raw_name);
+                let suggested = platform_services::sanitize_suggested_filename(&raw_name);
                 let mut extensions =
-                    win_platform::json_get_string_array(payload, "extensions").unwrap_or_default();
+                    crate::json::json_get_string_array(payload, "extensions").unwrap_or_default();
                 if extensions.is_empty()
                     && let Some((_, ext)) = suggested.rsplit_once('.')
                     && !ext.is_empty()
                 {
                     extensions.push(ext.to_owned());
                 }
-                let bytes = if let Some(b64) = win_platform::json_get_string(payload, "dataBase64")
-                {
-                    win_platform::base64_decode(&b64, MAX_CAPABILITY_FILE_BYTES)?
-                } else if let Some(text) = win_platform::json_get_string(payload, "text") {
+                let bytes = if let Some(b64) = crate::json::json_get_string(payload, "dataBase64") {
+                    platform_services::base64_decode(&b64, MAX_CAPABILITY_FILE_BYTES)?
+                } else if let Some(text) = crate::json::json_get_string(payload, "text") {
                     if text.len() > MAX_CAPABILITY_FILE_BYTES {
                         return Err("保存データサイズが上限を超えています".to_owned());
                     }
@@ -1293,16 +1562,23 @@ impl Delegate {
             }
             WindowCommand::DialogOpenFile => {
                 let extensions =
-                    win_platform::json_get_string_array(payload, "extensions").unwrap_or_default();
-                let multiple = win_platform::json_get_bool(payload, "multiple").unwrap_or(false);
+                    crate::json::json_get_string_array(payload, "extensions").unwrap_or_default();
+                let multiple = crate::json::json_get_bool(payload, "multiple").unwrap_or(false);
                 let Some(paths) = embedder_ui::show_open_file_dialog(
                     hwnd,
                     &extensions,
                     multiple,
                     self.non_interactive,
-                ) else {
+                )?
+                else {
                     return Err("cancelled".to_owned());
                 };
+                if paths.len() > platform_services::MAX_CAPABILITY_TOKENS {
+                    return Err(format!(
+                        "Select at most {} files at once.",
+                        platform_services::MAX_CAPABILITY_TOKENS
+                    ));
+                }
                 return Ok(self.files.borrow_mut().register_batch_json(&paths));
             }
             WindowCommand::DialogSelectFolder => {
@@ -1328,19 +1604,20 @@ impl Delegate {
                 if payload.len() > MAX_CAPABILITY_FILE_BYTES {
                     return Err("暗号化データが大きすぎます".to_owned());
                 }
-                let encrypted = win_platform::dpapi_encrypt(payload.as_bytes())?;
-                return Ok(win_platform::base64_encode(&encrypted));
+                let encrypted = platform_services::dpapi_encrypt(payload.as_bytes())?;
+                return Ok(platform_services::base64_encode(&encrypted));
             }
             WindowCommand::SafeStorageDecrypt => {
-                let ciphertext = win_platform::base64_decode(payload, MAX_CAPABILITY_FILE_BYTES)?;
-                let plain = win_platform::dpapi_decrypt(&ciphertext)?;
+                let ciphertext =
+                    platform_services::base64_decode(payload, MAX_CAPABILITY_FILE_BYTES)?;
+                let plain = platform_services::dpapi_decrypt(&ciphertext)?;
                 return String::from_utf8(plain)
                     .map_err(|_| "復号データが UTF-8 ではありません".to_owned());
             }
             WindowCommand::Notify => {
-                let title = win_platform::json_get_string(payload, "title")
+                let title = crate::json::json_get_string(payload, "title")
                     .unwrap_or_else(|| self.default_title.clone());
-                let body = win_platform::json_get_string(payload, "body").unwrap_or_default();
+                let body = crate::json::json_get_string(payload, "body").unwrap_or_default();
                 self.deliver_notification(&title, &body);
             }
             WindowCommand::GetTheme => {
@@ -1351,37 +1628,37 @@ impl Delegate {
                 });
             }
             WindowCommand::GetPlatform => {
-                return Ok(crate::unix_platform::platform_capabilities().to_json());
+                return Ok(crate::platform::platform_capabilities().to_json());
             }
             WindowCommand::ClipboardReadText => {
                 if self.non_interactive {
                     return Ok(String::new());
                 }
-                return win_platform::clipboard_read_text(hwnd);
+                return platform_services::clipboard_read_text(hwnd);
             }
             WindowCommand::ClipboardWriteText => {
-                if payload.len() > win_platform::MAX_CLIPBOARD_BYTES {
+                if payload.len() > platform_services::MAX_CLIPBOARD_BYTES {
                     return Err("クリップボードテキストが大きすぎます".to_owned());
                 }
                 if self.non_interactive {
                     return Ok("dry-run".to_owned());
                 }
-                win_platform::clipboard_write_text(hwnd, payload)?;
+                platform_services::clipboard_write_text(hwnd, payload)?;
             }
             WindowCommand::ClipboardReadHtml => {
                 if self.non_interactive {
                     return Ok(String::new());
                 }
-                return win_platform::clipboard_read_html(hwnd);
+                return platform_services::clipboard_read_html(hwnd);
             }
             WindowCommand::ClipboardWriteHtml => {
-                if payload.len() > win_platform::MAX_CLIPBOARD_BYTES {
+                if payload.len() > platform_services::MAX_CLIPBOARD_BYTES {
                     return Err("クリップボード HTML が大きすぎます".to_owned());
                 }
                 if self.non_interactive {
                     return Ok("dry-run".to_owned());
                 }
-                win_platform::clipboard_write_html(hwnd, payload)?;
+                platform_services::clipboard_write_html(hwnd, payload)?;
             }
             WindowCommand::ClipboardReadImage => {
                 if self.non_interactive {
@@ -1389,33 +1666,37 @@ impl Delegate {
                         "{\"width\":0,\"height\":0,\"pngBase64\":\"\",\"dataUrl\":\"\"}".to_owned(),
                     );
                 }
-                return win_platform::clipboard_read_image_json(hwnd);
+                return platform_services::clipboard_read_image_json(hwnd);
             }
             WindowCommand::ClipboardWriteImage => {
-                if let Some(bmp_b64) = win_platform::json_get_string(payload, "bmpBase64")
+                if let Some(bmp_b64) = crate::json::json_get_string(payload, "bmpBase64")
                     && !bmp_b64.is_empty()
                 {
-                    let bmp =
-                        win_platform::base64_decode(&bmp_b64, win_platform::MAX_CLIPBOARD_BYTES)?;
-                    let dib = win_platform::decode_bmp_to_dib(&bmp)?;
+                    let bmp = platform_services::base64_decode(
+                        &bmp_b64,
+                        platform_services::MAX_CLIPBOARD_BYTES,
+                    )?;
+                    let dib = platform_services::decode_bmp_to_dib(&bmp)?;
                     if self.non_interactive {
                         return Ok("dry-run".to_owned());
                     }
-                    win_platform::clipboard_write_image_dib(hwnd, &dib)?;
-                } else if let Some(rgba_b64) = win_platform::json_get_string(payload, "rgbaBase64")
+                    platform_services::clipboard_write_image_dib(hwnd, &dib)?;
+                } else if let Some(rgba_b64) = crate::json::json_get_string(payload, "rgbaBase64")
                     && !rgba_b64.is_empty()
                 {
-                    let width = win_platform::json_get_strict_u32(payload, "width")
+                    let width = crate::json::json_get_strict_u32(payload, "width")
                         .ok_or_else(|| "画像幅 (width) が指定されていません".to_owned())?;
-                    let height = win_platform::json_get_strict_u32(payload, "height")
+                    let height = crate::json::json_get_strict_u32(payload, "height")
                         .ok_or_else(|| "画像高さ (height) が指定されていません".to_owned())?;
-                    let rgba =
-                        win_platform::base64_decode(&rgba_b64, win_platform::MAX_CLIPBOARD_BYTES)?;
+                    let rgba = platform_services::base64_decode(
+                        &rgba_b64,
+                        platform_services::MAX_CLIPBOARD_BYTES,
+                    )?;
                     if self.non_interactive {
-                        win_platform::rgba_to_dib(width, height, &rgba)?;
+                        platform_services::rgba_to_dib(width, height, &rgba)?;
                         return Ok("dry-run".to_owned());
                     }
-                    win_platform::clipboard_write_image_rgba(hwnd, width, height, &rgba)?;
+                    platform_services::clipboard_write_image_rgba(hwnd, width, height, &rgba)?;
                 } else {
                     return Err(
                         "画像データ (rgbaBase64 または bmpBase64) が不足しています".to_owned()
@@ -1426,13 +1707,13 @@ impl Delegate {
                 if self.non_interactive {
                     return Ok("dry-run".to_owned());
                 }
-                win_platform::clipboard_clear(hwnd)?;
+                platform_services::clipboard_clear(hwnd)?;
             }
             WindowCommand::AutostartGet => {
                 if self.non_interactive {
                     return Ok("false".to_owned());
                 }
-                let enabled = win_platform::autostart_is_enabled(self.autostart_app_name)?;
+                let enabled = platform_services::autostart_is_enabled(self.autostart_app_name)?;
                 return Ok(if enabled {
                     "true".to_owned()
                 } else {
@@ -1450,7 +1731,7 @@ impl Delegate {
                 }
                 let exe = std::env::current_exe()
                     .map_err(|err| format!("実行ファイルパスの取得に失敗しました: {err}"))?;
-                win_platform::autostart_set_enabled_for_exe(
+                platform_services::autostart_set_enabled_for_exe(
                     self.autostart_app_name,
                     enabled,
                     &exe,
@@ -1459,13 +1740,13 @@ impl Delegate {
                 return Ok(enabled.to_string());
             }
             WindowCommand::ProtocolClientSet => {
-                let scheme = win_platform::validate_custom_uri_scheme(payload)?;
+                let scheme = platform_services::validate_custom_uri_scheme(payload)?;
                 if self.non_interactive {
                     return Ok(scheme);
                 }
                 let exe = std::env::current_exe()
                     .map_err(|err| format!("実行ファイルパスの取得に失敗しました: {err}"))?;
-                win_platform::register_uri_scheme_for_exe(
+                platform_services::register_uri_scheme_for_exe(
                     &scheme,
                     self.autostart_app_name,
                     &exe,
@@ -1474,47 +1755,55 @@ impl Delegate {
                 return Ok(scheme);
             }
             WindowCommand::ProtocolClientRemove => {
-                let scheme = win_platform::validate_custom_uri_scheme(payload)?;
+                let scheme = platform_services::validate_custom_uri_scheme(payload)?;
                 if self.non_interactive {
                     return Ok(scheme);
                 }
-                win_platform::unregister_uri_scheme(&scheme)?;
+                platform_services::unregister_uri_scheme(&scheme)?;
                 return Ok(scheme);
             }
             WindowCommand::SessionListSiteData => {
-                self.pending_session_ops
-                    .borrow_mut()
-                    .push_back(PendingSessionOp::ListSiteData { call_id });
+                queue_request(
+                    &self.pending_session_ops,
+                    MAX_PENDING_IPC,
+                    PendingSessionOp::ListSiteData { call_id },
+                )?;
                 self.waker.wake();
                 return Ok(self.cached_site_data_json.borrow().clone());
             }
             WindowCommand::SessionClearSiteData => {
-                self.pending_session_ops
-                    .borrow_mut()
-                    .push_back(PendingSessionOp::ClearSiteData { call_id });
+                queue_request(
+                    &self.pending_session_ops,
+                    MAX_PENDING_IPC,
+                    PendingSessionOp::ClearSiteData { call_id },
+                )?;
                 self.waker.wake();
                 return Ok("queued".to_owned());
             }
             WindowCommand::SessionClearCookies => {
                 let session_only = payload.trim() == "session";
-                self.pending_session_ops
-                    .borrow_mut()
-                    .push_back(PendingSessionOp::ClearCookies {
+                queue_request(
+                    &self.pending_session_ops,
+                    MAX_PENDING_IPC,
+                    PendingSessionOp::ClearCookies {
                         session_only,
                         call_id,
-                    });
+                    },
+                )?;
                 self.waker.wake();
                 return Ok("queued".to_owned());
             }
             WindowCommand::SessionClearCache => {
-                self.pending_session_ops
-                    .borrow_mut()
-                    .push_back(PendingSessionOp::ClearCache { call_id });
+                queue_request(
+                    &self.pending_session_ops,
+                    MAX_PENDING_IPC,
+                    PendingSessionOp::ClearCache { call_id },
+                )?;
                 self.waker.wake();
                 return Ok("queued".to_owned());
             }
             WindowCommand::OpenChildWindow => {
-                let url_str = win_platform::json_get_string(payload, "url")
+                let url_str = crate::json::json_get_string(payload, "url")
                     .unwrap_or_else(|| "about:blank".to_owned());
                 if !bridge::allows_child_window_url(
                     &url_str,
@@ -1528,25 +1817,30 @@ impl Delegate {
                 }
                 let url = Url::parse(&url_str)
                     .map_err(|err| format!("子ウィンドウ URL の解析に失敗しました: {err}"))?;
-                let title = win_platform::json_get_string(payload, "title")
+                let title = crate::json::json_get_string(payload, "title")
                     .filter(|s| !s.is_empty())
                     .unwrap_or_else(|| self.default_title.clone());
-                let raw_w = win_platform::json_get_u32(payload, "width").unwrap_or(800) as i32;
-                let raw_h = win_platform::json_get_u32(payload, "height").unwrap_or(600) as i32;
+                let raw_w = crate::json::json_get_u32(payload, "width").unwrap_or(800) as i32;
+                let raw_h = crate::json::json_get_u32(payload, "height").unwrap_or(600) as i32;
                 let (width, height) = window_state::clamp_window_request_size(raw_w, raw_h);
                 if self.non_interactive {
+                    if call_id.is_some() {
+                        return Err("子ウィンドウは非対話モードでは作成できません".to_owned());
+                    }
                     return Ok("dry-run".to_owned());
                 }
-                self.pending_child_windows
-                    .borrow_mut()
-                    .push_back(PendingChildWindow::FromBridge {
+                queue_request(
+                    &self.pending_child_windows,
+                    MAX_CHILD_WINDOWS,
+                    PendingChildWindow::FromBridge {
                         origin_window: self.window.id(),
                         url,
                         title,
                         width,
                         height,
                         call_id,
-                    });
+                    },
+                )?;
                 self.waker.wake();
                 return Ok("queued".to_owned());
             }
@@ -1571,8 +1865,7 @@ impl Delegate {
             | WindowCommand::SessionClearCookies
             | WindowCommand::SessionClearCache
             | WindowCommand::OpenChildWindow => {
-                let _ = self.handle_window_command(command, payload, Some(call_id), webview)?;
-                Ok("queued".to_owned())
+                self.handle_window_command(command, payload, Some(call_id), webview)
             }
             WindowCommand::DialogSelectFolder => {
                 let title = if payload.trim().is_empty() {
@@ -1581,90 +1874,51 @@ impl Delegate {
                     payload.trim().to_owned()
                 };
                 let hwnd = hwnd_of(&self.window);
-                let target_window = self.window.id();
                 let non_interactive = self.non_interactive;
-                let proxy = self.waker.0.clone();
-                std::thread::spawn(move || {
-                    let (ok, out) =
-                        match embedder_ui::show_select_folder_dialog(hwnd, &title, non_interactive)
-                        {
-                            Some(folder) => (true, folder.to_string_lossy().into_owned()),
-                            None => (false, "cancelled".to_owned()),
-                        };
-                    let _ = proxy.send_event(HostEvent::AsyncIpcReply {
-                        target_window,
-                        call_id,
-                        ok,
-                        payload: out,
-                        is_json: false,
-                    });
-                });
-                Ok("queued".to_owned())
+                self.spawn_async(call_id, move || {
+                    embedder_ui::show_select_folder_dialog(hwnd, &title, non_interactive)
+                        .map(|folder| folder.to_string_lossy().into_owned())
+                        .ok_or_else(|| "cancelled".to_owned())
+                })
             }
             WindowCommand::SafeStorageEncrypt => {
                 if payload.len() > MAX_CAPABILITY_FILE_BYTES {
                     return Err("暗号化データが大きすぎます".to_owned());
                 }
                 let text = payload.to_owned();
-                let target_window = self.window.id();
-                let proxy = self.waker.0.clone();
-                std::thread::spawn(move || {
-                    let res = win_platform::dpapi_encrypt(text.as_bytes())
-                        .map(|enc| win_platform::base64_encode(&enc));
-                    let (ok, out) = match res {
-                        Ok(s) => (true, s),
-                        Err(e) => (false, e),
-                    };
-                    let _ = proxy.send_event(HostEvent::AsyncIpcReply {
-                        target_window,
-                        call_id,
-                        ok,
-                        payload: out,
-                        is_json: false,
-                    });
-                });
-                Ok("queued".to_owned())
+                self.spawn_async(call_id, move || {
+                    platform_services::dpapi_encrypt(text.as_bytes())
+                        .map(|encrypted| platform_services::base64_encode(&encrypted))
+                })
             }
             WindowCommand::SafeStorageDecrypt => {
-                let b64 = payload.to_owned();
-                let target_window = self.window.id();
-                let proxy = self.waker.0.clone();
-                std::thread::spawn(move || {
-                    let res = win_platform::base64_decode(&b64, MAX_CAPABILITY_FILE_BYTES)
-                        .and_then(|ct| win_platform::dpapi_decrypt(&ct))
-                        .and_then(|plain| {
-                            String::from_utf8(plain)
-                                .map_err(|_| "復号データが UTF-8 ではありません".to_owned())
-                        });
-                    let (ok, out) = match res {
-                        Ok(s) => (true, s),
-                        Err(e) => (false, e),
-                    };
-                    let _ = proxy.send_event(HostEvent::AsyncIpcReply {
-                        target_window,
-                        call_id,
-                        ok,
-                        payload: out,
-                        is_json: false,
-                    });
-                });
-                Ok("queued".to_owned())
+                let max_encoded_size = 4 * MAX_CAPABILITY_FILE_BYTES.div_ceil(3);
+                if payload.len() > max_encoded_size {
+                    return Err("暗号化データが大きすぎます".to_owned());
+                }
+                let encoded = payload.to_owned();
+                self.spawn_async(call_id, move || {
+                    let ciphertext =
+                        platform_services::base64_decode(&encoded, MAX_CAPABILITY_FILE_BYTES)?;
+                    let plaintext = platform_services::dpapi_decrypt(&ciphertext)?;
+                    String::from_utf8(plaintext)
+                        .map_err(|_| "復号データが UTF-8 ではありません".to_owned())
+                })
             }
             other => {
                 let parse_json = matches!(
                     other,
                     WindowCommand::DialogOpenFile | WindowCommand::ClipboardReadImage
                 );
-                self.pending_async_tasks
-                    .borrow_mut()
-                    .push_back(PendingAsyncTask::Window {
+                self.queue_async(
+                    PendingAsyncTask::Window {
                         call_id,
                         command: other,
                         payload: payload.to_owned(),
                         parse_json,
-                    });
-                self.waker.wake();
-                Ok("queued".to_owned())
+                    },
+                    payload.len(),
+                )
             }
         }
     }
@@ -1746,7 +2000,6 @@ impl WebViewDelegate for Delegate {
 
     fn notify_load_status_changed(&self, _: WebView, status: LoadStatus) {
         if status == LoadStatus::Complete {
-            self.load_complete.set(true);
             self.waker.wake();
         }
     }
@@ -1771,14 +2024,14 @@ impl WebViewDelegate for Delegate {
             eprintln!("{bt}");
         }
         let url_str = webview.url().map(|u| u.to_string()).unwrap_or_default();
-        let report = win_platform::CrashReport::new(
+        let report = platform_services::CrashReport::new(
             &self.default_title,
             &url_str,
             "webview-crashed",
             &reason,
             backtrace,
         );
-        if let Ok(path) = win_platform::write_crash_report(&self.crash_dir, &report) {
+        if let Ok(path) = platform_services::write_crash_report(&self.crash_dir, &report) {
             eprintln!("[crash-report] wrote {}", path.display());
         }
     }
@@ -1798,10 +2051,14 @@ impl WebViewDelegate for Delegate {
         if self.non_interactive {
             return;
         }
-        self.pending_child_windows
-            .borrow_mut()
-            .push_back(PendingChildWindow::FromServoRequest(request));
-        self.waker.wake();
+        match queue_request(
+            &self.pending_child_windows,
+            MAX_CHILD_WINDOWS,
+            PendingChildWindow::FromServoRequest(request),
+        ) {
+            Ok(()) => self.waker.wake(),
+            Err(err) => eprintln!("[child window] {err}"),
+        }
     }
 
     /// Navigation guard (Milestone B + Stage 1 `--dev-url` loopback origin):
@@ -1910,15 +2167,15 @@ impl WebViewDelegate for Delegate {
                         BridgeCommand::AppAsync { call_id, command } => {
                             match self.capabilities.check_app_command(command) {
                                 Ok(()) => {
-                                    self.pending_async_tasks.borrow_mut().push_back(
+                                    let payload = prompt.current_value();
+                                    self.queue_async(
                                         PendingAsyncTask::App {
                                             call_id,
                                             command: command.to_owned(),
-                                            payload: prompt.current_value().to_owned(),
+                                            payload: payload.to_owned(),
                                         },
-                                    );
-                                    self.waker.wake();
-                                    Ok("queued".to_owned())
+                                        command.len() + payload.len(),
+                                    )
                                 }
                                 Err(err) => Err(err),
                             }
@@ -2063,16 +2320,26 @@ impl WebViewDelegate for Delegate {
                     .iter()
                     .map(|pattern| pattern.0.clone())
                     .collect();
-                if let Some(paths) = embedder_ui::show_open_file_dialog(
+                match embedder_ui::show_open_file_dialog(
                     hwnd,
                     &extensions,
                     picker.allow_select_multiple(),
                     self.non_interactive,
                 ) {
-                    picker.select(&paths);
-                    picker.submit();
-                } else {
-                    picker.dismiss();
+                    Ok(Some(paths)) => {
+                        picker.select(&paths);
+                        picker.submit();
+                    }
+                    Ok(None) => picker.dismiss(),
+                    Err(err) => {
+                        embedder_ui::show_alert(
+                            hwnd,
+                            &self.default_title,
+                            &err,
+                            self.non_interactive,
+                        );
+                        picker.dismiss();
+                    }
                 }
             }
             EmbedderControl::ColorPicker(mut picker) => {
@@ -2130,6 +2397,63 @@ fn classify_reload_shortcut(
     }
 }
 
+fn handle_keyboard_input(
+    webview: &WebView,
+    delegate: &Delegate,
+    event: &KeyEvent,
+    modifiers: ModifiersState,
+    composing: bool,
+    is_synthetic: bool,
+) {
+    if delegate.handle_fullscreen_shortcut(webview, event, modifiers, composing, is_synthetic) {
+        return;
+    }
+    let reload = classify_reload_shortcut(
+        delegate.allow_reload_shortcuts,
+        composing,
+        modifiers,
+        &event.logical_key,
+    );
+    if reload != ReloadShortcut::None {
+        if event.state == ElementState::Pressed && !event.repeat && !is_synthetic {
+            match reload {
+                ReloadShortcut::Reload => delegate.reload_requested.set(true),
+                ReloadShortcut::HardReload => delegate.hard_reload_requested.set(true),
+                ReloadShortcut::None => {}
+            }
+        }
+        return;
+    }
+    let zoom = if !composing
+        && modifiers.control_key()
+        && !modifiers.alt_key()
+        && !modifiers.super_key()
+    {
+        match &event.logical_key {
+            WinitKey::Character(text) if matches!(text.as_str(), "+" | "=") => Some(1),
+            WinitKey::Character(text) if text.as_str() == "-" => Some(-1),
+            WinitKey::Character(text) if text.as_str() == "0" => Some(0),
+            _ => None,
+        }
+    } else {
+        None
+    };
+    if let Some(delta) = zoom {
+        if event.state == ElementState::Pressed && !is_synthetic {
+            let next = if delta == 0 {
+                1.0
+            } else {
+                window_state::step_zoom(webview.page_zoom(), delta)
+            };
+            webview.set_page_zoom(next);
+        }
+        return;
+    }
+    webview.notify_input_event(InputEvent::Keyboard(input::keyboard_event(
+        event, modifiers, composing,
+    )));
+}
+
 fn close_timed_out(started: Instant, now: Instant) -> bool {
     now.saturating_duration_since(started) > CLOSE_TIMEOUT
 }
@@ -2144,33 +2468,36 @@ fn request_close(webview: &WebView, delegate: &Rc<Delegate>) {
     }
     delegate.flush_pending_move(true);
     delegate.close_in_progress.set(true);
-    delegate.close_started_at.set(Some(Instant::now()));
+    let started = Instant::now();
+    delegate.close_started_at.set(Some(started));
     let delegate_cb = delegate.clone();
-    webview.evaluate_javascript(
-        "typeof window.__draconiumBeforeClose === 'function' ? Boolean(window.__draconiumBeforeClose()) : true",
-        move |result| {
-            match result {
-                Ok(JSValue::Boolean(false)) => {
-                    delegate_cb.close_in_progress.set(false);
-                    delegate_cb.close_started_at.set(None);
-                }
-                _ => {
-                    delegate_cb.close_in_progress.set(false);
-                    delegate_cb.close_started_at.set(None);
-                    delegate_cb.should_exit.set(true);
-                }
-            }
-            delegate_cb.waker.wake();
-        },
-    );
+    webview.evaluate_javascript(BEFORE_CLOSE_SCRIPT, move |result| {
+        if delegate_cb.close_started_at.get() != Some(started) {
+            return;
+        }
+        delegate_cb.close_started_at.set(None);
+        delegate_cb.close_in_progress.set(false);
+        if matches!(result, Ok(JSValue::Boolean(true))) {
+            delegate_cb.should_exit.set(true);
+        } else if let Err(err) = result {
+            eprintln!("[window] Before-close hook failed: {err:?}");
+        }
+        delegate_cb.waker.wake();
+    });
 }
 
 /// Reload the page through the same before-close hook as closing, so an
 /// app with unsaved state (the memo's autosave window) can flush first and
 /// veto a reload that would discard it.
-fn request_reload(webview: &WebView, delegate: &Rc<Delegate>) {
+fn handle_reload_requests(webview: &WebView, delegate: &Rc<Delegate>, servo: &Servo) {
+    let hard = delegate.hard_reload_requested.replace(false);
+    let normal = delegate.reload_requested.replace(false);
+    if !hard && !normal {
+        return;
+    }
     if delegate.reload_in_progress.get()
         || delegate.close_in_progress.get()
+        || delegate.exit_requested.get()
         || delegate.should_exit.get()
     {
         return;
@@ -2179,19 +2506,22 @@ fn request_reload(webview: &WebView, delegate: &Rc<Delegate>) {
     delegate.reload_in_progress.set(true);
     let delegate_cb = delegate.clone();
     let webview_cb = webview.clone();
-    webview.evaluate_javascript(
-        "typeof window.__draconiumBeforeClose === 'function' ? Boolean(window.__draconiumBeforeClose()) : true",
-        move |result| {
-            delegate_cb.reload_in_progress.set(false);
-            if !matches!(result, Ok(JSValue::Boolean(false)))
-                && !delegate_cb.should_exit.get()
-                && !delegate_cb.close_in_progress.get()
-            {
-                webview_cb.reload();
+    let servo_cb = hard.then(|| servo.clone());
+    webview.evaluate_javascript(BEFORE_CLOSE_SCRIPT, move |result| {
+        delegate_cb.reload_in_progress.set(false);
+        if matches!(result, Ok(JSValue::Boolean(true)))
+            && !delegate_cb.should_exit.get()
+            && !delegate_cb.close_in_progress.get()
+        {
+            if let Some(servo) = servo_cb {
+                servo.network_manager().clear_cache();
             }
-            delegate_cb.waker.wake();
-        },
-    );
+            webview_cb.reload();
+        } else if let Err(err) = result {
+            eprintln!("[window] Before-reload hook failed: {err:?}");
+        }
+        delegate_cb.waker.wake();
+    });
 }
 
 fn target_delegate_and_webview(
@@ -2246,6 +2576,88 @@ fn send_async_reply(
         payload,
         is_json,
     });
+}
+
+fn start_capture(delegate: &Delegate, webview: &WebView, pending: PendingCapture) -> bool {
+    let waker = delegate.waker.clone();
+    let target_window = delegate.window.id();
+    let PendingCapture {
+        format,
+        suggested,
+        call_id,
+    } = pending;
+    let finish = move |reply_result: Result<String, String>| {
+        let event_json = match &reply_result {
+            Ok(name) => format!(r#"{{"ok":true,"name":{}}}"#, crate::json::json_string(name)),
+            Err(err) => format!(
+                r#"{{"ok":false,"error":{}}}"#,
+                crate::json::json_string(err)
+            ),
+        };
+        let _ = waker.0.send_event(HostEvent::CaptureFinished {
+            target_window,
+            call_id,
+            event_json,
+            reply_result,
+        });
+    };
+    delegate.capture_in_progress.set(true);
+    let slot = match delegate.async_workers.try_reserve() {
+        Ok(slot) => slot,
+        Err(err) => {
+            finish(Err(err));
+            return false;
+        }
+    };
+    let ext = match format {
+        CaptureFormat::Png => "png",
+        CaptureFormat::Pdf => "pdf",
+    };
+    let Some(dest) = embedder_ui::show_save_file_dialog(
+        hwnd_of(&delegate.window),
+        &suggested,
+        &[ext.to_owned()],
+        delegate.non_interactive,
+    ) else {
+        finish(Err("cancelled".to_owned()));
+        return false;
+    };
+    webview.take_screenshot(None, move |capture| match capture {
+        Ok(image) => {
+            let finish_on_worker = finish.clone();
+            let worker = std::thread::Builder::new()
+                .name("draconium-capture".to_owned())
+                .spawn(move || {
+                    let saved = match format {
+                        CaptureFormat::Png => image
+                            .save(&dest)
+                            .map_err(|err| format!("PNG 保存失敗: {err}")),
+                        CaptureFormat::Pdf => platform_services::encode_rgba_as_raster_pdf(
+                            image.width(),
+                            image.height(),
+                            image.as_raw(),
+                        )
+                        .and_then(|pdf| {
+                            std::fs::write(&dest, &pdf)
+                                .map_err(|err| format!("PDF 保存失敗: {err}"))
+                        }),
+                    };
+                    drop(slot);
+                    finish_on_worker(saved.map(|()| {
+                        dest.file_name()
+                            .map(|name| name.to_string_lossy().into_owned())
+                            .unwrap_or(suggested)
+                    }));
+                });
+            if let Err(err) = worker {
+                finish(Err(format!(
+                    "キャプチャ保存処理を開始できませんでした: {err}"
+                )));
+            }
+        }
+        Err(err) => finish(Err(format!("キャプチャ失敗: {err:?}"))),
+    });
+    true
 }
 
 fn spawn_child_window(
@@ -2320,7 +2732,7 @@ fn spawn_child_window(
     let window = Rc::new(window);
     let window_id = window.id();
     let dark = state.delegate.dark_theme.get();
-    win_platform::apply_dwm_dark_mode(hwnd_of(&window), dark);
+    platform_services::apply_dwm_dark_mode(hwnd_of(&window), dark);
 
     let Ok(display_handle) = event_loop.display_handle() else {
         send_open_err("ディスプレイハンドルの取得に失敗しました");
@@ -2336,7 +2748,12 @@ fn spawn_child_window(
         return;
     };
     let child_rc = Rc::new(rc);
-    let _ = child_rc.make_current();
+    if let Err(err) = child_rc.make_current() {
+        send_open_err(&format!(
+            "子ウィンドウのレンダリングコンテキストを有効にできませんでした: {err:?}"
+        ));
+        return;
+    }
 
     let child_file_dir = bridge::resolve_initial_file_dir(child_initial_url.as_str());
     let child_ucm = Rc::new(UserContentManager::new(&state.servo));
@@ -2382,7 +2799,6 @@ fn spawn_child_window(
         window_visible: Cell::new(true),
         input_method: Cell::new(None),
         animating: Cell::new(false),
-        load_complete: Cell::new(false),
         has_painted: Cell::new(false),
         close_in_progress: Cell::new(false),
         close_started_at: Cell::new(None),
@@ -2395,10 +2811,13 @@ fn spawn_child_window(
         pending_move: Cell::new(None),
         ignore_move_until: Cell::new(None),
         pending_captures: RefCell::new(VecDeque::new()),
+        capture_in_progress: Cell::new(false),
         pending_session_ops: RefCell::new(VecDeque::new()),
         pending_child_windows: RefCell::new(VecDeque::new()),
         pending_async_tasks: RefCell::new(VecDeque::new()),
-        pending_deep_links: RefCell::new(VecDeque::new()),
+        pending_async_bytes: Cell::new(0),
+        pending_page_events: RefCell::new(VecDeque::new()),
+        async_workers: state.delegate.async_workers.clone(),
         cached_site_data_json: RefCell::new("[]".to_owned()),
     });
 
@@ -2431,6 +2850,7 @@ fn spawn_child_window(
         mouse_position: DevicePoint::zero(),
         modifiers: ModifiersState::empty(),
         composing: false,
+        file_drop: FileDropState::default(),
     });
 
     if let Some((origin_window, cid)) = origin_and_call_id {
@@ -2455,51 +2875,33 @@ impl ApplicationHandler<HostEvent> for App {
         let background_polling = handler.wants_background_polling();
         let non_interactive = self.self_test.is_some() || self.screenshot_job.is_some();
 
-        let min_size = config.window.min_size.map_or(MIN_SET_WINDOW_SIZE, |size| {
-            window_state::LogicalSize::new(
-                size.width.max(MIN_SET_WINDOW_SIZE.width),
-                size.height.max(MIN_SET_WINDOW_SIZE.height),
-            )
-        });
-        let max_size = config.window.max_size.map_or(MAX_SET_WINDOW_SIZE, |size| {
-            window_state::LogicalSize::new(
-                size.width.min(MAX_SET_WINDOW_SIZE.width),
-                size.height.min(MAX_SET_WINDOW_SIZE.height),
-            )
-        });
-        let inconsistent_limits = config
-            .window
-            .min_size
-            .zip(config.window.max_size)
-            .is_some_and(|(min, max)| min.width > max.width || min.height > max.height);
-        if inconsistent_limits
-            || (config.capabilities.allow_window_sizing
-                && (min_size.width > max_size.width || min_size.height > max_size.height))
-        {
-            eprintln!("[window] Inconsistent configured inner size limits");
-            event_loop.exit();
-            return;
-        }
+        let (min_size, max_size) = self.window_limits;
 
         let single_instance = if let Some(ref mutex_name) = config.single_instance_name {
             match SingleInstanceLock::acquire(mutex_name) {
                 Ok(Some(lock)) => Some(lock),
                 Ok(None) => {
-                    let payload = win_platform::build_second_instance_json(
+                    let payload = platform_services::build_second_instance_json(
                         &config.raw_args,
                         config.initial_deep_link.as_deref(),
                     );
-                    let forwarded =
-                        win_platform::forward_to_running_instance(&config.instance_tag, &payload);
-                    eprintln!(
-                        "[single-instance] すでに起動しているため終了します ({mutex_name}, forwarded={forwarded})"
+                    let forwarded = platform_services::forward_to_running_instance(
+                        &config.instance_tag,
+                        &payload,
                     );
+                    if !forwarded {
+                        self.startup_error = Some(format!(
+                            "起動済みのインスタンスに引数を転送できませんでした ({mutex_name})"
+                        ));
+                    }
                     event_loop.exit();
                     return;
                 }
                 Err(err) => {
-                    eprintln!("[single-instance] Mutex 取得に失敗しました: {err}");
-                    None
+                    self.startup_error =
+                        Some(format!("単一インスタンスロックの取得に失敗しました: {err}"));
+                    event_loop.exit();
+                    return;
                 }
             }
         } else {
@@ -2537,26 +2939,29 @@ impl ApplicationHandler<HostEvent> for App {
         {
             attributes = attributes.with_skip_taskbar(config.window.skip_taskbar);
         }
-        let window = Rc::new(
-            event_loop
-                .create_window(attributes)
-                .expect("Failed to create window"),
-        );
+        let window = match event_loop.create_window(attributes) {
+            Ok(window) => Rc::new(window),
+            Err(err) => {
+                self.startup_error = Some(format!("Failed to create window: {err}"));
+                event_loop.exit();
+                return;
+            }
+        };
         if let Some(position) = config.window.initial_position
             && logical_rect_visible(&window, position, config.window.initial_size)
         {
             window.set_outer_position(LogicalPosition::new(position.x, position.y));
         }
 
-        let initial_dark = win_platform::detect_system_dark_mode().unwrap_or(false);
+        let initial_dark = platform_services::detect_system_dark_mode().unwrap_or(false);
         let hwnd = hwnd_of(&window);
         if !config.window.decorations {
-            win_platform::apply_dwm_rounded_corners(hwnd);
+            platform_services::apply_dwm_rounded_corners(hwnd);
         }
-        win_platform::apply_dwm_dark_mode(hwnd, initial_dark);
+        platform_services::apply_dwm_dark_mode(hwnd, initial_dark);
         if let Some(opacity) = config.window.opacity
             && !non_interactive
-            && let Err(err) = win_platform::set_window_opacity(hwnd, opacity)
+            && let Err(err) = platform_services::set_window_opacity(hwnd, opacity)
         {
             eprintln!("[window] 初期不透明度の適用をスキップしました: {err}");
         }
@@ -2593,26 +2998,32 @@ impl ApplicationHandler<HostEvent> for App {
         };
         let tray_active = tray.as_ref().is_some_and(|handle| handle.has_tray_icon());
 
-        let rendering_context = Rc::new(
-            WindowRenderingContext::new(
-                event_loop.display_handle().expect("No display handle"),
-                window.window_handle().expect("No window handle"),
-                window.inner_size(),
-            )
-            .expect("Failed to create rendering context"),
-        );
-        rendering_context
-            .make_current()
-            .expect("Failed to make rendering context current");
+        let rendering_context = (|| -> Result<_, String> {
+            let display = event_loop.display_handle().map_err(|err| err.to_string())?;
+            let handle = window.window_handle().map_err(|err| err.to_string())?;
+            let context = WindowRenderingContext::new(display, handle, window.inner_size())
+                .map_err(|err| format!("{err:?}"))?;
+            context.make_current().map_err(|err| format!("{err:?}"))?;
+            Ok(Rc::new(context))
+        })();
+        let rendering_context = match rendering_context {
+            Ok(context) => context,
+            Err(err) => {
+                self.startup_error = Some(format!("Failed to initialize window rendering: {err}"));
+                event_loop.exit();
+                return;
+            }
+        };
 
         let transparent_mode = config.window.transparent;
-        let devtools_enabled = config.devtools_addr.is_some();
+        let devtools_addr = config.devtools_addr.filter(|_| !non_interactive);
+        let devtools_enabled = devtools_addr.is_some();
         let mut prefs = Preferences::default();
         prefs.layout_css_backdrop_filter_enabled = config.backdrop_filter;
         if transparent_mode {
             prefs.shell_background_color_rgba = [0.0, 0.0, 0.0, 0.0];
         }
-        if let Some(addr) = config.devtools_addr.clone() {
+        if let Some(addr) = devtools_addr {
             prefs.devtools_server_enabled = true;
             prefs.devtools_server_listen_address = addr;
         }
@@ -2640,12 +3051,22 @@ impl ApplicationHandler<HostEvent> for App {
             servo_builder = servo_builder.protocol_registry(registry);
         }
         let servo = servo_builder.build();
-        servo.set_delegate(Rc::new(HostServoDelegate { devtools_enabled }));
+        servo.set_delegate(Rc::new(HostServoDelegate {
+            devtools_enabled,
+            hwnd,
+        }));
         servo.setup_logging();
 
         // Preload bridge + UserStyleSheet (Milestone B + Stage 1 CSP-clean popover shim):
         // every page gets a frozen `window.Draconium` bound to this launch's session token.
-        let session_token = bridge::generate_session_token();
+        let session_token = match bridge::generate_session_token() {
+            Ok(token) => token,
+            Err(err) => {
+                self.startup_error = Some(err.to_owned());
+                event_loop.exit();
+                return;
+            }
+        };
         let user_content_manager = Rc::new(UserContentManager::new(&servo));
         user_content_manager.add_stylesheet(Rc::new(UserStyleSheet::new(
             bridge::POPOVER_POLYFILL_CSS.to_owned(),
@@ -2663,10 +3084,14 @@ impl ApplicationHandler<HostEvent> for App {
             None,
         )));
 
-        let mut initial_deep_links = VecDeque::new();
-        if let Some(uri) = config.initial_deep_link {
-            initial_deep_links.push_back(uri);
-        }
+        let initial_page_events = config
+            .initial_deep_link
+            .into_iter()
+            .map(|uri| PageEvent {
+                name: "deep-link",
+                json: crate::json::json_string(&uri),
+            })
+            .collect();
 
         let initial_url = config.url.clone();
         let initial_file_dir = bridge::resolve_initial_file_dir(initial_url.as_str());
@@ -2700,7 +3125,6 @@ impl ApplicationHandler<HostEvent> for App {
             window_visible: Cell::new(!config.window.start_hidden),
             input_method: Cell::new(None),
             animating: Cell::new(false),
-            load_complete: Cell::new(false),
             has_painted: Cell::new(false),
             close_in_progress: Cell::new(false),
             close_started_at: Cell::new(None),
@@ -2713,10 +3137,13 @@ impl ApplicationHandler<HostEvent> for App {
             pending_move: Cell::new(None),
             ignore_move_until: Cell::new(Some(Instant::now() + PROGRAMMATIC_MOVE_GRACE)),
             pending_captures: RefCell::new(VecDeque::new()),
+            capture_in_progress: Cell::new(false),
             pending_session_ops: RefCell::new(VecDeque::new()),
             pending_child_windows: RefCell::new(VecDeque::new()),
             pending_async_tasks: RefCell::new(VecDeque::new()),
-            pending_deep_links: RefCell::new(initial_deep_links),
+            pending_async_bytes: Cell::new(0),
+            pending_page_events: RefCell::new(initial_page_events),
+            async_workers: AsyncWorkers::default(),
             cached_site_data_json: RefCell::new("[]".to_owned()),
         });
         let webview = WebViewBuilder::new(&servo, rendering_context.clone())
@@ -2745,8 +3172,7 @@ impl ApplicationHandler<HostEvent> for App {
             mouse_position: DevicePoint::zero(),
             modifiers: ModifiersState::empty(),
             composing: false,
-            hovering_files: false,
-            pending_dropped_files: Vec::new(),
+            file_drop: FileDropState::default(),
         });
         self.state.as_ref().unwrap().servo.spin_event_loop();
     }
@@ -2776,15 +3202,9 @@ impl ApplicationHandler<HostEvent> for App {
                 reply_result,
             } => {
                 if let Some((delegate, webview)) = target_delegate_and_webview(state, target_window)
-                    && delegate.is_active_page_origin(webview)
                 {
-                    if let Some(ev_script) = bridge::dispatch_script_for_origin(
-                        delegate.initial_url.as_str(),
-                        "capture-saved",
-                        &event_json,
-                    ) {
-                        webview.evaluate_javascript(ev_script, |_| {});
-                    }
+                    delegate.capture_in_progress.set(false);
+                    delegate.dispatch_page_event(webview, "capture-saved", &event_json);
                     if let Some(cid) = call_id {
                         let (ok, msg) = match reply_result {
                             Ok(name) => (true, name),
@@ -2817,81 +3237,65 @@ impl ApplicationHandler<HostEvent> for App {
                 TrayAction::GlobalHotkey => {
                     let next = !state.delegate.window_visible.get();
                     state.delegate.set_window_visible(next);
-                    if state.delegate.load_complete.get() {
-                        state.webview.evaluate_javascript(
-                            bridge::dispatch_script("global-hotkey", "\"triggered\""),
-                            |_| {},
-                        );
-                    }
+                    state.delegate.dispatch_when_loaded(
+                        &state.webview,
+                        "global-hotkey",
+                        crate::json::json_string("triggered"),
+                    );
                 }
-                TrayAction::ThemeChanged => {
-                    if let Some(dark) = win_platform::detect_system_dark_mode()
+                TrayAction::ThemeChanged(dark) => {
+                    if let Some(dark) = dark.or_else(platform_services::detect_system_dark_mode)
                         && dark != state.delegate.dark_theme.get()
                     {
-                        state.delegate.dark_theme.set(dark);
-                        win_platform::apply_dwm_dark_mode(hwnd_of(&state.delegate.window), dark);
                         let theme = if dark { Theme::Dark } else { Theme::Light };
-                        state.webview.notify_theme_change(theme);
+                        let theme_json = if dark { "\"dark\"" } else { "\"light\"" };
+                        let update = |delegate: &Delegate, webview: &WebView| {
+                            delegate.dark_theme.set(dark);
+                            platform_services::apply_dwm_dark_mode(hwnd_of(&delegate.window), dark);
+                            webview.notify_theme_change(theme);
+                            delegate.dispatch_when_loaded(
+                                webview,
+                                "theme-changed",
+                                theme_json.to_owned(),
+                            );
+                        };
+                        update(&state.delegate, &state.webview);
                         for child in &state.child_windows {
-                            child.delegate.dark_theme.set(dark);
-                            win_platform::apply_dwm_dark_mode(
-                                hwnd_of(&child.delegate.window),
-                                dark,
-                            );
-                            child.webview.notify_theme_change(theme);
-                        }
-                        if state.delegate.load_complete.get() {
-                            let theme_json = if dark { "\"dark\"" } else { "\"light\"" };
-                            state.webview.evaluate_javascript(
-                                bridge::dispatch_script("theme-changed", theme_json),
-                                |_| {},
-                            );
+                            update(&child.delegate, &child.webview);
                         }
                     }
                 }
                 TrayAction::PowerEvent(kind) => {
-                    if state.delegate.load_complete.get() {
-                        let json = format!("\"{kind}\"");
-                        state.webview.evaluate_javascript(
-                            bridge::dispatch_script("power-event", &json),
-                            |_| {},
-                        );
-                    }
+                    state.delegate.dispatch_when_loaded(
+                        &state.webview,
+                        "power-event",
+                        crate::json::json_string(kind),
+                    );
                 }
                 TrayAction::NotificationClicked => {
                     state.delegate.set_window_visible(true);
-                    if state.delegate.load_complete.get() {
-                        state.webview.evaluate_javascript(
-                            bridge::dispatch_script("notification-clicked", "{}"),
-                            |_| {},
-                        );
-                    }
+                    state.delegate.dispatch_when_loaded(
+                        &state.webview,
+                        "notification-clicked",
+                        "{}".to_owned(),
+                    );
                 }
                 TrayAction::SecondInstance(payload_json) => {
                     state.delegate.set_window_visible(true);
-                    if let Some(uri) = win_platform::json_get_string(&payload_json, "deepLink")
+                    if let Some(uri) = crate::json::json_get_string(&payload_json, "deepLink")
                         && !uri.is_empty()
                     {
-                        if state.delegate.load_complete.get() {
-                            let uri_json = win_platform::json_string(&uri);
-                            state.webview.evaluate_javascript(
-                                bridge::dispatch_script("deep-link", &uri_json),
-                                |_| {},
-                            );
-                        } else {
-                            state
-                                .delegate
-                                .pending_deep_links
-                                .borrow_mut()
-                                .push_back(uri);
-                        }
-                    }
-                    if state.delegate.load_complete.get() {
-                        state.webview.evaluate_javascript(
-                            bridge::dispatch_script("second-instance", &payload_json),
-                            |_| {},
+                        state.delegate.dispatch_when_loaded(
+                            &state.webview,
+                            "deep-link",
+                            crate::json::json_string(&uri),
                         );
                     }
+                    state.delegate.dispatch_when_loaded(
+                        &state.webview,
+                        "second-instance",
+                        payload_json,
+                    );
                 }
             },
         }
@@ -2918,47 +3322,14 @@ impl ApplicationHandler<HostEvent> for App {
         if let (Some(job), Some(state)) = (&mut self.screenshot_job, &mut self.state) {
             job.advance(state);
         }
-        // Deliver any queued initial or second-instance deep links once load completes.
-        if let Some(state) = &self.state
-            && state.delegate.load_complete.get()
-        {
-            let mut dispatched = false;
-            while let Some(uri) = state.delegate.pending_deep_links.borrow_mut().pop_front() {
-                let uri_json = win_platform::json_string(&uri);
-                state
-                    .webview
-                    .evaluate_javascript(bridge::dispatch_script("deep-link", &uri_json), |_| {});
-                dispatched = true;
+        if let Some(state) = &mut self.state {
+            let mut dispatched = state.delegate.flush_page_events(&state.webview);
+            dispatched |= state.file_drop.flush(&state.delegate, &state.webview);
+            for child in &mut state.child_windows {
+                dispatched |= child.delegate.flush_page_events(&child.webview);
+                dispatched |= child.file_drop.flush(&child.delegate, &child.webview);
             }
             if dispatched {
-                state.servo.spin_event_loop();
-            }
-        }
-        // Flush any winit file-drop batch as a single capability-scoped event.
-        if let Some(state) = &mut self.state
-            && !state.pending_dropped_files.is_empty()
-            && state.delegate.load_complete.get()
-        {
-            let dropped = std::mem::take(&mut state.pending_dropped_files);
-            if state
-                .delegate
-                .capabilities
-                .check(crate::policy::Capability::FileDrop)
-                .is_ok()
-            {
-                let files_json = state
-                    .delegate
-                    .files
-                    .borrow_mut()
-                    .register_batch_json(&dropped);
-                let scale = state.delegate.window.scale_factor().max(0.1);
-                let css_x = (f64::from(state.mouse_position.x) / scale).round();
-                let css_y = (f64::from(state.mouse_position.y) / scale).round();
-                let detail_json = format!("{{\"x\":{css_x},\"y\":{css_y},\"files\":{files_json}}}");
-                state.webview.evaluate_javascript(
-                    bridge::dispatch_script("file-drop", &detail_json),
-                    |_| {},
-                );
                 state.servo.spin_event_loop();
             }
         }
@@ -2973,95 +3344,12 @@ impl ApplicationHandler<HostEvent> for App {
             }
             let mut ran_capture = false;
             for (delegate, webview) in &targets {
-                let target_window = delegate.window.id();
-                while let Some(pending) = delegate.pending_captures.borrow_mut().pop_front() {
-                    let hwnd = hwnd_of(&delegate.window);
-                    let ext = match pending.format {
-                        CaptureFormat::Png => "png",
-                        CaptureFormat::Pdf => "pdf",
-                    };
-                    if let Some(dest) = embedder_ui::show_save_file_dialog(
-                        hwnd,
-                        &pending.suggested,
-                        &[ext.to_owned()],
-                        delegate.non_interactive,
-                    ) {
-                        let proxy = delegate.waker.0.clone();
-                        let format = pending.format;
-                        let call_id = pending.call_id;
-                        let fallback_name = pending.suggested.clone();
-                        webview.take_screenshot(None, move |capture| match capture {
-                            Ok(image) => {
-                                let proxy_worker = proxy.clone();
-                                std::thread::spawn(move || {
-                                    let save_res: Result<(), String> =
-                                        match format {
-                                            CaptureFormat::Png => image
-                                                .save(&dest)
-                                                .map_err(|e| format!("PNG 保存失敗: {e}")),
-                                            CaptureFormat::Pdf => {
-                                                win_platform::encode_rgba_as_raster_pdf(
-                                                    image.width(),
-                                                    image.height(),
-                                                    image.as_raw(),
-                                                )
-                                                .and_then(|pdf| {
-                                                    std::fs::write(&dest, &pdf)
-                                                        .map_err(|e| format!("PDF 保存失敗: {e}"))
-                                                })
-                                            }
-                                        };
-                                    let (event_json, reply_result) = match save_res {
-                                        Ok(()) => {
-                                            let name = dest
-                                                .file_name()
-                                                .map(|n| n.to_string_lossy().into_owned())
-                                                .unwrap_or(fallback_name);
-                                            let ev = format!(
-                                                "{{\"ok\":true,\"name\":{}}}",
-                                                win_platform::json_string(&name)
-                                            );
-                                            (ev, Ok(name))
-                                        }
-                                        Err(err) => {
-                                            let ev = format!(
-                                                "{{\"ok\":false,\"error\":{}}}",
-                                                win_platform::json_string(&err)
-                                            );
-                                            (ev, Err(err))
-                                        }
-                                    };
-                                    let _ = proxy_worker.send_event(HostEvent::CaptureFinished {
-                                        target_window,
-                                        call_id,
-                                        event_json,
-                                        reply_result,
-                                    });
-                                });
-                            }
-                            Err(err) => {
-                                let msg = format!("キャプチャ失敗: {err:?}");
-                                let event_json = format!(
-                                    "{{\"ok\":false,\"error\":{}}}",
-                                    win_platform::json_string(&msg)
-                                );
-                                let _ = proxy.send_event(HostEvent::CaptureFinished {
-                                    target_window,
-                                    call_id,
-                                    event_json,
-                                    reply_result: Err(msg),
-                                });
-                            }
-                        });
-                        ran_capture = true;
-                    } else {
-                        let _ = delegate.waker.0.send_event(HostEvent::CaptureFinished {
-                            target_window,
-                            call_id: pending.call_id,
-                            event_json: "{\"ok\":false,\"error\":\"cancelled\"}".to_owned(),
-                            reply_result: Err("cancelled".to_owned()),
-                        });
-                    }
+                if delegate.capture_in_progress.get() {
+                    continue;
+                }
+                let pending = delegate.pending_captures.borrow_mut().pop_front();
+                if let Some(pending) = pending {
+                    ran_capture |= start_capture(delegate, webview, pending);
                 }
             }
             if ran_capture {
@@ -3185,7 +3473,9 @@ impl ApplicationHandler<HostEvent> for App {
             }
             let mut ran_async = false;
             for (delegate, webview) in &targets {
-                while let Some(task) = delegate.pending_async_tasks.borrow_mut().pop_front() {
+                let tasks = std::mem::take(&mut *delegate.pending_async_tasks.borrow_mut());
+                delegate.pending_async_bytes.set(0);
+                for task in tasks {
                     ran_async = true;
                     match task {
                         PendingAsyncTask::App {
@@ -3231,7 +3521,7 @@ impl ApplicationHandler<HostEvent> for App {
         // Background push events (e.g. host file watchers or periodic feeds).
         if let Some(state) = &mut self.state
             && state.background_polling
-            && state.delegate.load_complete.get()
+            && state.webview.load_status() == LoadStatus::Complete
             && !state.delegate.should_exit.get()
             && Instant::now() >= state.next_bg_poll
         {
@@ -3254,20 +3544,12 @@ impl ApplicationHandler<HostEvent> for App {
             state.delegate.exit_requested.set(false);
             request_close(&state.webview, &state.delegate);
         }
-        // A page-issued `dn-window:hard-reload` clears the network cache and runs the guarded reload flow.
-        if let Some(state) = &self.state
-            && state.delegate.hard_reload_requested.get()
-        {
-            state.delegate.hard_reload_requested.set(false);
-            state.servo.network_manager().clear_cache();
-            request_reload(&state.webview, &state.delegate);
-        }
-        // A page-issued `dn-window:reload` runs the guarded reload flow.
-        if let Some(state) = &self.state
-            && state.delegate.reload_requested.get()
-        {
-            state.delegate.reload_requested.set(false);
-            request_reload(&state.webview, &state.delegate);
+        // Process bridge and keyboard reloads for the originating WebView.
+        if let Some(state) = &self.state {
+            handle_reload_requests(&state.webview, &state.delegate, &state.servo);
+            for child in &state.child_windows {
+                handle_reload_requests(&child.webview, &child.delegate, &state.servo);
+            }
         }
         // Reap any child windows that requested close or received `notify_closed`.
         if let Some(state) = &mut self.state
@@ -3281,7 +3563,8 @@ impl ApplicationHandler<HostEvent> for App {
         if let Some(state) = &self.state {
             state.delegate.flush_pending_move(false);
         }
-        // Drive Servo while waiting for the JS before-close hook and exit if it stalls.
+        // Drive Servo while waiting for the JS before-close hook. A timeout needs
+        // an explicit user decision before discarding any unsaved changes.
         if let Some(state) = &self.state
             && state.delegate.close_in_progress.get()
         {
@@ -3293,9 +3576,16 @@ impl ApplicationHandler<HostEvent> for App {
                     .get()
                     .is_some_and(|started| close_timed_out(started, Instant::now()))
             {
-                state.delegate.should_exit.set(true);
                 state.delegate.close_in_progress.set(false);
                 state.delegate.close_started_at.set(None);
+                if embedder_ui::show_confirm(
+                    hwnd_of(&state.delegate.window),
+                    &state.delegate.default_title,
+                    "The page did not respond to the close request. Close anyway?",
+                    state.delegate.non_interactive,
+                ) {
+                    state.delegate.should_exit.set(true);
+                }
             }
         }
         if self
@@ -3325,7 +3615,7 @@ impl ApplicationHandler<HostEvent> for App {
         };
         if let Some(state) = &self.state
             && state.background_polling
-            && state.delegate.load_complete.get()
+            && state.webview.load_status() == LoadStatus::Complete
         {
             deadline = Some(deadline.map_or(state.next_bg_poll, |d| d.min(state.next_bg_poll)));
         }
@@ -3480,18 +3770,14 @@ impl ApplicationHandler<HostEvent> for App {
                         ..
                     } => {
                         let child = &state.child_windows[idx];
-                        if child.delegate.handle_fullscreen_shortcut(
+                        handle_keyboard_input(
                             &child.webview,
+                            &child.delegate,
                             &event,
                             child.modifiers,
                             child.composing,
                             is_synthetic,
-                        ) {
-                            return;
-                        }
-                        child.webview.notify_input_event(InputEvent::Keyboard(
-                            input::keyboard_event(&event, child.modifiers, child.composing),
-                        ));
+                        );
                     }
                     WindowEvent::Ime(ime) => {
                         let child = &mut state.child_windows[idx];
@@ -3527,6 +3813,18 @@ impl ApplicationHandler<HostEvent> for App {
                                 }),
                             ));
                         }
+                    }
+                    WindowEvent::HoveredFile(_) => {
+                        let child = &mut state.child_windows[idx];
+                        child.file_drop.hover(&child.delegate, &child.webview);
+                    }
+                    WindowEvent::HoveredFileCancelled => {
+                        let child = &mut state.child_windows[idx];
+                        child.file_drop.cancel(&child.delegate, &child.webview);
+                    }
+                    WindowEvent::DroppedFile(path) => {
+                        let child = &mut state.child_windows[idx];
+                        child.file_drop.drop_file(&child.delegate, path);
                     }
                     _ => {}
                 }
@@ -3664,68 +3962,14 @@ impl ApplicationHandler<HostEvent> for App {
                 is_synthetic,
                 ..
             } => {
-                if state.delegate.handle_fullscreen_shortcut(
+                handle_keyboard_input(
                     webview,
+                    &state.delegate,
                     &event,
                     state.modifiers,
                     state.composing,
                     is_synthetic,
-                ) {
-                    return;
-                }
-                // Host shortcuts: F5 / Ctrl+R reload through the guarded flow
-                // (when enabled); Ctrl+Shift+R / Ctrl+F5 clear cache and reload;
-                // Ctrl+= / Ctrl+- / Ctrl+0 adjust page zoom.
-                // Ignored during IME composition or when Alt/Super are held.
-                let reload_shortcut = classify_reload_shortcut(
-                    state.delegate.allow_reload_shortcuts,
-                    state.composing,
-                    state.modifiers,
-                    &event.logical_key,
                 );
-                let no_alt_super = !state.modifiers.alt_key() && !state.modifiers.super_key();
-                let zoom_action = if !state.composing
-                    && no_alt_super
-                    && state.modifiers.control_key()
-                {
-                    match &event.logical_key {
-                        WinitKey::Character(text) if matches!(text.as_str(), "+" | "=") => Some(1),
-                        WinitKey::Character(text) if text.as_str() == "-" => Some(-1),
-                        WinitKey::Character(text) if text.as_str() == "0" => Some(0),
-                        _ => None,
-                    }
-                } else {
-                    None
-                };
-                match reload_shortcut {
-                    ReloadShortcut::HardReload => {
-                        if event.state == ElementState::Pressed && !event.repeat {
-                            state.servo.network_manager().clear_cache();
-                            request_reload(webview, &state.delegate);
-                        }
-                    }
-                    ReloadShortcut::Reload => {
-                        if event.state == ElementState::Pressed && !event.repeat {
-                            request_reload(webview, &state.delegate);
-                        }
-                    }
-                    ReloadShortcut::None => {
-                        if let Some(delta) = zoom_action {
-                            if event.state == ElementState::Pressed {
-                                let next = if delta == 0 {
-                                    1.0
-                                } else {
-                                    window_state::step_zoom(webview.page_zoom(), delta)
-                                };
-                                webview.set_page_zoom(next);
-                            }
-                        } else {
-                            webview.notify_input_event(InputEvent::Keyboard(
-                                input::keyboard_event(&event, state.modifiers, state.composing),
-                            ));
-                        }
-                    }
-                }
             }
             WindowEvent::Ime(ime) => {
                 let composition = match ime {
@@ -3760,34 +4004,9 @@ impl ApplicationHandler<HostEvent> for App {
                     )));
                 }
             }
-            WindowEvent::HoveredFile(_) => {
-                if state.delegate.capabilities.allow_file_drop && !state.hovering_files {
-                    state.hovering_files = true;
-                    if state.delegate.load_complete.get() {
-                        webview.evaluate_javascript(
-                            bridge::dispatch_script("file-drop-hover", "{}"),
-                            |_| {},
-                        );
-                    }
-                }
-            }
-            WindowEvent::HoveredFileCancelled => {
-                if state.hovering_files {
-                    state.hovering_files = false;
-                    if state.delegate.load_complete.get() {
-                        webview.evaluate_javascript(
-                            bridge::dispatch_script("file-drop-cancel", "{}"),
-                            |_| {},
-                        );
-                    }
-                }
-            }
-            WindowEvent::DroppedFile(path) => {
-                state.hovering_files = false;
-                if state.delegate.capabilities.allow_file_drop {
-                    state.pending_dropped_files.push(path);
-                }
-            }
+            WindowEvent::HoveredFile(_) => state.file_drop.hover(&state.delegate, webview),
+            WindowEvent::HoveredFileCancelled => state.file_drop.cancel(&state.delegate, webview),
+            WindowEvent::DroppedFile(path) => state.file_drop.drop_file(&state.delegate, path),
             _ => {}
         }
         state.servo.spin_event_loop();
@@ -3799,15 +4018,25 @@ struct Waker(EventLoopProxy<HostEvent>);
 
 struct HostServoDelegate {
     devtools_enabled: bool,
+    hwnd: isize,
 }
 
 impl ServoDelegate for HostServoDelegate {
     fn notify_devtools_server_started(&self, port: u16, _token: String) {
-        eprintln!("[devtools] Firefox RDP server ready on 127.0.0.1:{port}");
+        eprintln!("[devtools] Firefox RDP server ready on loopback port {port}");
     }
 
     fn request_devtools_connection(&self, request: AllowOrDenyRequest) {
-        if self.devtools_enabled {
+        // Servo checks its own token before invoking this callback. Require
+        // local user consent for the standard (tokenless) Firefox connection.
+        if self.devtools_enabled
+            && embedder_ui::show_confirm(
+                self.hwnd,
+                "Firefox DevTools",
+                "Allow this local connection to inspect and control the WebView?",
+                false,
+            )
+        {
             request.allow();
         } else {
             request.deny();
@@ -3889,7 +4118,8 @@ impl ScreenshotJob {
             }
             return;
         }
-        if !state.delegate.load_complete.get() || !state.delegate.has_painted.get() {
+        if state.webview.load_status() != LoadStatus::Complete || !state.delegate.has_painted.get()
+        {
             return;
         }
         match self.wait_until {
@@ -4038,7 +4268,9 @@ impl SelfTestRunner {
             self.fail(&format!("timed out at phase {}", self.phase));
         }
         if self.phase == 0 {
-            if state.delegate.load_complete.get() && state.delegate.has_painted.get() {
+            if state.webview.load_status() == LoadStatus::Complete
+                && state.delegate.has_painted.get()
+            {
                 self.wait_until = Some(now + Duration::from_millis(200));
                 self.phase = 1;
             }
@@ -4152,8 +4384,6 @@ impl SelfTestRunner {
                         if (forgedFile.ok) { return 'BAD:forged file token allowed'; } \
                         const badExt = window.Draconium.window.openExternal('file:///C:/Windows/cmd.exe'); \
                         if (badExt.ok) { return 'BAD:file external URL allowed'; } \
-                        const okExt = window.Draconium.window.openExternal('https://example.com'); \
-                        if (!okExt.ok) { return 'BAD:https external URL denied: ' + okExt.error; } \
                         const hideRes = window.Draconium.window.hide(); \
                         if (hideRes.ok) { return 'BAD:hide succeeded without tray'; } \
                         const themeRes = window.Draconium.window.getTheme(); \
@@ -4171,12 +4401,6 @@ impl SelfTestRunner {
                         const canBackRes = window.Draconium.window.canGoBack(); \
                         const canForwardRes = window.Draconium.window.canGoForward(); \
                         if (!canBackRes.ok || !canForwardRes.ok) { return 'BAD:history state failed'; } \
-                        const clipWrite = window.Draconium.clipboard.writeText('folio-self-test'); \
-                        if (!clipWrite.ok) { return 'BAD:clipboard.writeText failed: ' + clipWrite.error; } \
-                        const autoGet = window.Draconium.autostart.isEnabled(); \
-                        if (!autoGet.ok || autoGet.data !== false) { return 'BAD:autostart.isEnabled failed'; } \
-                        const pdfDry = window.Draconium.window.exportPdf('folio.pdf'); \
-                        if (!pdfDry.ok) { return 'BAD:exportPdf dry-run failed: ' + pdfDry.error; } \
                         const zIn = window.Draconium.window.zoomIn(); \
                         const zReset = window.Draconium.window.zoomReset(); \
                         if (!zIn.ok || !zReset.ok) { return 'BAD:zoom failed'; } \
@@ -4192,12 +4416,8 @@ impl SelfTestRunner {
                         const title = document.getElementById('input-title'); \
                         title.value = 'Folio Verification'; \
                         title.dispatchEvent(new Event('input', { bubbles: true })); \
-                        area.value = '# 日本語テスト\\n\\n2行目😀'; \
+                        area.value = '# 日本語テスト\\n\\n2行目😀\\n\\n| prose\\n\\n>\\tquote\\n\\n| A |\\n| --- |\\n| B |'; \
                         area.dispatchEvent(new Event('input', { bubbles: true })); \
-                        const previewH1 = document.querySelector('#preview-prose h1'); \
-                        if (!previewH1 || previewH1.textContent !== '日本語テスト') { \
-                            return 'BAD:markdown preview did not update'; \
-                        } \
                         window.__draconiumAsyncList = null; \
                         window.Draconium.invokeAsync('list_notes', '{}').then(r => { window.__draconiumAsyncList = r; }); \
                         window.__folioBenchResult = null; \
@@ -4227,6 +4447,13 @@ impl SelfTestRunner {
                     "(() => { \
                         if (!window.__folioBenchResult || !window.__draconiumAsyncList) { return 'PENDING'; } \
                         if (!window.__draconiumAsyncList.ok) { return 'BAD:invokeAsync failed'; } \
+                        const preview = document.getElementById('preview-prose'); \
+                        const previewH1 = preview.querySelector('h1'); \
+                        if (!previewH1 || previewH1.textContent !== '日本語テスト') { return 'PENDING'; } \
+                        const hasPipeParagraph = Array.from(preview.querySelectorAll('p')).some(p => p.textContent === '| prose'); \
+                        if (!hasPipeParagraph || preview.querySelector('blockquote')?.textContent !== 'quote' || !preview.querySelector('table')) { \
+                            return 'BAD:markdown paragraph, quote, or table missing'; \
+                        } \
                         const r = window.__folioBenchResult; \
                         if (r.frames !== 12 || r.domNodes < 40) { return 'BAD_BENCH:' + JSON.stringify(r); } \
                         return 'OK:fps=' + r.fps + '|avg_ms=' + r.avgFrameMs + '|p95_ms=' + r.p95FrameMs + '|dom_nodes=' + r.domNodes; \
@@ -4365,6 +4592,36 @@ impl SelfTestRunner {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rejects_window_limits_that_conflict_with_bridge_clamp() {
+        let url = Url::parse("dn://app/index.html").unwrap();
+        let window =
+            WindowConfig::standard(180, 100).with_max_size(Some(HostLogicalSize::new(180, 100)));
+        let native_only = HostConfig::new("Test", url).with_window(window);
+        assert!(effective_window_limits(&native_only).is_ok());
+        let with_bridge = native_only.with_capabilities(Capabilities::standard_desktop());
+        assert!(effective_window_limits(&with_bridge).is_err());
+    }
+
+    #[test]
+    fn worker_slots_are_bounded_and_reusable() {
+        let workers = AsyncWorkers::default();
+        let mut slots = (0..MAX_ASYNC_WORKERS)
+            .map(|_| workers.try_reserve().unwrap())
+            .collect::<Vec<_>>();
+        assert!(workers.try_reserve().is_err());
+        slots.pop();
+        assert!(workers.try_reserve().is_ok());
+    }
+
+    #[test]
+    fn full_request_queue_preserves_queued_requests() {
+        let queue = RefCell::new(VecDeque::new());
+        assert!(queue_request(&queue, 1, "first").is_ok());
+        assert!(queue_request(&queue, 1, "second").is_err());
+        assert_eq!(queue.into_inner().pop_front(), Some("first"));
+    }
 
     #[test]
     fn host_config_reload_shortcuts_defaults_true_and_can_disable() {

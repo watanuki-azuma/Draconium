@@ -24,7 +24,14 @@ class Verification:
         self.failures: list[str] = []
         self.passes = 0
 
-    def command(self, label: str, args: list[str], cwd: Path | None = None) -> bool:
+    def command(
+        self,
+        label: str,
+        args: list[str],
+        cwd: Path | None = None,
+        *,
+        require_tests: bool = False,
+    ) -> bool:
         print(f"[RUN] {label}")
         try:
             result = subprocess.run(
@@ -43,6 +50,10 @@ class Verification:
             return False
 
         if result.returncode == 0:
+            if require_tests and not re.search(
+                r"^test result: ok\. [1-9]\d* passed; 0 failed;", result.stdout, re.MULTILINE
+            ):
+                return self.check(label, ["no successful Rust tests reported"])
             print(f"[PASS] {label}")
             self.passes += 1
             return True
@@ -256,6 +267,15 @@ def phase_static(verification: Verification) -> None:
                 cwd=root,
             )
 
+    bridge = (root / "crates/draconium-host/src/bridge.rs").read_text(encoding="utf-8")
+    preload = re.search(r'^pub const PRELOAD_SCRIPT: &str = r(#+)"(.*?)"\1;', bridge, re.M | re.S)
+    if preload is None or not preload[2].strip():
+        verification.check("Node syntax check (PRELOAD_SCRIPT)", ["missing preload script"])
+    else:
+        script = verification.temp_dir / "preload.js"
+        script.write_text(preload[2], encoding="utf-8")
+        verification.command("node --check PRELOAD_SCRIPT", ["node", "--check", str(script)])
+
     verification.check("Relative Markdown links", check_markdown_links(root))
 
 
@@ -267,6 +287,7 @@ def phase_standalone_tests(verification: Verification) -> None:
     print("\n== Phase 2: Standalone Rust unit tests ==")
     sources = [
         "crates/draconium-host/src/unix_platform.rs",
+        "crates/draconium-host/src/platform_capabilities.rs",
         "crates/draconium-host/src/window_state.rs",
         "crates/draconium-host/src/bridge.rs",
         "crates/draconium-host/src/protocol.rs",
@@ -295,7 +316,7 @@ def phase_standalone_tests(verification: Verification) -> None:
             ],
         )
         if compiled:
-            verification.command(f"run {label}", [str(binary)])
+            verification.command(f"run {label}", [str(binary)], require_tests=True)
 
 
 def rust_path_literal(path: Path) -> str:
@@ -306,8 +327,10 @@ def platform_harness_source(root: Path) -> str:
     sources = {
         "embedder_ui": rust_path_literal(root / "crates/draconium-host/src/embedder_ui.rs"),
         "tray": rust_path_literal(root / "crates/draconium-host/src/tray.rs"),
+        "json": rust_path_literal(root / "crates/draconium-host/src/json.rs"),
+        "platform_capabilities": rust_path_literal(root / "crates/draconium-host/src/platform_capabilities.rs"),
         "unix_platform": rust_path_literal(root / "crates/draconium-host/src/unix_platform.rs"),
-        "win_platform": rust_path_literal(root / "crates/draconium-host/src/win_platform.rs"),
+        "platform_services": rust_path_literal(root / "crates/draconium-host/src/platform_services.rs"),
     }
     return f'''
 
@@ -321,29 +344,35 @@ mod embedder_ui;
 #[path = "{sources["tray"]}"]
 mod tray;
 
+#[path = "{sources["json"]}"]
+pub mod json;
+
+#[path = "{sources["platform_capabilities"]}"]
+mod platform_capabilities;
+
 #[path = "{sources["unix_platform"]}"]
 mod unix_platform;
 
 #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 #[cfg_attr(target_os = "windows", allow(dead_code))]
-#[path = "{sources["win_platform"]}"]
-mod win_platform;
+#[path = "{sources["platform_services"]}"]
+mod platform_services;
 
-pub use unix_platform::{{PlatformCapabilities, platform_capabilities}};
+pub use platform_capabilities::{{PlatformCapabilities, platform_capabilities}};
 pub use tray::TrayHandle;
-pub use win_platform::SingleInstanceLock;
+pub use platform_services::SingleInstanceLock;
 
 pub mod platform {{
-    pub use crate::unix_platform::{{PlatformCapabilities, platform_capabilities}};
-    pub use crate::win_platform::{{
+    pub use crate::platform_capabilities::{{PlatformCapabilities, platform_capabilities}};
+    pub use crate::platform_services::{{
         opacity_to_alpha, parse_hotkey, validate_custom_uri_scheme, validate_devtools_addr,
     }};
 }}
 
 // `host.rs` is deliberately absent from this lightweight crate root. Expose a
 // thin `pub fn` touching the exact host-facing wrappers in `embedder_ui`,
-// `tray`, and `win_platform` so `--crate-type lib -D warnings` exercises the
-// full `embedder_ui`/`tray`/`win_platform` -> `unix_platform` call graph on
+// `tray`, and `platform_services` so `--crate-type lib -D warnings` exercises the
+// full `embedder_ui`/`tray`/`platform_services` -> `unix_platform` call graph on
 // macOS, Linux, and other Unix without hiding real dead code inside
 // `unix_platform.rs`.
 #[cfg(not(test))]
@@ -355,7 +384,7 @@ pub fn __ci_host_surface() {{
         embedder_ui::show_alert as fn(isize, &str, &str, bool),
         embedder_ui::show_confirm as fn(isize, &str, &str, bool) -> bool,
         embedder_ui::show_open_file_dialog
-            as fn(isize, &[String], bool, bool) -> Option<Vec<std::path::PathBuf>>,
+            as fn(isize, &[String], bool, bool) -> Result<Option<Vec<std::path::PathBuf>>, String>,
         embedder_ui::show_save_file_dialog
             as fn(isize, &str, &[String], bool) -> Option<std::path::PathBuf>,
         embedder_ui::show_select_folder_dialog
@@ -365,23 +394,23 @@ pub fn __ci_host_surface() {{
         embedder_ui::open_external_url as fn(&str) -> Result<(), String>,
         tray::TrayHandle::has_tray_icon as fn(&tray::TrayHandle) -> bool,
         tray::TrayHandle::show_notification as fn(&tray::TrayHandle, &str, &str) -> bool,
-        win_platform::SingleInstanceLock::acquire
-            as fn(&str) -> Result<Option<win_platform::SingleInstanceLock>, String>,
-        win_platform::forward_to_running_instance as fn(&str, &str) -> bool,
-        win_platform::detect_system_dark_mode as fn() -> Option<bool>,
-        win_platform::clipboard_read_text as fn(isize) -> Result<String, String>,
-        win_platform::clipboard_write_text as fn(isize, &str) -> Result<(), String>,
-        win_platform::clipboard_read_html as fn(isize) -> Result<String, String>,
-        win_platform::clipboard_write_html as fn(isize, &str) -> Result<(), String>,
-        win_platform::clipboard_read_image_json as fn(isize) -> Result<String, String>,
-        win_platform::clipboard_write_image_dib as fn(isize, &[u8]) -> Result<(), String>,
-        win_platform::clipboard_write_image_rgba as fn(isize, u32, u32, &[u8]) -> Result<(), String>,
-        win_platform::clipboard_clear as fn(isize) -> Result<(), String>,
-        win_platform::register_uri_scheme_for_exe
+        platform_services::SingleInstanceLock::acquire
+            as fn(&str) -> Result<Option<platform_services::SingleInstanceLock>, String>,
+        platform_services::forward_to_running_instance as fn(&str, &str) -> bool,
+        platform_services::detect_system_dark_mode as fn() -> Option<bool>,
+        platform_services::clipboard_read_text as fn(isize) -> Result<String, String>,
+        platform_services::clipboard_write_text as fn(isize, &str) -> Result<(), String>,
+        platform_services::clipboard_read_html as fn(isize) -> Result<String, String>,
+        platform_services::clipboard_write_html as fn(isize, &str) -> Result<(), String>,
+        platform_services::clipboard_read_image_json as fn(isize) -> Result<String, String>,
+        platform_services::clipboard_write_image_dib as fn(isize, &[u8]) -> Result<(), String>,
+        platform_services::clipboard_write_image_rgba as fn(isize, u32, u32, &[u8]) -> Result<(), String>,
+        platform_services::clipboard_clear as fn(isize) -> Result<(), String>,
+        platform_services::register_uri_scheme_for_exe
             as fn(&str, &str, &std::path::Path, &[&str]) -> Result<(), String>,
-        win_platform::unregister_uri_scheme as fn(&str) -> Result<(), String>,
-        win_platform::autostart_is_enabled as fn(&str) -> Result<bool, String>,
-        win_platform::autostart_set_enabled_for_exe
+        platform_services::unregister_uri_scheme as fn(&str) -> Result<(), String>,
+        platform_services::autostart_is_enabled as fn(&str) -> Result<bool, String>,
+        platform_services::autostart_set_enabled_for_exe
             as fn(&str, bool, &std::path::Path, &[&str]) -> Result<(), String>,
     );
 }}
@@ -392,7 +421,7 @@ mod ci_integration_tests {{
 
     #[test]
     fn platform_capabilities_match_the_running_os() {{
-        let capabilities = unix_platform::platform_capabilities();
+        let capabilities = platform::platform_capabilities();
         #[cfg(target_os = "windows")]
         assert_eq!(capabilities.os, "windows");
         #[cfg(target_os = "macos")]
@@ -428,7 +457,7 @@ mod ci_integration_tests {{
         assert!(dir_meta.is_dir());
         assert_eq!(dir_meta.mode() & 0o777, 0o700);
 
-        let acquire = || win_platform::SingleInstanceLock::acquire(&tag);
+        let acquire = || platform_services::SingleInstanceLock::acquire(&tag);
         let lock = acquire().expect("acquire first lock").expect("first lock is available");
         assert!(acquire().expect("check duplicate lock").is_none());
         let lock_meta = fs::symlink_metadata(&lock_path).expect("lock file metadata");
@@ -452,7 +481,9 @@ mod ci_integration_tests {{
                     instance_window_tag: tag.clone(),
                 }},
                 move |action| {{
-                    let _ = action_tx.send(action);
+                    if matches!(action, tray::TrayAction::SecondInstance(_)) {{
+                        let _ = action_tx.send(action);
+                    }}
                 }},
             )?;
             Ok::<_, String>((tray, action_rx))
@@ -460,7 +491,7 @@ mod ci_integration_tests {{
         let check_forwarding = |action_rx: &mpsc::Receiver<tray::TrayAction>| {{
             assert_eq!(fs::metadata(&socket_path).expect("IPC socket metadata").mode() & 0o777, 0o600);
             let payload = format!(r#"{{{{"source":"verify-ci","pid":{{}}}}}}"#, std::process::id());
-            assert!(win_platform::forward_to_running_instance(&tag, &payload));
+            assert!(platform_services::forward_to_running_instance(&tag, &payload));
             assert_eq!(
                 action_rx.recv_timeout(Duration::from_secs(3)).expect("receive forwarded payload"),
                 tray::TrayAction::SecondInstance(payload)
@@ -528,7 +559,7 @@ def phase_platform_harness(verification: Verification, run_win32_probe: bool) ->
         ],
     )
     if test_compiled:
-        verification.command("run platform harness tests", [str(test_binary)])
+        verification.command("run platform harness tests", [str(test_binary)], require_tests=True)
 
     if run_win32_probe:
         probe_binary = executable_path(verification.temp_dir, "win32_live_probe")

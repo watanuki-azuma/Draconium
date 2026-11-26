@@ -13,10 +13,17 @@
 //! default Content-Security-Policy generation, and MIME types — free of Servo
 //! crate dependencies.
 
+use std::collections::HashSet;
+use std::fs::File;
+use std::io::Read;
+use std::path::Path;
+
 /// An in-binary embedded UI asset used as a self-contained fallback when
 /// on-disk assets are not supplied or for single-binary distribution.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct EmbeddedAsset {
+    /// A dn://app/ path such as assets/app.js or /assets/app.js.
+    /// Use a unique path with nonempty, visible segments and URL-safe ASCII.
     pub path: &'static str,
     pub bytes: &'static [u8],
 }
@@ -26,6 +33,10 @@ pub const SCHEME: &str = "dn";
 
 /// The authority (host part) under which app assets are served.
 pub const APP_AUTHORITY: &str = "app";
+
+/// Per-asset limit for disk reads. Bundled audio, video, and Wasm can be
+/// larger than typical HTML or CSS, so allow up to 64 MiB from disk.
+const MAX_DISK_ASSET_BYTES: u64 = 64 * 1024 * 1024;
 
 /// Default strict Content-Security-Policy header injected on `dn://app/*.html`
 /// responses. Because `rust-url` treats non-special schemes like `dn://` as
@@ -95,33 +106,36 @@ pub fn content_type_for(file_name: &str) -> &'static str {
 /// relative path (supporting nested asset subdirectories such as
 /// `assets/index.js` or `fonts/inter.woff2`).
 ///
-/// Rejects empty paths, directory traversal (`..`), current-dir (`.`),
-/// dotfiles/hidden directories (`.env`, `.git/config`), double or trailing
-/// slashes, backslashes, percent-encoded characters, colons (drive letters /
-/// NTFS ADS), NUL bytes, and control characters.
-pub fn resolve_asset_path(raw_path: &str) -> Option<String> {
+/// Rejects empty or hidden segments, backslashes, colons (drive letters and
+/// NTFS ADS), URL delimiters, and characters requiring percent encoding.
+pub fn resolve_asset_path(raw_path: &str) -> Option<&str> {
     let trimmed = raw_path.strip_prefix('/').unwrap_or(raw_path);
-    if trimmed.is_empty()
-        || trimmed.contains('\\')
-        || trimmed.contains('%')
-        || trimmed.contains('\0')
-        || trimmed.contains(':')
-        || trimmed.chars().any(char::is_control)
+    if trimmed.bytes().any(|byte| {
+        !byte.is_ascii_graphic()
+            || matches!(
+                byte,
+                b'"' | b'#' | b'%' | b':' | b'<' | b'>' | b'?' | b'\\' | b'`' | b'{' | b'}'
+            )
+    }) || trimmed
+        .split('/')
+        .any(|segment| segment.is_empty() || segment.starts_with('.'))
     {
         return None;
     }
-    let mut segments = Vec::new();
-    for segment in trimmed.split('/') {
-        if segment.is_empty() || segment == "." || segment == ".." || segment.starts_with('.') {
-            return None;
+    Some(trimmed)
+}
+
+/// Validate the fallback table even when disk assets take precedence.
+pub fn validate_embedded_assets(assets: &[EmbeddedAsset]) -> Result<(), String> {
+    let mut paths = HashSet::with_capacity(assets.len());
+    for asset in assets {
+        let path = resolve_asset_path(asset.path)
+            .ok_or_else(|| format!("Invalid embedded asset path {:?}", asset.path))?;
+        if !paths.insert(path) {
+            return Err(format!("Duplicate embedded asset path {path:?}"));
         }
-        segments.push(segment);
     }
-    if segments.is_empty() {
-        None
-    } else {
-        Some(segments.join("/"))
-    }
+    Ok(())
 }
 
 /// Look up an asset in a caller-supplied [`EmbeddedAsset`] fallback table.
@@ -129,8 +143,27 @@ pub fn embedded_lookup(assets: &[EmbeddedAsset], path: &str) -> Option<&'static 
     let normalized = resolve_asset_path(path)?;
     assets
         .iter()
-        .find(|asset| asset.path == normalized)
+        .find(|asset| asset.path.strip_prefix('/').unwrap_or(asset.path) == normalized)
         .map(|asset| asset.bytes)
+}
+
+/// Read a normalized disk asset within a canonicalized asset root.
+pub fn read_disk_asset(root_canon: &Path, rel_path: &str) -> Option<Vec<u8>> {
+    let candidate = root_canon.join(rel_path).canonicalize().ok()?;
+    if !candidate.starts_with(root_canon) || !candidate.is_file() {
+        return None;
+    }
+    let file = File::open(candidate).ok()?;
+    let metadata = file.metadata().ok()?;
+    if !metadata.is_file() || metadata.len() > MAX_DISK_ASSET_BYTES {
+        return None;
+    }
+    // Check the actual read as well, since the file can grow after metadata().
+    let mut bytes = Vec::new();
+    file.take(MAX_DISK_ASSET_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    (bytes.len() as u64 <= MAX_DISK_ASSET_BYTES).then_some(bytes)
 }
 
 #[cfg(test)]
@@ -143,18 +176,15 @@ mod tests {
             bytes: b"<!doctype html><html><body>Hello</body></html>",
         },
         EmbeddedAsset {
-            path: "assets/app.js",
+            path: "/assets/app.js",
             bytes: b"console.log('ok');",
         },
     ];
 
     #[test]
     fn resolve_asset_path_finds_top_level_and_rejects_empty() {
-        assert_eq!(
-            resolve_asset_path("/index.html").as_deref(),
-            Some("index.html")
-        );
-        assert_eq!(resolve_asset_path("app.js").as_deref(), Some("app.js"));
+        assert_eq!(resolve_asset_path("/index.html"), Some("index.html"));
+        assert_eq!(resolve_asset_path("app.js"), Some("app.js"));
         assert_eq!(resolve_asset_path("/"), None);
         assert_eq!(resolve_asset_path(""), None);
     }
@@ -169,15 +199,15 @@ mod tests {
     #[test]
     fn resolve_asset_path_supports_safe_nested_paths() {
         assert_eq!(
-            resolve_asset_path("/assets/chunks/app-123.mjs").as_deref(),
+            resolve_asset_path("/assets/chunks/app-123.mjs"),
             Some("assets/chunks/app-123.mjs")
         );
         assert_eq!(
-            resolve_asset_path("fonts/inter.woff2").as_deref(),
+            resolve_asset_path("fonts/inter.woff2"),
             Some("fonts/inter.woff2")
         );
         assert_eq!(
-            resolve_asset_path("/wasm/engine.wasm").as_deref(),
+            resolve_asset_path("/wasm/engine.wasm"),
             Some("wasm/engine.wasm")
         );
         assert_eq!(resolve_asset_path("/assets/../secret.txt"), None);
@@ -199,9 +229,62 @@ mod tests {
                 .unwrap()
                 .contains("<!doctype html>")
         );
-        assert!(embedded_lookup(TEST_EMBEDDED, "assets/app.js").is_some());
+        assert_eq!(
+            embedded_lookup(TEST_EMBEDDED, "assets/app.js"),
+            Some(TEST_EMBEDDED[1].bytes)
+        );
+        assert_eq!(
+            embedded_lookup(TEST_EMBEDDED, "/assets/app.js"),
+            Some(TEST_EMBEDDED[1].bytes)
+        );
         assert!(embedded_lookup(TEST_EMBEDDED, "/nonexistent.js").is_none());
         assert!(embedded_lookup(TEST_EMBEDDED, "/../index.html").is_none());
+    }
+
+    #[test]
+    fn embedded_paths_reject_invalid_or_duplicate_entries() {
+        assert_eq!(validate_embedded_assets(TEST_EMBEDDED), Ok(()));
+        for path in [
+            "../app.js",
+            "//app.js",
+            " app.js",
+            "資料.js",
+            "app.js?v=1",
+            "app.js#top",
+            "app%20a.js",
+        ] {
+            let error = validate_embedded_assets(&[EmbeddedAsset { path, bytes: b"" }]);
+            assert!(error.unwrap_err().contains("Invalid embedded asset path"));
+        }
+        let duplicate = EmbeddedAsset {
+            path: "/index.html",
+            bytes: b"duplicate",
+        };
+        let error = validate_embedded_assets(&[TEST_EMBEDDED[0], duplicate]);
+        assert!(error.unwrap_err().contains("Duplicate embedded asset path"));
+    }
+
+    #[test]
+    fn disk_assets_have_a_size_limit() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("dn-assets-{}-{nonce}", std::process::id()));
+        std::fs::create_dir(&root).unwrap();
+        let root = root.canonicalize().unwrap();
+        let path = root.join("asset.bin");
+        std::fs::write(&path, b"asset").unwrap();
+        let small = read_disk_asset(&root, "asset.bin");
+        File::create(&path)
+            .unwrap()
+            .set_len(MAX_DISK_ASSET_BYTES + 1)
+            .unwrap();
+        let oversized = read_disk_asset(&root, "asset.bin");
+        std::fs::remove_dir_all(&root).unwrap();
+
+        assert_eq!(small.as_deref(), Some(b"asset".as_slice()));
+        assert_eq!(oversized, None);
     }
 
     #[test]

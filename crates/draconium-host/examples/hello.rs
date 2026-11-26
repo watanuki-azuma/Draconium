@@ -8,7 +8,8 @@ use std::error::Error;
 use std::path::Path;
 
 use draconium_host::{
-    Capabilities, EmbeddedAsset, HostConfig, HostHandler, WindowConfig, resolve_app_url_from, run,
+    Capabilities, EmbeddedAsset, HostConfig, HostHandler, WindowConfig, run,
+    try_resolve_app_url_from,
 };
 
 const HELLO_HTML: &[u8] = br#"<!doctype html>
@@ -88,14 +89,14 @@ impl HostHandler for HelloApp {
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
-    let (url, asset_root) = resolve_app_url_from(
+    let (url, asset_root) = try_resolve_app_url_from(
         Path::new(env!("CARGO_MANIFEST_DIR")),
         true,
         None,
         "hello.html",
         "ui/hello.html",
         "ui/hello.html",
-    );
+    )?;
     let config = HostConfig::new("Draconium Host Example", url)
         .with_window(WindowConfig::standard(720, 480))
         .with_asset_root(asset_root)

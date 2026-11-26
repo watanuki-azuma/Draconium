@@ -26,8 +26,8 @@ pub enum TrayAction {
     Quit,
     /// Global hotkey registered via `--hotkey` was pressed.
     GlobalHotkey,
-    /// Windows system settings changed (e.g. `AppsUseLightTheme` dark/light toggle).
-    ThemeChanged,
+    /// System appearance changed. Platforms with a sampled value provide it.
+    ThemeChanged(Option<bool>),
     /// Windows power broadcast (`"suspend"`, `"resume"`, `"power-status"`).
     PowerEvent(&'static str),
     /// User clicked a desktop notification balloon.
@@ -88,17 +88,7 @@ pub fn power_event_from_wparam(wparam: usize) -> Option<&'static str> {
 
 /// Compute the scoped Win32 window class and title for a given instance tag.
 pub fn os_event_window_name(tag: &str) -> String {
-    let cleaned: String = tag
-        .chars()
-        .filter(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-'))
-        .take(48)
-        .collect();
-    let suffix = if cleaned.is_empty() {
-        "Default"
-    } else {
-        cleaned.as_str()
-    };
-    format!("Draconium.TrayWindow.{suffix}")
+    crate::platform_services::instance_window_name(tag)
 }
 
 /// Validate a raw `WM_COPYDATA` byte slice (must be non-empty, `<= MAX_COPYDATA_BYTES`,
@@ -149,7 +139,7 @@ pub fn encode_tray_tip(text: &str) -> [u16; 128] {
 mod win32 {
     use std::ffi::c_void;
     use std::ptr;
-    use std::sync::mpsc;
+    use std::sync::{Arc, Mutex, mpsc};
     use std::thread::{self, JoinHandle};
 
     use super::{
@@ -345,8 +335,11 @@ mod win32 {
         presentations: bool,
         has_tray_icon: bool,
         has_hotkey: bool,
+        pending_notification: Arc<Mutex<Option<EphemeralNotification>>>,
         on_action: Box<dyn Fn(TrayAction) + Send + 'static>,
     }
+
+    type EphemeralNotification = ([u16; 64], [u16; 256]);
 
     fn wide_nul(s: &str) -> Vec<u16> {
         let mut v: Vec<u16> = s.encode_utf16().collect();
@@ -479,22 +472,21 @@ mod win32 {
                     0
                 }
                 WM_SHOW_EPHEMERAL_NOTIFY => {
-                    if lparam != 0 {
-                        let boxed = Box::from_raw(lparam as *mut (String, String));
-                        let (title, body) = *boxed;
-                        let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const TrayContext;
-                        let tip = if !ptr.is_null() {
-                            (*ptr).tooltip.as_str()
-                        } else {
-                            "Draconium"
-                        };
+                    let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const TrayContext;
+                    if let Some(ctx) = ptr.as_ref()
+                        && let Some((title, body)) = ctx
+                            .pending_notification
+                            .lock()
+                            .ok()
+                            .and_then(|mut pending| pending.take())
+                    {
                         cleanup_ephemeral_balloon(hwnd);
                         let mut nid = ephemeral_nid(hwnd);
                         nid.u_flags = NIF_MESSAGE | NIF_ICON | NIF_TIP | NIF_INFO;
                         nid.h_icon = LoadIconW(0, IDI_APPLICATION);
-                        nid.sz_tip = encode_tray_tip(tip);
-                        nid.sz_info_title = encode_wide_fixed::<64>(&title);
-                        nid.sz_info = encode_wide_fixed::<256>(&body);
+                        nid.sz_tip = encode_tray_tip(&ctx.tooltip);
+                        nid.sz_info_title = title;
+                        nid.sz_info = body;
                         nid.dw_info_flags = NIIF_INFO;
                         if Shell_NotifyIconW(NIM_ADD, &nid) != 0 {
                             SetTimer(
@@ -543,7 +535,7 @@ mod win32 {
                 WM_SETTINGCHANGE => {
                     let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const TrayContext;
                     if !ptr.is_null() {
-                        ((*ptr).on_action)(TrayAction::ThemeChanged);
+                        ((*ptr).on_action)(TrayAction::ThemeChanged(None));
                     }
                     0
                 }
@@ -584,6 +576,7 @@ mod win32 {
     pub struct TrayHandle {
         hwnd: Hwnd,
         has_tray_icon: bool,
+        pending_notification: Arc<Mutex<Option<EphemeralNotification>>>,
         thread: Option<JoinHandle<()>>,
     }
 
@@ -593,6 +586,8 @@ mod win32 {
             on_action: impl Fn(TrayAction) + Send + 'static,
         ) -> Result<Self, String> {
             let (tx, rx) = mpsc::channel::<Result<(Hwnd, bool), String>>();
+            let pending_notification = Arc::new(Mutex::new(None));
+            let window_notification = Arc::clone(&pending_notification);
             let thread = thread::Builder::new()
                 .name("draconium-tray".to_owned())
                 .spawn(move || unsafe {
@@ -666,6 +661,7 @@ mod win32 {
                         presentations: config.presentations,
                         has_tray_icon,
                         has_hotkey,
+                        pending_notification: window_notification,
                         on_action: Box::new(on_action),
                     });
                     let ctx_ptr = Box::into_raw(ctx);
@@ -702,6 +698,7 @@ mod win32 {
                 Ok(Ok((hwnd, has_tray_icon))) => Ok(Self {
                     hwnd,
                     has_tray_icon,
+                    pending_notification,
                     thread: Some(thread),
                 }),
                 Ok(Err(err)) => {
@@ -738,19 +735,19 @@ mod win32 {
                 // SAFETY: `nid` is a fully initialized `NOTIFYICONDATAW` targeting our own HWND.
                 return unsafe { Shell_NotifyIconW(NIM_MODIFY, &nid) != 0 };
             }
-            let payload = Box::into_raw(Box::new((title.to_owned(), body.to_owned())));
-            // SAFETY: Transfers ownership of `payload` to `wnd_proc(WM_SHOW_EPHEMERAL_NOTIFY)`.
-            let posted =
-                unsafe { PostMessageW(self.hwnd, WM_SHOW_EPHEMERAL_NOTIFY, 0, payload as isize) };
-            if posted == 0 {
-                // SAFETY: Reclaim box if `PostMessageW` failed.
-                unsafe {
-                    drop(Box::from_raw(payload));
-                }
-                false
-            } else {
-                true
+            let Ok(mut pending) = self.pending_notification.lock() else {
+                return false;
+            };
+            let needs_wakeup = pending.is_none();
+            *pending = Some((encode_wide_fixed(title), encode_wide_fixed(body)));
+            // Window messages only signal the receiver to check its own pending state.
+            if needs_wakeup
+                && unsafe { PostMessageW(self.hwnd, WM_SHOW_EPHEMERAL_NOTIFY, 0, 0) } == 0
+            {
+                *pending = None;
+                return false;
             }
+            true
         }
     }
 
@@ -772,6 +769,8 @@ pub use win32::TrayHandle;
 #[cfg(unix)]
 pub struct TrayHandle {
     _ipc_server: Option<crate::unix_platform::UnixInstanceServer>,
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    theme_monitor: Option<(std::sync::mpsc::Sender<()>, std::thread::JoinHandle<()>)>,
 }
 
 #[cfg(unix)]
@@ -780,12 +779,17 @@ impl TrayHandle {
         config: TrayConfig,
         on_action: impl Fn(TrayAction) + Send + 'static,
     ) -> Result<Self, String> {
+        use std::sync::{Arc, Mutex};
+
+        let on_action = Arc::new(Mutex::new(on_action));
+        let on_payload = Arc::clone(&on_action);
         let server = if !config.instance_window_tag.trim().is_empty() {
             match crate::unix_platform::UnixInstanceServer::start(
                 &config.instance_window_tag,
                 move |raw| {
                     if let Some(payload) =
                         decode_copydata_payload(DN_COPYDATA_MAGIC, raw.as_bytes())
+                        && let Ok(on_action) = on_payload.lock()
                     {
                         on_action(TrayAction::SecondInstance(payload));
                     }
@@ -800,8 +804,43 @@ impl TrayHandle {
         } else {
             None
         };
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        let theme_monitor = {
+            use std::sync::mpsc::{self, RecvTimeoutError};
+            use std::time::Duration;
+
+            let (stop, stopped) = mpsc::channel();
+            match std::thread::Builder::new()
+                .name("draconium-theme".to_owned())
+                .spawn(move || {
+                    let mut last = None;
+                    loop {
+                        if let Some(dark) = crate::unix_platform::detect_system_dark_mode()
+                            && last != Some(dark)
+                        {
+                            last = Some(dark);
+                            if let Ok(on_action) = on_action.lock() {
+                                on_action(TrayAction::ThemeChanged(Some(dark)));
+                            }
+                        }
+                        if stopped.recv_timeout(Duration::from_secs(2))
+                            != Err(RecvTimeoutError::Timeout)
+                        {
+                            break;
+                        }
+                    }
+                }) {
+                Ok(thread) => Some((stop, thread)),
+                Err(err) => {
+                    eprintln!("[unix-theme] {err}");
+                    None
+                }
+            }
+        };
         Ok(Self {
             _ipc_server: server,
+            #[cfg(any(target_os = "macos", target_os = "linux"))]
+            theme_monitor,
         })
     }
 
@@ -818,6 +857,16 @@ impl TrayHandle {
         {
             let _ = (title, body);
             false
+        }
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+impl Drop for TrayHandle {
+    fn drop(&mut self) {
+        if let Some((stop, thread)) = self.theme_monitor.take() {
+            drop(stop);
+            let _ = thread.join();
         }
     }
 }
@@ -879,11 +928,10 @@ mod tests {
 
     #[test]
     fn os_event_window_name_and_copydata_validation() {
-        assert_eq!(
-            os_event_window_name("Local\\Draconium.Workspace"),
-            "Draconium.TrayWindow.LocalDraconiumWorkspace"
+        assert!(
+            os_event_window_name("Local\\Draconium.Workspace").starts_with("Draconium.TrayWindow.")
         );
-        assert_eq!(os_event_window_name(""), "Draconium.TrayWindow.Default");
+        assert_ne!(os_event_window_name(""), os_event_window_name("Default"));
 
         let payload = br#"{"argv":["--workspace"],"deepLink":"dnfolio://open"}"#;
         assert_eq!(

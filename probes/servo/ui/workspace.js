@@ -3,21 +3,27 @@
 
   const state = {
     notes: [],
+    maxNoteBytes: null,
+    unreadableCount: 0,
     activeId: null,
-    activeNote: null,
+    selectionVersion: 0,
+    workspaceVersion: 0,
+    deletingId: null,
     filterQuery: "",
+    searchMatches: null,
+    searchVersion: 0,
+    searchTimer: null,
     activeTag: "",
     mode: "split",
     dirty: false,
     saveTimer: null,
+    previewTimer: null,
+    previewPending: false,
     toastTimer: null,
     theme: "light",
     labOpen: false,
-    benchRunning: false,
-    frameSamples: [
-      16.2, 16.6, 16.5, 16.8, 16.4, 16.9, 16.5, 16.7, 16.4, 16.6, 16.8, 16.5,
-      16.3, 16.7, 16.6, 16.5, 16.8, 16.4, 16.6, 16.7,
-    ],
+    benchPromise: null,
+    frameSamples: [],
   };
 
   function byId(id) {
@@ -34,6 +40,7 @@
     const windowTitle = state.activeId
       ? (state.dirty ? "• " : "") + (title || "Untitled") + " — Draconium Folio"
       : "Draconium Folio";
+    if (document.title === windowTitle) return;
     document.title = windowTitle;
     const hostWindow = window.Draconium && window.Draconium.window;
     if (hostWindow && typeof hostWindow.setTitle === "function") hostWindow.setTitle(windowTitle);
@@ -58,7 +65,12 @@
   async function callAppAsync(command, payloadObj) {
     const raw = payloadObj == null ? "{}" : JSON.stringify(payloadObj);
     if (window.Draconium && typeof window.Draconium.invokeAsync === "function") {
-      const res = await window.Draconium.invokeAsync(command, raw);
+      let res;
+      try {
+        res = await window.Draconium.invokeAsync(command, raw);
+      } catch (error) {
+        return { ok: false, error: String(error) };
+      }
       if (!res || !res.ok) {
         return { ok: false, error: (res && res.error) || "Request failed" };
       }
@@ -71,13 +83,15 @@
     return callAppSync(command, payloadObj);
   }
 
-  function showToast(message) {
+  function showToast(message, details = "") {
     const el = byId("status-toast");
     if (!el) return;
     el.textContent = message;
+    el.title = details || message;
     if (state.toastTimer) clearTimeout(state.toastTimer);
     state.toastTimer = setTimeout(function () {
       el.textContent = "";
+      el.title = "";
     }, 3200);
   }
 
@@ -86,6 +100,7 @@
     if (el) {
       el.textContent = text;
       el.className = "save-state" + (kind ? " " + kind : "");
+      el.title = text;
     }
     syncWindowTitle();
   }
@@ -148,22 +163,24 @@
       grid.className = "editor-grid mode-" + valid;
     }
     const buttons = document.querySelectorAll(".mode-btn[data-mode]");
-    for (let i = 0; i < buttons.length; i++) {
-      const b = buttons[i];
-      if (b.getAttribute("data-mode") === valid) {
-        b.classList.add("is-active");
-      } else {
-        b.classList.remove("is-active");
-      }
+    for (const button of buttons) {
+      const selected = button.getAttribute("data-mode") === valid;
+      button.classList.toggle("is-active", selected);
+      button.setAttribute("aria-pressed", String(selected));
     }
+    if (state.previewPending) updatePreview();
   }
 
   function updateCounts(text) {
-    const chars = Array.from(text || "").length;
-    const words = (text || "")
-      .trim()
-      .split(/\s+/)
-      .filter(Boolean).length;
+    let chars = 0;
+    let words = 0;
+    let inWord = false;
+    for (const char of text) {
+      const isWord = !/\s/.test(char);
+      if (isWord && !inWord) words++;
+      inWord = isWord;
+      chars++;
+    }
     const mins = Math.max(1, Math.ceil(words / 220));
 
     const wordsEl = byId("stat-words");
@@ -172,6 +189,20 @@
     if (wordsEl) wordsEl.textContent = words + (words === 1 ? " word" : " words");
     if (charsEl) charsEl.textContent = chars + (chars === 1 ? " character" : " characters");
     if (readEl) readEl.textContent = mins + " min read";
+  }
+
+  function updatePreview() {
+    clearTimeout(state.previewTimer);
+    state.previewTimer = null;
+    const text = byId("editor-textarea").value;
+    if (state.previewPending && state.mode !== "write") {
+      renderMarkdown(text, byId("preview-prose"));
+      state.previewPending = false;
+    }
+    updateCounts(text);
+    if (state.labOpen) {
+      byId("lab-dom-nodes").textContent = String(document.querySelectorAll("*").length);
+    }
   }
 
   function isSafeHref(url) {
@@ -224,9 +255,13 @@
     }
   }
 
-  function renderMarkdown(markdownText) {
-    const container = byId("preview-prose");
-    if (!container) return;
+  function startsTable(lines, index) {
+    return lines[index].trim().startsWith("|") &&
+      index + 1 < lines.length &&
+      /^\|\s*:?-+:?\s*(?:\|\s*:?-+:?\s*)*\|?$/.test(lines[index + 1].trim());
+  }
+
+  function renderMarkdown(markdownText, container) {
     container.innerHTML = "";
 
     const lines = String(markdownText || "").replace(/\r\n/g, "\n").split("\n");
@@ -273,11 +308,11 @@
         continue;
       }
 
-      if (trimmed.startsWith("> ")) {
+      if (/^>\s+/.test(trimmed)) {
         const bq = document.createElement("blockquote");
         const quoteLines = [];
-        while (i < lines.length && lines[i].trim().startsWith("> ")) {
-          quoteLines.push(lines[i].trim().slice(2));
+        while (i < lines.length && /^>\s+/.test(lines[i].trim())) {
+          quoteLines.push(lines[i].trim().replace(/^>\s+/, ""));
           i++;
         }
         const p = document.createElement("p");
@@ -287,11 +322,7 @@
         continue;
       }
 
-      if (
-        trimmed.startsWith("|") &&
-        i + 1 < lines.length &&
-        /^\|[\s:|-]+\|?$/.test(lines[i + 1].trim())
-      ) {
+      if (startsTable(lines, i)) {
         const table = document.createElement("table");
         const thead = document.createElement("thead");
         const headRow = document.createElement("tr");
@@ -372,11 +403,13 @@
         continue;
       }
 
-      const paraLines = [];
+      const paraLines = [trimmed];
+      i++;
       while (
         i < lines.length &&
         lines[i].trim() !== "" &&
-        !/^(#{1,4}\s+|```|>\s+|[-*]\s+|\d+\.\s+|\|)/.test(lines[i].trim())
+        !/^(?:#{1,4}\s+|```|>\s+|[-*]\s+|\d+\.\s+|(?:-{3,}|\*{3,})$)/.test(lines[i].trim()) &&
+        !startsTable(lines, i)
       ) {
         paraLines.push(lines[i].trim());
         i++;
@@ -385,80 +418,77 @@
       appendInlineNodes(p, paraLines.join(" "));
       container.appendChild(p);
     }
+  }
 
-    const domEl = byId("lab-dom-nodes");
-    if (domEl) {
-      domEl.textContent = String(document.querySelectorAll("*").length);
+  function renderNoteArticle() {
+    const article = document.createElement("article");
+    renderMarkdown(byId("editor-textarea").value, article);
+    return article;
+  }
+
+  function buildNoteHtml() {
+    const exported = document.implementation.createHTMLDocument(byId("input-title").value || "Untitled note");
+    exported.documentElement.lang = document.documentElement.lang;
+    const charset = exported.createElement("meta");
+    charset.setAttribute("charset", "utf-8");
+    exported.head.prepend(charset);
+    exported.body.appendChild(renderNoteArticle());
+    return "<!DOCTYPE html>\n" + exported.documentElement.outerHTML;
+  }
+
+  function updateTagSelection() {
+    for (const button of byId("tag-filter-bar").children) {
+      const selected = button.dataset.tag === state.activeTag;
+      button.classList.toggle("is-selected", selected);
+      button.setAttribute("aria-pressed", String(selected));
     }
   }
 
   function renderTagStrip() {
     const bar = byId("tag-filter-bar");
-    if (!bar) return;
-    const tagSet = new Set();
-    for (let i = 0; i < state.notes.length; i++) {
-      const tags = state.notes[i].tags || [];
-      for (let j = 0; j < tags.length; j++) {
-        tagSet.add(tags[j]);
+    const focusedTag = bar.contains(document.activeElement) ? document.activeElement.dataset.tag : null;
+    const tags = Array.from(new Set(state.notes.flatMap(note => note.tags || []))).sort();
+    if (state.activeTag && !tags.includes(state.activeTag)) state.activeTag = "";
+    bar.replaceChildren();
+    if (tags.length) {
+      for (const tag of ["", ...tags]) {
+        const button = document.createElement("button");
+        button.type = "button";
+        button.className = "tag-pill";
+        button.dataset.tag = tag;
+        button.textContent = tag || "All";
+        button.addEventListener("click", function () {
+          state.activeTag = state.activeTag === tag ? "" : tag;
+          updateTagSelection();
+          renderNoteList();
+        });
+        bar.appendChild(button);
       }
     }
-    const sorted = Array.from(tagSet).sort();
-    bar.innerHTML = "";
-    if (sorted.length === 0) return;
-
-    const allBtn = document.createElement("button");
-    allBtn.type = "button";
-    allBtn.className = "tag-pill" + (state.activeTag === "" ? " is-selected" : "");
-    allBtn.textContent = "All";
-    allBtn.addEventListener("click", function () {
-      state.activeTag = "";
-      renderTagStrip();
-      renderNoteList();
-    });
-    bar.appendChild(allBtn);
-
-    for (let i = 0; i < sorted.length; i++) {
-      const tag = sorted[i];
-      const pill = document.createElement("button");
-      pill.type = "button";
-      pill.className = "tag-pill" + (state.activeTag === tag ? " is-selected" : "");
-      pill.textContent = tag;
-      pill.addEventListener("click", function () {
-        state.activeTag = state.activeTag === tag ? "" : tag;
-        renderTagStrip();
-        renderNoteList();
-      });
-      bar.appendChild(pill);
+    updateTagSelection();
+    if (focusedTag !== null) {
+      const matchingButton = Array.from(bar.children).find(button => button.dataset.tag === focusedTag);
+      (matchingButton || bar.firstElementChild || byId("input-search")).focus();
     }
   }
 
-  function getVisibleNotes() {
-    const q = state.filterQuery.trim().toLowerCase();
-    return state.notes.filter(function (note) {
-      if (state.activeTag) {
-        const tags = note.tags || [];
-        if (tags.indexOf(state.activeTag) === -1) return false;
-      }
-      if (!q) return true;
-      const hay = (
-        note.title +
-        " " +
-        (note.excerpt || "") +
-        " " +
-        (note.tags || []).join(" ")
-      ).toLowerCase();
-      return hay.indexOf(q) !== -1;
-    });
+  function updateNoteSelection() {
+    for (const button of byId("note-list").querySelectorAll(".note-item")) {
+      const selected = button.dataset.noteId === state.activeId;
+      button.classList.toggle("is-active", selected);
+      button.setAttribute("aria-selected", String(selected));
+    }
   }
 
   function renderNoteList() {
     const listEl = byId("note-list");
-    const countEl = byId("note-count");
-    if (!listEl) return;
-
-    const visible = getVisibleNotes();
-    if (countEl) countEl.textContent = String(visible.length);
-    listEl.innerHTML = "";
+    const focusedId = listEl.contains(document.activeElement) ? document.activeElement.dataset.noteId : null;
+    const fragment = document.createDocumentFragment();
+    const visible = state.notes.filter(function (note) {
+      return (!state.searchMatches || state.searchMatches.has(note.id)) &&
+        (!state.activeTag || (note.tags || []).includes(state.activeTag));
+    });
+    byId("note-count").textContent = String(visible.length);
 
     if (visible.length === 0) {
       const empty = document.createElement("div");
@@ -466,18 +496,17 @@
       empty.textContent = state.notes.length === 0
         ? "No notes yet. Select New note to begin."
         : "No notes match the current filter.";
-      listEl.appendChild(empty);
-      return;
+      fragment.appendChild(empty);
     }
 
-    for (let i = 0; i < visible.length; i++) {
-      const note = visible[i];
-      const btn = document.createElement("button");
-      btn.type = "button";
-      btn.className = "note-item" + (note.id === state.activeId ? " is-active" : "");
-      btn.setAttribute("role", "option");
-      btn.setAttribute("aria-selected", note.id === state.activeId ? "true" : "false");
-      btn.setAttribute("data-note-id", note.id);
+    let replacement;
+    for (const note of visible) {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = "note-item";
+      button.setAttribute("role", "option");
+      button.dataset.noteId = note.id;
+      if (note.id === focusedId) replacement = button;
 
       const title = document.createElement("span");
       title.className = "note-item-title";
@@ -487,12 +516,48 @@
       excerpt.className = "note-item-excerpt";
       excerpt.textContent = note.excerpt || "Empty note";
 
-      btn.appendChild(title);
-      btn.appendChild(excerpt);
-      btn.addEventListener("click", function () {
-        selectNote(note.id);
-      });
-      listEl.appendChild(btn);
+      button.append(title, excerpt);
+      button.addEventListener("click", function () { selectNote(note.id); });
+      fragment.appendChild(button);
+    }
+
+    listEl.replaceChildren(fragment);
+    updateNoteSelection();
+    if (focusedId !== null) (replacement || byId("input-search")).focus();
+  }
+
+  function scheduleSearch() {
+    const version = ++state.searchVersion;
+    const query = state.filterQuery;
+    clearTimeout(state.searchTimer);
+    state.searchTimer = null;
+    if (!query) {
+      state.searchMatches = null;
+      renderNoteList();
+      return;
+    }
+
+    state.searchTimer = setTimeout(async function () {
+      state.searchTimer = null;
+      const res = await callAppAsync("list_notes", { query });
+      if (version !== state.searchVersion) return;
+      if (!res.ok) {
+        showToast("Search failed: " + res.error);
+        return;
+      }
+      state.searchMatches = new Set(res.data.notes.map(note => note.id));
+      renderNoteList();
+    }, 180);
+  }
+
+  function updateEditorAvailability() {
+    for (const id of ["input-title", "input-tags", "editor-textarea"]) {
+      const field = byId(id);
+      field.disabled = !state.activeId;
+      field.readOnly = Boolean(state.deletingId);
+    }
+    for (const id of ["btn-export-menu", "btn-delete-note"]) {
+      byId(id).disabled = !state.activeId || Boolean(state.deletingId);
     }
   }
 
@@ -502,7 +567,6 @@
       state.saveTimer = null;
     }
     state.activeId = note ? note.id : null;
-    state.activeNote = note;
     state.dirty = false;
 
     const content = (note && note.content) || "";
@@ -515,14 +579,14 @@
       const field = byId(id);
       if (field) {
         field.value = value;
-        field.disabled = !state.activeId;
       }
     }
 
-    renderMarkdown(content);
-    updateCounts(content);
+    updateEditorAvailability();
+    state.previewPending = true;
+    updatePreview();
     setSaveState(state.activeId ? "Saved" : "", "");
-    renderNoteList();
+    updateNoteSelection();
   }
 
   function flushSaveSync() {
@@ -560,13 +624,18 @@
     }
     renderTagStrip();
     renderNoteList();
+    if (state.filterQuery) scheduleSearch();
     return true;
   }
 
   function scheduleAutosave() {
-    if (!state.activeId) return;
-    state.dirty = true;
-    setSaveState("Unsaved changes", "is-dirty");
+    if (!state.activeId || state.deletingId) return;
+    if (!state.dirty) {
+      state.dirty = true;
+      setSaveState("Unsaved changes", "is-dirty");
+    } else {
+      syncWindowTitle();
+    }
     if (state.saveTimer) clearTimeout(state.saveTimer);
     state.saveTimer = setTimeout(function () {
       flushSaveSync();
@@ -574,56 +643,74 @@
   }
 
   async function selectNote(id) {
+    if (state.deletingId) return false;
+    const version = ++state.selectionVersion;
+    if (id === state.activeId) return true;
     if (state.dirty && !flushSaveSync()) {
       showToast("Save failed — keeping current edits");
-      return;
+      return false;
     }
     const res = await callAppAsync("load_note", { id: id });
+    if (version !== state.selectionVersion) return false;
     if (!res.ok) {
       setSaveState(res.error, "is-error");
-      return;
+      return false;
     }
     // Edits can arrive while the selected note loads.
     if (state.dirty && !flushSaveSync()) {
       showToast("Save failed — keeping current edits");
-      return;
+      return false;
     }
     applyNoteToEditor(res.data);
+    return true;
   }
 
-  async function refreshWorkspace(preferredId) {
-    const res = await callAppAsync("list_notes", {});
-    if (!res.ok) {
-      setSaveState(res.error, "is-error");
-      return;
+  function applyWorkspaceList(data) {
+    state.notes = Array.isArray(data.notes) ? data.notes : [];
+    state.maxNoteBytes = data.maxNoteBytes;
+    const unreadableCount = data.unreadableCount || 0;
+    if (unreadableCount && unreadableCount !== state.unreadableCount) {
+      showToast(unreadableCount + (unreadableCount === 1 ? " note could" : " notes could") + " not be read");
     }
-    state.notes = Array.isArray(res.data.notes) ? res.data.notes : [];
+    state.unreadableCount = unreadableCount;
     renderTagStrip();
-    renderNoteList();
+    scheduleSearch();
+    if (state.filterQuery) renderNoteList();
+  }
 
-    const targetId =
-      preferredId && state.notes.some(function (n) { return n.id === preferredId; })
-        ? preferredId
-        : state.notes.length > 0
-          ? state.notes[0].id
-          : null;
+  function firstAvailableNote(preferredId) {
+    if (preferredId && state.notes.some(note => note.id === preferredId)) return preferredId;
+    return state.notes.length ? state.notes[0].id : null;
+  }
 
-    if (targetId) {
-      await selectNote(targetId);
-    } else {
-      if (state.dirty && !flushSaveSync()) {
-        showToast("Save failed — keeping current edits");
-        return;
-      }
-      applyNoteToEditor(null);
+  async function refreshWorkspace(preferredId, selection = state.selectionVersion) {
+    const version = ++state.workspaceVersion;
+    const res = await callAppAsync("list_notes", {});
+    if (version !== state.workspaceVersion) return false;
+    if (!res.ok) {
+      showToast("Could not refresh notes: " + res.error);
+      return false;
     }
+    applyWorkspaceList(res.data);
+    if (selection !== state.selectionVersion || state.deletingId) return false;
+
+    const targetId = firstAvailableNote(preferredId);
+    if (targetId) return selectNote(targetId);
+    if (state.dirty && !flushSaveSync()) {
+      showToast("Save failed — keeping current edits");
+      return false;
+    }
+    applyNoteToEditor(null);
+    return true;
   }
 
   async function createNewNote() {
+    if (state.deletingId) return;
     if (state.dirty && !flushSaveSync()) {
       showToast("Save failed — keeping current edits");
       return;
     }
+    const selection = state.selectionVersion;
     const res = await callAppAsync("create_note", {
       title: "Untitled note",
       tags: "",
@@ -633,9 +720,9 @@
       setSaveState(res.error, "is-error");
       return;
     }
-    await refreshWorkspace(res.data.id);
+    const selected = await refreshWorkspace(res.data.id, selection);
     const titleEl = byId("input-title");
-    if (titleEl) {
+    if (selected && state.activeId === res.data.id) {
       titleEl.focus();
       titleEl.select();
     }
@@ -643,42 +730,67 @@
   }
 
   async function deleteActiveNote() {
-    if (!state.activeId) return;
+    if (!state.activeId || state.deletingId) return;
     const idToDelete = state.activeId;
-    const res = await callAppAsync("delete_note", { id: idToDelete });
-    if (!res.ok) {
-      setSaveState(res.error, "is-error");
+    const title = byId("input-title").value || "Untitled note";
+    if (!window.confirm('Move "' + title + '" to the workspace trash?')) return;
+    if (!flushSaveSync()) {
+      showToast("Save failed — keeping current edits");
       return;
     }
-    state.dirty = false;
-    showToast("Deleted note");
+
+    state.selectionVersion++;
+    state.deletingId = idToDelete;
+    updateEditorAvailability();
+    setSaveState("Moving to trash…", "is-dirty");
+    const res = await callAppAsync("delete_note", { id: idToDelete });
+    state.deletingId = null;
+    updateEditorAvailability();
+    if (!res.ok) {
+      setSaveState("Could not move note to trash: " + res.error, "is-error");
+      return;
+    }
+    if (state.activeId === idToDelete) applyNoteToEditor(null);
+    state.notes = state.notes.filter(note => note.id !== idToDelete);
+    renderTagStrip();
+    renderNoteList();
+    showToast("Moved note to workspace trash", res.data.trashPath);
     await refreshWorkspace(null);
   }
 
-  async function importFileTokens(files) {
+  async function importFileTokens(files, extraFiles = 0) {
     if (!Array.isArray(files) || files.length === 0) return;
     if (!window.Draconium || !window.Draconium.files) return;
 
+    const selection = state.selectionVersion;
+    let importedCount = 0;
     let lastImportedId = null;
-    for (let i = 0; i < files.length; i++) {
-      const entry = files[i];
-      const readRes = await window.Draconium.files.readTextAsync(entry.token);
-      if (!readRes || !readRes.ok) {
-        showToast("Could not read " + (entry.name || "file"));
-        continue;
-      }
-      const impRes = await callAppAsync("import_note", {
-        fileName: entry.name || "imported.md",
-        content: readRes.data,
-      });
-      if (impRes.ok && impRes.data && impRes.data.id) {
+    const failures = [];
+    for (const entry of files) {
+      const fileName = entry.name || "imported.md";
+      try {
+        if (state.maxNoteBytes && entry.size > state.maxNoteBytes) {
+          throw new Error("File exceeds " + state.maxNoteBytes / (1024 * 1024) + " MiB limit");
+        }
+        const readRes = await window.Draconium.files.readTextAsync(entry.token);
+        if (!readRes || !readRes.ok) {
+          throw new Error((readRes && readRes.error) || "Could not read file");
+        }
+        const impRes = await callAppAsync("import_note", { fileName, content: readRes.data });
+        if (!impRes.ok) throw new Error(impRes.error);
         lastImportedId = impRes.data.id;
+        importedCount++;
+      } catch (error) {
+        failures.push(fileName + " — " + error.message);
       }
     }
-    if (lastImportedId) {
-      await refreshWorkspace(lastImportedId);
-      showToast("Imported file");
-    }
+    if (lastImportedId) await refreshWorkspace(lastImportedId, selection);
+    const imported = "Imported " + importedCount + (importedCount === 1 ? " file" : " files");
+    const summary = [imported];
+    if (failures.length) summary.push(failures.length + " failed");
+    if (extraFiles > 0) summary.push(extraFiles + " skipped by the file drop limit");
+    const message = summary.join(", ");
+    showToast(failures.length ? message + ". " + failures[0] : message, [message, ...failures].join("\n"));
   }
 
   async function openNativeFilePicker() {
@@ -686,23 +798,28 @@
       showToast("File picker unavailable");
       return;
     }
-    const picked = await window.Draconium.dialog.openFileAsync({
-      extensions: ["md", "markdown", "txt"],
-      multiple: true,
-    });
-    if (!picked || !picked.ok || !Array.isArray(picked.data) || picked.data.length === 0) {
-      return;
+    try {
+      const picked = await window.Draconium.dialog.openFileAsync({
+        extensions: ["md", "markdown", "txt"],
+        multiple: true,
+      });
+      if (!picked || !picked.ok) {
+        const error = picked && picked.error;
+        if (error !== "cancelled") showToast("File picker failed: " + (error || "No response"));
+        return;
+      }
+      await importFileTokens(picked.data);
+    } catch (error) {
+      showToast("File picker failed: " + error);
     }
-    await importFileTokens(picked.data);
   }
 
   function hideExportMenu() {
     const pop = byId("export-popover");
     if (pop && typeof pop.hidePopover === "function") {
-      try {
-        pop.hidePopover();
-      } catch (_) {}
+      pop.hidePopover();
     }
+    byId("btn-export-menu").focus();
   }
 
   function drawLabScope() {
@@ -729,9 +846,9 @@
     ctx.stroke();
 
     const samples = state.frameSamples;
-    const count = Math.max(1, samples.length);
+    const count = samples.length;
     const barGap = 4;
-    const barW = Math.max(4, Math.floor((w - 16) / count) - barGap);
+    const barW = Math.max(4, Math.floor((w - 16) / Math.max(1, count)) - barGap);
 
     for (let i = 0; i < count; i++) {
       const ms = Math.max(2, Math.min(36, samples[i]));
@@ -758,6 +875,7 @@
     state.labOpen = open;
     if (open) {
       drawer.classList.remove("is-hidden");
+      byId("lab-dom-nodes").textContent = String(document.querySelectorAll("*").length);
       drawLabScope();
     } else {
       drawer.classList.add("is-hidden");
@@ -766,87 +884,79 @@
   }
 
   function runRenderBenchmark(targetFrames) {
-    const totalFrames = Math.max(4, Math.min(180, Number(targetFrames) || 60));
-    if (state.benchRunning) {
-      return Promise.resolve({
-        frames: totalFrames,
-        fps: 60,
-        avgFrameMs: 16.6,
-        p95FrameMs: 18.0,
-        domNodes: document.querySelectorAll("*").length,
-      });
+    if (state.benchPromise) return state.benchPromise;
+    if (typeof window.requestAnimationFrame !== "function") {
+      const error = "Frame timing is unavailable";
+      showToast(error);
+      return Promise.resolve({ error });
     }
+
+    const totalFrames = Math.max(4, Math.min(180, Math.round(Number(targetFrames) || 60)));
     toggleLabDrawer(true);
-    state.benchRunning = true;
-    const btn = byId("btn-run-bench");
-    if (btn) btn.textContent = "Measuring...";
+    state.frameSamples = [];
+    const button = byId("btn-run-bench");
+    button.textContent = "Measuring...";
+    button.disabled = true;
 
-    return new Promise(function (resolve) {
+    state.benchPromise = new Promise(function (resolve) {
       const deltas = [];
-      let count = 0;
-      let lastTs = performance.now();
+      let lastFrame;
+      let frameRequest;
+      const timeout = setTimeout(function () {
+        const error = "Render check timed out waiting for frames";
+        showToast(error);
+        finish({ error });
+      }, Math.max(10000, totalFrames * 500));
 
-      function step() {
-        const now = performance.now();
-        const dt = Math.max(1.0, now - lastTs);
-        lastTs = now;
-        deltas.push(dt);
-        count++;
+      function finish(result) {
+        clearTimeout(timeout);
+        window.cancelAnimationFrame(frameRequest);
+        button.textContent = "Run render check";
+        button.disabled = false;
+        state.benchPromise = null;
+        resolve(result);
+      }
 
-        state.frameSamples.push(dt);
-        if (state.frameSamples.length > 48) state.frameSamples.shift();
-        drawLabScope();
-
-        if (count < totalFrames) {
-          schedule();
+      function sample(timestamp) {
+        if (lastFrame !== undefined && timestamp > lastFrame) {
+          const elapsed = timestamp - lastFrame;
+          deltas.push(elapsed);
+          state.frameSamples.push(elapsed);
+          if (state.frameSamples.length > 48) state.frameSamples.shift();
+          drawLabScope();
+        }
+        lastFrame = timestamp;
+        if (deltas.length < totalFrames) {
+          frameRequest = window.requestAnimationFrame(sample);
           return;
         }
 
-        const sum = deltas.reduce(function (a, b) { return a + b; }, 0);
-        const avgMs = sum / Math.max(1, deltas.length);
-        const sorted = deltas.slice().sort(function (a, b) { return a - b; });
-        const p95Ms = sorted[Math.min(sorted.length - 1, Math.floor(sorted.length * 0.95))] || avgMs;
-        const fps = Math.min(240, 1000 / Math.max(1, avgMs));
+        const avgMs = deltas.reduce((sum, delta) => sum + delta, 0) / deltas.length;
+        const sorted = deltas.slice().sort((a, b) => a - b);
+        const p95Ms = sorted[Math.ceil(sorted.length * 0.95) - 1];
+        const fps = 1000 / avgMs;
         const domNodes = document.querySelectorAll("*").length;
 
-        if (byId("lab-fps")) byId("lab-fps").textContent = fps.toFixed(1) + " fps";
-        if (byId("lab-avg-ms")) byId("lab-avg-ms").textContent = avgMs.toFixed(1) + " ms";
-        if (byId("lab-p95-ms")) byId("lab-p95-ms").textContent = p95Ms.toFixed(1) + " ms";
-        if (byId("lab-dom-nodes")) byId("lab-dom-nodes").textContent = String(domNodes);
-        if (btn) btn.textContent = "Run render check";
-        state.benchRunning = false;
+        byId("lab-fps").textContent = fps.toFixed(1) + " fps";
+        byId("lab-avg-ms").textContent = avgMs.toFixed(1) + " ms";
+        byId("lab-p95-ms").textContent = p95Ms.toFixed(1) + " ms";
+        byId("lab-dom-nodes").textContent = String(domNodes);
 
         const report = {
           frames: totalFrames,
           fps: Number(fps.toFixed(2)),
           avgFrameMs: Number(avgMs.toFixed(2)),
           p95FrameMs: Number(p95Ms.toFixed(2)),
-          domNodes: domNodes,
+          domNodes,
         };
         callAppAsync("record_benchmark", report);
         showToast("Render check complete");
-        resolve(report);
+        finish(report);
       }
 
-      function schedule() {
-        let fired = false;
-        const timer = setTimeout(function () {
-          if (fired) return;
-          fired = true;
-          step();
-        }, 18);
-        if (typeof window.requestAnimationFrame === "function") {
-          window.requestAnimationFrame(function () {
-            if (fired) return;
-            fired = true;
-            clearTimeout(timer);
-            step();
-          });
-        }
-      }
-
-      schedule();
+      frameRequest = window.requestAnimationFrame(sample);
     });
+    return state.benchPromise;
   }
 
   window.__folioRunBenchmark = runRenderBenchmark;
@@ -925,8 +1035,8 @@
     const searchInput = byId("input-search");
     if (searchInput) {
       searchInput.addEventListener("input", function () {
-        state.filterQuery = this.value;
-        renderNoteList();
+        state.filterQuery = this.value.trim();
+        scheduleSearch();
       });
     }
 
@@ -958,11 +1068,28 @@
     if (tagsEl) tagsEl.addEventListener("input", scheduleAutosave);
     if (areaEl) {
       areaEl.addEventListener("input", function () {
-        renderMarkdown(this.value);
-        updateCounts(this.value);
+        state.previewPending = true;
+        clearTimeout(state.previewTimer);
+        state.previewTimer = setTimeout(updatePreview, 140);
         scheduleAutosave();
       });
     }
+
+    const exportMenu = byId("export-popover");
+    const exportTrigger = byId("btn-export-menu");
+    let focusWasInMenu = false;
+    exportMenu.addEventListener("beforetoggle", function (event) {
+      focusWasInMenu = event.newState === "closed" && exportMenu.contains(document.activeElement);
+    });
+    exportMenu.addEventListener("toggle", function (event) {
+      const open = event.newState === "open";
+      exportTrigger.setAttribute("aria-expanded", String(open));
+      if (open) {
+        byId("act-copy-md").focus();
+      } else if (focusWasInMenu && (document.activeElement === document.body || exportMenu.contains(document.activeElement))) {
+        exportTrigger.focus();
+      }
+    });
 
     if (byId("act-copy-md")) {
       byId("act-copy-md").addEventListener("click", function () {
@@ -978,9 +1105,8 @@
     if (byId("act-copy-html")) {
       byId("act-copy-html").addEventListener("click", function () {
         hideExportMenu();
-        const html = byId("preview-prose") ? byId("preview-prose").innerHTML : "";
         if (window.Draconium && window.Draconium.clipboard) {
-          const res = window.Draconium.clipboard.writeHtml(html);
+          const res = window.Draconium.clipboard.writeHtml(renderNoteArticle().innerHTML);
           showToast(res && res.ok ? "Copied formatted HTML" : "Clipboard copy failed");
         }
       });
@@ -1003,9 +1129,21 @@
     if (byId("act-export-html")) {
       byId("act-export-html").addEventListener("click", async function () {
         hideExportMenu();
-        if (!window.Draconium || !window.Draconium.window) return;
-        const res = await window.Draconium.window.exportHtmlAsync((state.activeId || "note") + ".html");
-        if (res && res.ok) showToast("Exported HTML");
+        if (!state.activeId || !window.Draconium || !window.Draconium.dialog) return;
+        try {
+          const res = await window.Draconium.dialog.saveTextFileAsync({
+            name: state.activeId + ".html",
+            extensions: ["html"],
+            text: buildNoteHtml(),
+          });
+          if (res && res.ok) {
+            showToast("Exported HTML");
+          } else if (!res || res.error !== "cancelled") {
+            showToast("HTML export failed: " + ((res && res.error) || "No response"));
+          }
+        } catch (error) {
+          showToast("HTML export failed: " + error);
+        }
       });
     }
 
@@ -1060,13 +1198,13 @@
     });
     document.addEventListener("dn:file-drop", function (ev) {
       if (dropOverlay) dropOverlay.classList.add("is-hidden");
-      const files = ev && ev.detail && ev.detail.files;
-      importFileTokens(files);
+      if (ev.detail) importFileTokens(ev.detail.files, ev.detail.extraFiles);
     });
 
     if (window.Draconium && typeof window.Draconium.on === "function") {
       window.Draconium.on("theme-changed", function (payload) {
-        if (payload && payload.theme) applyTheme(payload.theme);
+        const theme = typeof payload === "string" ? payload : payload && payload.theme;
+        if (theme === "light" || theme === "dark") applyTheme(theme);
       });
     }
   }
@@ -1077,16 +1215,8 @@
       setSaveState(res.error, "is-error");
       return;
     }
-    state.notes = Array.isArray(res.data.notes) ? res.data.notes : [];
-    renderTagStrip();
-    renderNoteList();
-
-    const targetId =
-      preferredId && state.notes.some(function (n) { return n.id === preferredId; })
-        ? preferredId
-        : state.notes.length > 0
-          ? state.notes[0].id
-          : null;
+    applyWorkspaceList(res.data);
+    const targetId = firstAvailableNote(preferredId);
 
     if (targetId) {
       const loaded = callAppSync("load_note", { id: targetId });

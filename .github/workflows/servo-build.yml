@@ -1,6 +1,17 @@
-name: Servo Release Build
+name: Servo Build
 
 on:
+  push:
+    branches: [main]
+    paths:
+      - 'crates/draconium-host/**'
+      - 'probes/servo/**'
+      - '.github/workflows/servo-build.yml'
+  pull_request:
+    paths:
+      - 'crates/draconium-host/**'
+      - 'probes/servo/**'
+      - '.github/workflows/servo-build.yml'
   workflow_dispatch:
     inputs:
       target_os:
@@ -24,21 +35,28 @@ on:
         default: false
         required: true
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event_name == 'workflow_dispatch' && github.run_id || github.ref }}
+  cancel-in-progress: ${{ github.event_name != 'workflow_dispatch' }}
+
 jobs:
   build:
-    name: Servo release (${{ matrix.target_os }})
+    name: Servo ${{ github.event_name == 'workflow_dispatch' && 'release' || 'check' }} (${{ matrix.target_os }})
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 90
     env:
       CARGO_TARGET_DIR: probes/servo/target
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_INCREMENTAL: "0"
     strategy:
       fail-fast: false
       matrix:
-        include: ${{ fromJSON(inputs.target_os == 'windows' && '[{"runner":"windows-2022","target_os":"windows"}]' || inputs.target_os == 'macos' && '[{"runner":"macos-latest","target_os":"macos"}]' || inputs.target_os == 'linux' && '[{"runner":"ubuntu-latest","target_os":"linux"}]' || '[{"runner":"windows-2022","target_os":"windows"},{"runner":"macos-latest","target_os":"macos"},{"runner":"ubuntu-latest","target_os":"linux"}]') }}
+        include: ${{ fromJSON((github.event_name != 'workflow_dispatch' || inputs.target_os == 'windows') && '[{"runner":"windows-2022","target_os":"windows"}]' || inputs.target_os == 'macos' && '[{"runner":"macos-latest","target_os":"macos"}]' || inputs.target_os == 'linux' && '[{"runner":"ubuntu-latest","target_os":"linux"}]' || '[{"runner":"windows-2022","target_os":"windows"},{"runner":"macos-latest","target_os":"macos"},{"runner":"ubuntu-latest","target_os":"linux"}]') }}
     steps:
       - uses: actions/checkout@v4
 
       - uses: dtolnay/rust-toolchain@stable
+        id: rust
 
       - name: Initialize MSVC environment
         if: runner.os == 'Windows'
@@ -132,11 +150,20 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             probes/servo/target
-          key: ${{ runner.os }}-cargo-servo${{ inputs.media_gstreamer && '-gst' || '' }}-${{ hashFiles('probes/servo/Cargo.lock', 'probes/servo/Cargo.toml', 'crates/draconium-host/Cargo.toml') }}
+          key: ${{ runner.os }}-${{ runner.arch }}-cargo-servo-${{ github.event_name == 'workflow_dispatch' && 'release' || 'check' }}${{ inputs.media_gstreamer && '-gst' || '' }}-${{ steps.rust.outputs.cachekey }}-${{ hashFiles('probes/servo/Cargo.lock', 'probes/servo/Cargo.toml', 'crates/draconium-host/Cargo.toml', 'probes/servo/vendor/servo-paint/Cargo.toml') }}
+
+      - name: Check showcase and patched Servo paint crate
+        if: github.event_name != 'workflow_dispatch'
+        run: cargo check --locked --all-targets --manifest-path probes/servo/Cargo.toml
+
+      - name: Check host library test targets
+        if: github.event_name != 'workflow_dispatch'
+        run: cargo check --locked --tests -p draconium-host --manifest-path probes/servo/Cargo.toml
 
       - name: Build Servo release
-        run: cargo build --release --locked ${{ inputs.media_gstreamer && '--features media-gstreamer' || '' }} --manifest-path probes/servo/Cargo.toml
+        if: github.event_name == 'workflow_dispatch'
+        run: cargo build --release --locked --bins ${{ inputs.build_example && '--example hello' || '' }} ${{ inputs.media_gstreamer && '--features media-gstreamer' || '' }} --manifest-path probes/servo/Cargo.toml
 
-      - name: Build host hello example
-        if: ${{ inputs.build_example }}
-        run: cargo build --release --locked ${{ inputs.media_gstreamer && '--features media-gstreamer' || '' }} -p draconium-host --example hello --manifest-path probes/servo/Cargo.toml
+      - name: Run host library tests, including input mappings
+        if: github.event_name == 'workflow_dispatch' && runner.os == 'Windows'
+        run: cargo test --release --locked -p draconium-host --lib ${{ inputs.media_gstreamer && '--features draconium-host/media-gstreamer' || '' }} --manifest-path probes/servo/Cargo.toml

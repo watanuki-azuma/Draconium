@@ -2,7 +2,7 @@
 
 `crates/draconium-host` separates platform-independent host logic (Servo 0.8.0 embedding, `winit` windowing, `dn://app/` protocol, `Capabilities` ACL, preload bridge, PDF/PNG/HTML export, crash reporting) from OS-specific desktop integrations:
 
-- **Windows**: direct Win32 / DWM / Shell / DPAPI FFI ([`win_platform.rs`](../crates/draconium-host/src/win_platform.rs), [`embedder_ui.rs`](../crates/draconium-host/src/embedder_ui.rs), [`tray.rs`](../crates/draconium-host/src/tray.rs)).
+- **Windows**: direct Win32 / DWM / Shell / DPAPI FFI ([`platform_services.rs`](../crates/draconium-host/src/platform_services.rs), [`embedder_ui.rs`](../crates/draconium-host/src/embedder_ui.rs), [`tray.rs`](../crates/draconium-host/src/tray.rs)).
 - **macOS & Linux**: zero-extra-dependency Rust `std` backends ([`unix_platform.rs`](../crates/draconium-host/src/unix_platform.rs)) using native OS utilities, standard user-session files (`LaunchAgents` / XDG Autostart), and local Unix domain sockets.
 
 ---
@@ -14,13 +14,14 @@
 | Servo 0.8.0 WebView, `dn://app/`, `Capabilities`, `invoke`/`invokeAsync`, child windows, PNG/HTML/PDF export, DevTools RDP | *(core)* | Supported | Supported | Supported |
 | Native media backend (optional Cargo feature) | `mediaGstreamer` / `media_gstreamer` | `false` by default; `true` with `media-gstreamer` | `false` by default; `true` with `media-gstreamer` | `false` by default; `true` with `media-gstreamer` |
 | Native dialogs (Alert, Confirm, Open/Save File, Folder Picker, Color Picker) | `nativeDialogs` / `native_dialogs` | Win32 (`MessageBoxW`, `GetOpenFileNameW`, `GetSaveFileNameW`, `IFileOpenDialog`, `ChooseColorW`) | `osascript` (AppleScript) | `zenity` (fallback: `kdialog`) |
+| Anchored popup menus for HTML selects and context menus | `nativePopupMenus` / `native_popup_menus` | `true`, Win32 popup menu | `false`, selection dialog | `false`, selection dialog |
 | Clipboard (Text & Clear) | `clipboardText` / `clipboard_text` | Win32 (`CF_UNICODETEXT`) | `pbpaste` / `pbcopy` (`LC_CTYPE=UTF-8`) | `wl-paste` / `wl-copy` (fallback: `xclip`, `xsel`) |
 | Clipboard (HTML) | `clipboardHtml` / `clipboard_html` | Win32 (`CF_HTML`) | `osascript` (`«class HTML»`) | `wl-paste` / `wl-copy` (fallback: `xclip`) |
 | Clipboard (Image) | `clipboardImage` / `clipboard_image` | Win32 (`CF_DIB`) | PNG via `osascript` (`PNGf`) | PNG via `wl-paste` / `wl-copy` (fallback: `xclip`) |
 | Desktop notifications | `notifications` | Win32 `Shell_NotifyIconW` balloon | `osascript` (`display notification`) | `notify-send` |
-| Login autostart | `autostart` | `HKCU\...\Run` | `~/Library/LaunchAgents/io.draconium.<id>.plist` | `$XDG_CONFIG_HOME/autostart/<id>.desktop` (`~/.config/autostart/`) |
-| Single-instance lock & forwarding (`--single-instance`) | `singleInstance` / `single_instance` | Named Mutex + `WM_COPYDATA` | Atomic `UnixListener` lock socket + Unix IPC socket | Atomic `UnixListener` lock socket + Unix IPC socket |
-| System Light/Dark theme detection | `systemTheme` / `system_theme` | `AppsUseLightTheme` + `WM_SETTINGCHANGE` | `defaults read -g AppleInterfaceStyle` | `gsettings` (`color-scheme` / `gtk-theme`) + `GTK_THEME` |
+| Login autostart | `autostart` | `HKCU\...\Run` and Task Manager startup status | `~/Library/LaunchAgents/io.draconium.<id>.plist` and launchd override | `$XDG_CONFIG_HOME/autostart/<id>.desktop` (`~/.config/autostart/`) and desktop-entry flags |
+| Single-instance lock & forwarding (`--single-instance`) | `singleInstance` / `single_instance` | Named mutex + `WM_COPYDATA`, with startup retry | Advisory file lock + Unix IPC socket | Advisory file lock + Unix IPC socket |
+| System Light/Dark theme detection | `systemTheme` / `system_theme` | `AppsUseLightTheme` + `WM_SETTINGCHANGE` | Background sampling with `defaults` | Background sampling with `gsettings` and `GTK_THEME` fallback |
 | External URL (`https:` / `mailto:`) | `externalUrl` / `external_url` | `ShellExecuteW` | `open -- <url>` | `xdg-open <url>` |
 | Native system tray (`--tray`) | `systemTray` / `system_tray` | Win32 `Shell_NotifyIconW` | Not yet implemented | Not yet implemented |
 | Global hotkey (`--hotkey`) | `globalHotkey` / `global_hotkey` | Win32 `RegisterHotKey` | Not yet implemented | Not yet implemented |
@@ -70,7 +71,7 @@ if caps.single_instance {
 
 No additional Rust crates are required for the OS utility backends on macOS or Linux. The optional native media backend has separate GStreamer crate and system-library requirements; see [Optional Native Media (`media-gstreamer`)](media-gstreamer.md).
 
-- **macOS**: Uses only built-in system binaries (`osascript`, `open`, `pbcopy`, `pbpaste`, `defaults`) and user-writable `~/Library/LaunchAgents/`.
+- **macOS**: Uses built-in system binaries (`osascript`, `open`, `pbcopy`, `pbpaste`, `defaults`, `plutil`, `launchctl`) and user-writable `~/Library/LaunchAgents/`.
 - **Linux**: Uses standard freedesktop / desktop utilities when present:
   - Dialogs: `zenity` (automatic fallback to `kdialog` when `zenity` is absent)
   - Clipboard: `wl-copy` / `wl-paste` (Wayland), falling back to `xclip` or `xsel` (X11)
