@@ -3,7 +3,7 @@
 
 Covers custom-chrome transparent screenshots, starter screenshot, DevTools
 Firefox RDP handshake, tray/single-instance WM_COPYDATA forwarding, and live
-HTTP IPC + child window capability attenuation.
+HTTP IPC + child window capability attenuation and viewport resizing.
 """
 
 from __future__ import annotations
@@ -74,7 +74,7 @@ PARENT_HTML = r"""<!doctype html>
     r.wasmValid = WebAssembly.validate(new Uint8Array([0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00]));
 
     const childUrl = location.origin + "/child.html";
-    const oc = await window.Draconium.window.openChildAsync({ url: childUrl, title: "DraconiumChildVerify", width: 320, height: 240 });
+    const oc = await window.Draconium.window.openChildAsync({ url: childUrl, title: "DraconiumChildVerify-" + location.port, width: 320, height: 240 });
     r.openChild = oc;
 
     const badChild = window.Draconium.window.openChild({ url: "https://example.com" });
@@ -102,6 +102,16 @@ CHILD_HTML = r"""<!doctype html>
     c.deniedSite = !window.Draconium.session.listSiteData().ok;
     c.deniedChild = !window.Draconium.window.openChild({ url: "about:blank" }).ok;
     c.themeOk = window.Draconium.window.getTheme().ok;
+    c.viewport = { width: window.innerWidth, scale: window.devicePixelRatio };
+    async function reportResize() {
+      if (window.innerWidth < c.viewport.width + 50) return;
+      window.removeEventListener("resize", reportResize);
+      await fetch("/report/child-resize", {
+        method: "POST",
+        body: JSON.stringify({ width: window.innerWidth }),
+      });
+    }
+    window.addEventListener("resize", reportResize);
   } catch (err) {
     c.fatal = String(err && (err.stack || err));
   }
@@ -357,11 +367,13 @@ def test_devtools_rdp(exe: str) -> None:
             proc.communicate()
 
 
-def wait_for_os_event_window(title: str, timeout: float = 12.0) -> int:
+def wait_for_window(name: str, timeout: float = 12.0) -> int:
     user32 = ctypes.windll.user32
+    user32.FindWindowW.argtypes = (wintypes.LPCWSTR, wintypes.LPCWSTR)
+    user32.FindWindowW.restype = wintypes.HWND
     deadline = time.time() + timeout
     while time.time() < deadline:
-        hwnd = user32.FindWindowW(title, None) or user32.FindWindowW(None, title)
+        hwnd = user32.FindWindowW(name, None) or user32.FindWindowW(None, name)
         if hwnd:
             return int(hwnd)
         time.sleep(0.15)
@@ -391,7 +403,7 @@ def test_tray_single_instance(exe: str, work_dir: str) -> None:
     )
     try:
         win_name = "Draconium.TrayWindow.LocalDraconiumWorkspace"
-        hwnd = wait_for_os_event_window(win_name, timeout=12.0)
+        hwnd = wait_for_window(win_name, timeout=12.0)
         assert hwnd != 0, f"Primary OS event window {win_name} did not appear"
         out2 = run_checked(
             [
@@ -421,6 +433,7 @@ def test_tray_single_instance(exe: str, work_dir: str) -> None:
 def test_live_http(exe: str, work_dir: str) -> None:
     reports: dict = {}
     done_event = threading.Event()
+    resized_event = threading.Event()
 
     class Handler(http.server.BaseHTTPRequestHandler):
         def log_message(self, format: str, *args: object) -> None:
@@ -447,6 +460,9 @@ def test_live_http(exe: str, work_dir: str) -> None:
                 reports["parent"] = json.loads(raw)
             elif self.path == "/report/child":
                 reports["child"] = json.loads(raw)
+            elif self.path == "/report/child-resize":
+                reports["child-resize"] = json.loads(raw)
+                resized_event.set()
             self.send_response(204)
             self.end_headers()
             if "parent" in reports and "child" in reports:
@@ -480,9 +496,26 @@ def test_live_http(exe: str, work_dir: str) -> None:
         errors="replace",
     )
     try:
-        finished = done_event.wait(timeout=20.0)
-        time.sleep(0.4)
-        alive = proc.poll() is None
+        assert done_event.wait(timeout=20.0), f"Timed out waiting for parent/child reports: {reports}"
+        viewport = reports["child"].get("viewport")
+        assert viewport and viewport["width"] > 0 and viewport["scale"] > 0, reports["child"]
+        hwnd = wait_for_window(f"DraconiumChildVerify-{port}", timeout=2.0)
+        assert hwnd, "Child window missing before resize"
+
+        set_window_pos = ctypes.WinDLL("user32", use_last_error=True).SetWindowPos
+        set_window_pos.argtypes = (
+            wintypes.HWND, wintypes.HWND, ctypes.c_int, ctypes.c_int,
+            ctypes.c_int, ctypes.c_int, wintypes.UINT,
+        )
+        set_window_pos.restype = wintypes.BOOL
+        scale = viewport["scale"]
+        # SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS
+        flags = 0x0002 | 0x0004 | 0x0010 | 0x4000
+        if not set_window_pos(hwnd, None, 0, 0, round(520 * scale), round(380 * scale), flags):
+            raise ctypes.WinError(ctypes.get_last_error())
+        assert resized_event.wait(timeout=5.0), f"Child viewport did not resize: {reports}"
+        assert reports["child-resize"]["width"] >= viewport["width"] + 50, reports
+        assert proc.poll() is None, "Host exited prematurely after child resize"
     finally:
         if proc.poll() is None:
             proc.terminate()
@@ -495,11 +528,9 @@ def test_live_http(exe: str, work_dir: str) -> None:
             proc.communicate()
         httpd.shutdown()
 
-    assert finished, f"Timed out waiting for parent/child reports: {reports}"
-    assert alive, "Host exited prematurely after openChild"
-
     p = reports["parent"]
-    c = reports["child"]
+    c = reports["child"].copy()
+    c.pop("viewport")
     assert p.get("safeStorage") == {
         "encOk": True,
         "decVal": "dpapi-live-日本語",
@@ -537,7 +568,7 @@ def test_live_http(exe: str, work_dir: str) -> None:
         "deniedChild": True,
         "themeOk": True,
     }, f"child privilege attenuation mismatch: {c}"
-    print("[PASS] live HTTP bridge, DPAPI, clipboard, session, wasm, print->exportPdf, openChild + attenuation")
+    print("[PASS] live HTTP bridge, DPAPI, clipboard, session, wasm, print->exportPdf, child attenuation and resize")
 
 
 def main() -> int:

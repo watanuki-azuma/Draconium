@@ -988,6 +988,30 @@ fn format_site_data_json(entries: &[SiteData]) -> String {
 }
 
 impl Delegate {
+    // The caller has made this window's rendering context current.
+    fn paint_frame(&self, webview: &WebView, rendering_context: &WindowRenderingContext) {
+        webview.paint();
+        rendering_context.present();
+        self.has_painted.set(true);
+    }
+
+    fn resize_viewport(
+        &self,
+        webview: &WebView,
+        rendering_context: &WindowRenderingContext,
+        servo: &Servo,
+        size: PhysicalSize<u32>,
+    ) -> bool {
+        if size.width == 0 || size.height == 0 || self.last_inner_size.replace(size) == size {
+            return false;
+        }
+        let _ = rendering_context.make_current();
+        webview.resize(size);
+        self.sync_fullscreen(webview);
+        servo.spin_event_loop();
+        true
+    }
+
     fn dispatch_page_event(&self, webview: &WebView, name: &str, json: &str) {
         if self.is_active_page_origin(webview)
             && let Some(script) =
@@ -3668,25 +3692,23 @@ impl ApplicationHandler<HostEvent> for App {
                     WindowEvent::RedrawRequested => {
                         let child = &state.child_windows[idx];
                         let _ = child.rendering_context.make_current();
-                        child.webview.paint();
-                        child.rendering_context.present();
-                        child.delegate.has_painted.set(true);
+                        child
+                            .delegate
+                            .paint_frame(&child.webview, &child.rendering_context);
                     }
                     WindowEvent::Resized(size) => {
                         let child = &state.child_windows[idx];
-                        if size.width == 0 || size.height == 0 {
+                        if !child.delegate.resize_viewport(
+                            &child.webview,
+                            &child.rendering_context,
+                            &state.servo,
+                            size,
+                        ) {
                             return;
                         }
-                        if child.delegate.last_inner_size.replace(size) == size {
-                            return;
-                        }
-                        let _ = child.rendering_context.make_current();
-                        child.webview.resize(size);
-                        child.delegate.sync_fullscreen(&child.webview);
-                        state.servo.spin_event_loop();
-                        child.webview.paint();
-                        child.rendering_context.present();
-                        child.delegate.has_painted.set(true);
+                        child
+                            .delegate
+                            .paint_frame(&child.webview, &child.rendering_context);
                     }
                     WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
                         let child = &state.child_windows[idx];
@@ -3843,24 +3865,22 @@ impl ApplicationHandler<HostEvent> for App {
             }
             WindowEvent::RedrawRequested => {
                 let _ = state.rendering_context.make_current();
-                webview.paint();
-                state.rendering_context.present();
-                state.delegate.has_painted.set(true);
+                state
+                    .delegate
+                    .paint_frame(webview, &state.rendering_context);
             }
             WindowEvent::Resized(size) => {
-                if size.width == 0 || size.height == 0 {
+                if !state.delegate.resize_viewport(
+                    webview,
+                    &state.rendering_context,
+                    &state.servo,
+                    size,
+                ) {
                     return;
                 }
-                if state.delegate.last_inner_size.replace(size) == size {
-                    return;
-                }
-                let _ = state.rendering_context.make_current();
-                webview.resize(size);
-                state.delegate.sync_fullscreen(webview);
-                state.servo.spin_event_loop();
-                webview.paint();
-                state.rendering_context.present();
-                state.delegate.has_painted.set(true);
+                state
+                    .delegate
+                    .paint_frame(webview, &state.rendering_context);
             }
             WindowEvent::Moved(position) => {
                 // Position persistence (Milestone A): ignore OS minimize
